@@ -1,0 +1,39 @@
+# Versiones verificadas contra PyPI el 2026-09-12.
+# La propuesta original fijaba langchain==0.1.16 / langgraph==0.0.38 —
+# son versiones pre-1.0 de 2024; la API cambió de forma incompatible
+# desde entonces (StateGraph, checkpointers, interrupt() para
+# human-in-the-loop). No se puede migrar cambiando solo el número de
+# versión: cualquier código de agentes que se escriba debe hacerse
+# contra la API 1.x, no contra estos ejemplos de hace dos años.
+
+# Web / API
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+
+# Datos
+sqlalchemy==2.0.52
+psycopg2-binary==2.9.13   # driver síncrono (API, migraciones)
+asyncpg==0.31.0           # driver async (listener LISTEN/NOTIFY)
+pgvector==0.5.0
+alembic==1.20.0
+
+# Configuración
+pydantic==2.13.5
+pydantic-settings==2.15.0
+python-dotenv==1.2.3
+
+# Resiliencia
+tenacity==9.1.4
+httpx==0.28.1
+
+# Orquestación agencial — solo si se usa el bucle Producer-Critic de
+# Full Development (ver README). No es una dependencia dura del resto
+# del sistema: la API y el listener funcionan sin ella.
+langgraph==1.2.11
+langchain-anthropic==1.7.2
+
+# Embeddings (Voyage AI, recomendado por Anthropic — ver src/config.py)
+voyageai==0.5.0
+
+# Testing
+pytest==9.1.1
