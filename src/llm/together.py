@@ -89,6 +89,35 @@ def _llm_retries(session: Session) -> int:
     return DEFAULT_LLM_RETRIES
 
 
+def _post_with_retry(
+    session, body: dict, timeout: float, cfg: LLMConfig
+) -> httpx.Response:
+    """POST a Together con reintentos (tenacity) según session_settings.
+
+    Compartido por `complete` y `complete_vision` para no duplicar el
+    patrón de retry.
+    """
+    retries = _llm_retries(session)
+
+    @retry(
+        stop=stop_after_attempt(retries),
+        wait=wait_exponential(multiplier=1, min=1, max=8),
+        reraise=True,
+    )
+    def _post() -> httpx.Response:
+        return httpx.post(
+            TOGETHER_CHAT_URL,
+            headers={
+                "Authorization": f"Bearer {cfg.api_key}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=timeout,
+        )
+
+    return _post()
+
+
 def complete(
     session: Session,
     prompt: str,
@@ -96,18 +125,21 @@ def complete(
     system: str | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
-    timeout: float = 60.0,
+    timeout: float = 900.0,
     response_format: dict | None = None,
 ) -> str:
-    """Llama al modelo pequeño o grande vía Together y devuelve el texto.
+    """Llama al modelo pequeño, grande o de visión vía Together y devuelve el texto.
 
-    model_size: "small" | "large". Los valores por defecto de temperature
-    y max_tokens salen de session_settings; se pueden sobreescribir por
-    llamada. `response_format` (0004) fuerza salida estructurada
-    (p. ej. {"type": "json_object"}) cuando el modelo lo soporta.
+    model_size: "small" | "large" | "vision". Los valores por defecto de
+    temperature y max_tokens salen de session_settings; se pueden
+    sobreescribir por llamada. `response_format` (0004) fuerza salida
+    estructurada (p. ej. {"type": "json_object"}) cuando el modelo lo
+    soporta.
     """
-    if model_size not in ("small", "large"):
-        raise ValueError(f"model_size debe ser 'small' o 'large', no {model_size!r}")
+    if model_size not in ("small", "large", "vision"):
+        raise ValueError(
+            f"model_size debe ser 'small', 'large' o 'vision', no {model_size!r}"
+        )
 
     cfg = get_active_llm_config(session)
     model = cfg.small_model if model_size == "small" else cfg.large_model
@@ -136,25 +168,71 @@ def complete(
     if response_format is not None:
         body["response_format"] = response_format
 
-    retries = _llm_retries(session)
+    resp = _post_with_retry(session, body, timeout, cfg)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
 
-    @retry(
-        stop=stop_after_attempt(retries),
-        wait=wait_exponential(multiplier=1, min=1, max=8),
-        reraise=True,
-    )
-    def _post() -> httpx.Response:
-        return httpx.post(
-            TOGETHER_CHAT_URL,
-            headers={
-                "Authorization": f"Bearer {cfg.api_key}",
-                "Content-Type": "application/json",
-            },
-            json=body,
-            timeout=timeout,
+
+def complete_vision(
+    session: Session,
+    prompt: str,
+    image_url: str,
+    model_size: str = "vision",
+    system: str | None = None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+    timeout: float = 900.0,
+    response_format: dict | None = None,
+) -> str:
+    """Llama a un modelo de visión con una imagen (URL) vía Together.
+
+    Igual que `complete`, pero el mensaje de usuario es una lista de
+    contenido multimodal estilo OpenAI: texto + image_url. El modelo se
+    resuelve con cfg.large_model (el usuario puede setear el modelo de
+    visión como large_model en session_settings).
+    """
+    if model_size not in ("small", "large", "vision"):
+        raise ValueError(
+            f"model_size debe ser 'small', 'large' o 'vision', no {model_size!r}"
         )
 
-    resp = _post()
+    cfg = get_active_llm_config(session)
+    model = cfg.small_model if model_size == "small" else cfg.large_model
+    temp = (
+        temperature
+        if temperature is not None
+        else (cfg.temperature_small if model_size == "small" else cfg.temperature_large)
+    )
+    tokens = (
+        max_tokens
+        if max_tokens is not None
+        else (cfg.max_tokens_small if model_size == "small" else cfg.max_tokens_large)
+    )
+
+    messages: list[dict] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append(
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ],
+        }
+    )
+
+    body: dict = {
+        "model": model,
+        "messages": messages,
+        "temperature": temp,
+        "max_tokens": tokens,
+    }
+    if response_format is not None:
+        body["response_format"] = response_format
+
+    resp = _post_with_retry(session, body, timeout, cfg)
     resp.raise_for_status()
     data = resp.json()
     return data["choices"][0]["message"]["content"]

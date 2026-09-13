@@ -38,6 +38,19 @@ class _FakeSession:
             def scalar_one_or_none(self):
                 return self._rows[0] if self._rows else None
 
+            def scalars(self):
+                return self
+
+            def first(self):
+                return self._rows[0] if self._rows else None
+
+        # select(SessionSettings) — el refuerzo LLM lee la config activa.
+        # Sin settings -> skipped (decisión determinista).
+        if hasattr(stmt, "_raw_columns") and stmt._raw_columns:
+            table = getattr(stmt._raw_columns[0], "name", "")
+            if table == "session_settings":
+                return _Result([])
+
         # Filtra por brand_objective + content_bucket (lo que usa el endpoint)
         rows = [
             t
@@ -159,6 +172,53 @@ def test_alignment_returns_semaforo(client):
     assert body["verdict"] == "auto_pass"
     assert body["failed_items"] == []
     assert len(body["checklist"]) == 4
+    # 0007: sin settings el refuerzo LLM se omite -> decisión determinista
+    # que requiere aceptación explícita del usuario.
+    assert body["llm_reinforcement"]["status"] == "skipped"
+    assert body["decision_source"] == "deterministic"
+    assert body["requires_user_acceptance"] is True
+
+
+def test_alignment_llm_reinforcement_ok_sets_decision_source(client, monkeypatch):
+    """0007: con refuerzo LLM ok, la decisión viene del LLM y NO requiere
+    aceptación obligatoria del usuario."""
+    import src.llm.reinforcement as reinforcement_mod
+    from src.llm.base import ok_result
+
+    brief = _make_brief(
+        evidence_source="Estudio 2026.",
+        pitch_15s="¿Crees que ya no necesitas el refuerzo?",
+        cta="Descarga la guía",
+        risk_level="bajo",
+        route_decision="repetitivo",
+        production_route="fast",
+    )
+    template = _make_template()
+    monkeypatch.setattr(
+        reinforcement_mod,
+        "reinforce_alignment",
+        lambda session, brief_data, rule_verdict, checklist_results: ok_result(
+            verdict="auto_pass",
+            llm_verdict="auto_pass",
+            reasoning="sin riesgos",
+            risks_detected=[],
+            model_used="small",
+            fallback_used=False,
+        ),
+    )
+    app.dependency_overrides[get_session] = lambda: _FakeSession(
+        {brief.id: brief}, [template]
+    )
+    try:
+        resp = client.post(f"/briefs/{brief.id}/alignment")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["llm_reinforcement"]["status"] == "ok"
+    assert body["decision_source"] == "llm"
+    assert body["requires_user_acceptance"] is False
 
 
 def test_alignment_404_when_brief_missing(client):
@@ -231,3 +291,86 @@ def test_alignment_needs_human_review_moves_to_revision(client):
     assert resp.status_code == 200
     assert resp.json()["verdict"] == "needs_human_review"
     assert brief.status == "revision"
+
+
+def test_alignment_degraded_persists_requires_user_acceptance(client):
+    """0007: sin settings el refuerzo se omite -> decisión determinista que
+    requiere aceptación del usuario; el flag se persiste en el brief."""
+    brief = _make_brief(
+        status="idea",
+        evidence_source="Estudio 2026.",
+        pitch_15s="¿Crees que ya no necesitas el refuerzo?",
+        cta="Descarga la guía",
+        risk_level="bajo",
+        route_decision="repetitivo",
+        production_route="fast",
+    )
+    template = _make_template()
+    app.dependency_overrides[get_session] = lambda: _FakeSession(
+        {brief.id: brief}, [template]
+    )
+    try:
+        resp = client.post(f"/briefs/{brief.id}/alignment")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["requires_user_acceptance"] is True
+    assert brief.requires_user_acceptance is True
+
+
+def test_alignment_llm_ok_persists_false(client, monkeypatch):
+    """0007: con refuerzo LLM ok, la decisión viene del LLM y el flag de
+    aceptación del usuario se persiste en False."""
+    import src.llm.reinforcement as reinforcement_mod
+    from src.llm.base import ok_result
+
+    brief = _make_brief(
+        status="idea",
+        evidence_source="Estudio 2026.",
+        pitch_15s="¿Crees que ya no necesitas el refuerzo?",
+        cta="Descarga la guía",
+        risk_level="bajo",
+        route_decision="repetitivo",
+        production_route="fast",
+    )
+    template = _make_template()
+    monkeypatch.setattr(
+        reinforcement_mod,
+        "reinforce_alignment",
+        lambda session, brief_data, rule_verdict, checklist_results: ok_result(
+            verdict="auto_pass",
+            llm_verdict="auto_pass",
+            reasoning="sin riesgos",
+            risks_detected=[],
+            model_used="small",
+            fallback_used=False,
+        ),
+    )
+    app.dependency_overrides[get_session] = lambda: _FakeSession(
+        {brief.id: brief}, [template]
+    )
+    try:
+        resp = client.post(f"/briefs/{brief.id}/alignment")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["requires_user_acceptance"] is False
+    assert brief.requires_user_acceptance is False
+
+
+def test_get_brief_surfaces_requires_user_acceptance(client):
+    """0007: el flag de aceptación del usuario se expone en GET /briefs/{id}."""
+    brief = _make_brief(requires_user_acceptance=True)
+    app.dependency_overrides[get_session] = lambda: _FakeSession({brief.id: brief})
+    try:
+        resp = client.get(f"/briefs/{brief.id}")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["requires_user_acceptance"] is True

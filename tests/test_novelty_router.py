@@ -197,3 +197,98 @@ def test_route_brief_with_refinement_degraded_keeps_default(monkeypatch):
     # Degradado -> default determinista: score 3 < umbral 4 -> repetitivo.
     assert result.route_decision == "repetitivo"
     assert result.novelty_score == 3  # default determinista intacto
+
+
+# ---------------------------------------------------------------------
+# Superficie de la degradación del refinamiento (0007)
+# ---------------------------------------------------------------------
+
+
+def _route_in_gray_zone(monkeypatch, refine_angle):
+    """Enruta en la zona gris (similitud 0.75) con un refinador inyectado."""
+    import src.agents.novelty_router as router_mod
+
+    monkeypatch.setattr(
+        router_mod,
+        "find_closest_prior_artifact",
+        lambda session, embed_fn, insight, objective: (_match(), 0.75),
+    )
+    return router_mod.route_brief(
+        _FakeSession(),
+        lambda s: [0.1] * 1024,
+        _base_inputs(),
+        refine_angle=refine_angle,
+    )
+
+
+def test_route_brief_refinement_ok_sets_status(monkeypatch):
+    """Refinamiento ok -> refinement_status 'ok' y sin aceptación obligatoria."""
+    result = _route_in_gray_zone(
+        monkeypatch,
+        lambda brief_data, prior_artifacts: {
+            "status": "ok",
+            "angulo_nuevo": True,
+            "reasoning": "nuevo",
+        },
+    )
+    assert result.refinement_status == "ok"
+    assert result.requires_user_acceptance is False
+
+
+def test_route_brief_refinement_degraded_requires_acceptance(monkeypatch):
+    """Refinamiento degradado -> la degradación se SUPERPICIE (0007):
+    refinement_status 'degraded' y requiere aceptación del usuario."""
+    result = _route_in_gray_zone(
+        monkeypatch,
+        lambda brief_data, prior_artifacts: {
+            "status": "degraded",
+            "reason": "llm_unavailable",
+            "angulo_nuevo": True,
+        },
+    )
+    assert result.refinement_status == "degraded"
+    assert result.requires_user_acceptance is True
+
+
+def test_route_brief_refinement_raising_is_degraded_not_silent(monkeypatch):
+    """Refinador con excepción -> degradación visible (0007): nunca se
+    traga el fallo en silencio."""
+
+    def boom(brief_data, prior_artifacts):
+        raise RuntimeError("refinador caído")
+
+    result = _route_in_gray_zone(monkeypatch, boom)
+    assert result.refinement_status == "degraded"
+    assert result.requires_user_acceptance is True
+
+
+def test_route_brief_refinement_skipped_requires_acceptance(monkeypatch):
+    """Refinamiento skipped -> determinista por construcción: requiere
+    aceptación del usuario."""
+    result = _route_in_gray_zone(
+        monkeypatch,
+        lambda brief_data, prior_artifacts: {
+            "status": "skipped",
+            "reason": "no_settings",
+            "angulo_nuevo": True,
+        },
+    )
+    assert result.refinement_status == "skipped"
+    assert result.requires_user_acceptance is True
+
+
+def test_route_brief_without_refinement_has_no_status(monkeypatch):
+    """Sin refinador inyectado -> sin estado de refinamiento y sin
+    aceptación obligatoria (defaults de NoveltyResult)."""
+    import src.agents.novelty_router as router_mod
+
+    monkeypatch.setattr(
+        router_mod,
+        "find_closest_prior_artifact",
+        lambda session, embed_fn, insight, objective: (_match(), 0.75),
+    )
+    result = router_mod.route_brief(
+        _FakeSession(), lambda s: [0.1] * 1024, _base_inputs()
+    )
+    assert result.refinement_status is None
+    assert result.requires_user_acceptance is False

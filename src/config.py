@@ -46,6 +46,11 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
 
+    # ASSET_STORAGE_PATH — raíz de assets pesados (puede ser un HDD externo
+    # montado en el host; Docker lo monta como volumen). Los storage_path de
+    # projects/artifacts/jobs se resuelven contra esta raíz (§20.8).
+    asset_storage_path: str = "./data/assets"
+
     # Autenticación (RBAC — ver src/auth.py)
     jwt_secret: str = ""  # JWT_SECRET en .env — generar con secrets.token_hex(32)
 

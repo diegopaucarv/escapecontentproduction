@@ -22,19 +22,40 @@ from src.auth import (
     create_access_token,
     require_role,
 )
+from src.config import get_settings
 from src.db.models import (
     ApiKey,
     AppUser,
+    AssetJob,
+    ContentArtifact,
     ContentBrief,
     EmbeddingSetting,
     LlmModel,
     PipelineTemplate,
+    ProductionManifest,
+    ProductionTemplate,
+    Project,
+    ProjectVersion,
     PromptArtifact,
     PromptTemplate,
     SessionSettings,
     TelemetryEvent,
+    ToolAdapter,
 )
 from src.db.session import get_session
+from src.production.flow import produce_project
+from src.production.generator import generate_snapshot
+from src.production.postproduction import postproduction_recommendations
+from src.production.produce_brief import resume_produce, run_produce
+from src.production.refine import refine_snapshot, resolve_format_spec
+from src.tools import (
+    OrchestrationError,
+    Orchestrator,
+    create_manifest,
+    list_manifests,
+    load_manifest,
+    validate_tool_chain,
+)
 
 app = FastAPI(title="Pipeline Unificado — ESCAPE / Ergalia", version="0.1.0")
 
@@ -203,6 +224,9 @@ def _brief_to_dict(brief: ContentBrief) -> dict:
         "route_decision": _val(brief.route_decision),
         "production_route": _val(brief.production_route),
         "pipeline_template_id": brief.pipeline_template_id,
+        # 0007: la última decisión (alineamiento/refuerzo) fue determinista
+        # y requiere aceptación explícita del usuario (auditoría).
+        "requires_user_acceptance": brief.requires_user_acceptance,
         "created_at": brief.created_at.isoformat() if brief.created_at else None,
         "updated_at": brief.updated_at.isoformat() if brief.updated_at else None,
     }
@@ -216,6 +240,12 @@ def align_brief(brief_id: uuid.UUID, session: Session = Depends(get_session)) ->
     + novelty_weights) y devuelve el semáforo 🟢🟡🔴. El enrutamiento por
     novedad (novelty_router) corre de forma asíncrona y puebla
     route_decision/production_route; aquí se usan como contexto.
+
+    Filosofía 0007 (LLM-first): el LLM es la opción SIEMPRE presente y
+    orquesta la decisión; el usuario es invitado a revisarla. Si el
+    refuerzo LLM degrada a determinista (o falla), la decisión requiere
+    aceptación explícita del usuario vía el flujo `revision` +
+    POST /briefs/{id}/approve (OWNER_APPROVAL).
     """
     brief = session.get(ContentBrief, brief_id)
     if brief is None:
@@ -285,6 +315,27 @@ def align_brief(brief_id: uuid.UUID, session: Session = Depends(get_session)) ->
     except Exception:  # noqa: BLE001 — el refuerzo nunca rompe el alineamiento
         llm_reinforcement = {"status": "error", "reason": "reinforcement_failed"}
 
+    # Filosofía 0007: el LLM es la opción SIEMPRE presente. Solo cuando el
+    # refuerzo responde "ok" la decisión puede venir del LLM (o del humano
+    # si el propio LLM lo indica); en cualquier otro caso (degradado,
+    # skipped o error) la decisión es determinista por construcción y
+    # requiere aceptación explícita del usuario.
+    if llm_reinforcement and llm_reinforcement.get("status") == "ok":
+        decision_source = llm_reinforcement.get("decision_source", "llm")
+        requires_user_acceptance = bool(
+            llm_reinforcement.get("requires_user_acceptance", False)
+        )
+    else:
+        # Sin refuerzo LLM (degradado, skipped o error): la decisión es
+        # determinista por construcción -> requiere aceptación del usuario.
+        decision_source = "deterministic"
+        requires_user_acceptance = True
+
+    # Filosofía 0007: el flag se PERSISTE en el brief para auditoría —
+    # si la última decisión fue determinista (degradación), el pipeline
+    # sabe que debe pausar hasta la aceptación del usuario.
+    brief.requires_user_acceptance = requires_user_acceptance
+
     # El veredicto del Gatekeeper decide el estado del brief (§3.9):
     # fail → retrabajo (generando); needs_human_review/auto_pass → revisión
     # (esperando la aprobación del 🟨 líder vía POST /briefs/{id}/approve).
@@ -317,6 +368,8 @@ def align_brief(brief_id: uuid.UUID, session: Session = Depends(get_session)) ->
         },
         "reasoning": result.reasoning,
         "llm_reinforcement": llm_reinforcement,
+        "decision_source": decision_source,
+        "requires_user_acceptance": requires_user_acceptance,
     }
 
 
@@ -353,6 +406,107 @@ def approve_brief(
         "status": _val(brief.status),
         "approved_by": str(user.id),
         "approved_at": brief.updated_at.isoformat() if brief.updated_at else None,
+    }
+
+
+class ResumeDecision(BaseModel):
+    """Decisión humana al reanudar el grafo Producer-Critic pausado."""
+
+    decision: str = Field(..., pattern="^(approve|reject)$")
+
+
+@app.post("/briefs/{brief_id}/produce", response_model=dict)
+def produce_brief(
+    brief_id: uuid.UUID,
+    session: Session = Depends(get_session),
+) -> dict:
+    """Ejecuta el bucle Producer-Critic (0007) con sesión real.
+
+    Requiere un brief 'aprobado' (OWNER_APPROVAL previo). Construye el
+    estado del grafo desde el brief + su plan de marca y lo invoca con
+    thread_id = brief_id (el interrupt/resume queda asociado al brief).
+    Si el grafo se pausa (needs_human_review o degradación determinista),
+    devuelve la interrupción; el humano la resuelve vía
+    POST /briefs/{id}/produce/resume. Si auto-pasa, materializa la pieza
+    como ContentArtifact (status 'borrador').
+    """
+    brief = session.get(ContentBrief, brief_id)
+    if brief is None:
+        raise HTTPException(status_code=404, detail=f"Brief {brief_id} no encontrado.")
+    if _val(brief.status) != "aprobado":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Solo se puede producir un brief 'aprobado'; "
+                f"este está en '{_val(brief.status)}'."
+            ),
+        )
+    template = session.execute(
+        select(PipelineTemplate).where(
+            PipelineTemplate.brand_objective == brief.brand_objective,
+            PipelineTemplate.content_bucket == brief.content_bucket,
+        )
+    ).scalar_one_or_none()
+    if template is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No hay plan de marca (pipeline_template) para "
+                f"{_val(brief.brand_objective)}/{_val(brief.content_bucket)}."
+            ),
+        )
+
+    result = run_produce(session, brief, template)
+
+    # auto_pass sin interrupción: la pieza queda lista como artefacto.
+    if result.get("verdict") == "auto_pass" and "__interrupt__" not in result:
+        artifact = ContentArtifact(
+            brief_id=brief.id,
+            artifact_type=_val(brief.artifact_type) or "post",
+            channel=brief.channel or "social",
+            status="borrador",
+        )
+        session.add(artifact)
+        session.commit()
+
+    return {
+        "brief_id": str(brief.id),
+        "verdict": result.get("verdict"),
+        "draft": result.get("draft"),
+        "iteration": result.get("iteration"),
+        "requires_user_acceptance": result.get("requires_user_acceptance"),
+        "checklist_results": result.get("checklist_results"),
+        "critic_feedback": result.get("critic_feedback"),
+        "human_decision": result.get("human_decision"),
+        "interrupted": "__interrupt__" in result,
+        "interrupt": (
+            result["__interrupt__"][0].value if "__interrupt__" in result else None
+        ),
+    }
+
+
+@app.post("/briefs/{brief_id}/produce/resume", response_model=dict)
+def resume_brief_production(
+    brief_id: uuid.UUID,
+    body: ResumeDecision,
+    session: Session = Depends(get_session),
+) -> dict:
+    """Reanuda el grafo Producer-Critic pausado en human_review_node.
+
+    La decisión humana ('approve' | 'reject') se entrega vía
+    Command(resume=...) al mismo thread (thread_id = brief_id). Solo
+    tiene sentido tras una pausa; si no hay pausa, LangGraph continúa
+    desde el último checkpoint.
+    """
+    brief = session.get(ContentBrief, brief_id)
+    if brief is None:
+        raise HTTPException(status_code=404, detail=f"Brief {brief_id} no encontrado.")
+    result = resume_produce(session, str(brief.id), body.decision)
+    return {
+        "brief_id": str(brief.id),
+        "human_decision": result.get("human_decision"),
+        "verdict": result.get("verdict"),
+        "interrupted": "__interrupt__" in result,
     }
 
 
@@ -1068,3 +1222,815 @@ def ensure_prompts(session: Session = Depends(get_session)) -> dict:
             status_code=500,
             detail=f"No se pudo compilar los prompts: {exc}",
         )
+
+
+# ---------------------------------------------------------------------
+# Fase 3 — API de producción: tool_adapters, production_templates,
+# manifiestos, jobs y endpoint disparador /produce (diseño §17, pts. 13-15)
+# ---------------------------------------------------------------------
+
+
+class ToolAdapterCreate(BaseModel):
+    name: str = Field(..., examples=["inkscape"])
+    mcp_server_name: str = Field(..., examples=["inkscape"])
+    execution_mode: str = Field(..., examples=["local"])
+    requires_license: str | None = None
+    is_active: bool = True
+
+
+class ToolAdapterUpdate(BaseModel):
+    name: str | None = None
+    mcp_server_name: str | None = None
+    execution_mode: str | None = None
+    requires_license: str | None = None
+    is_active: bool | None = None
+
+
+class ProductionTemplateCreate(BaseModel):
+    name: str = Field(..., examples=["Storyboard_Spec"])
+    content_type: str = Field(..., examples=["video"])
+    phase: str = Field(..., examples=["preproduccion"])
+    template_format: str = Field(..., examples=["json"])
+    content: dict = Field(default_factory=dict)
+    version: str = "1.0"
+    is_active: bool = True
+
+
+class ProductionTemplateUpdate(BaseModel):
+    name: str | None = None
+    content_type: str | None = None
+    phase: str | None = None
+    template_format: str | None = None
+    content: dict | None = None
+    version: str | None = None
+    is_active: bool | None = None
+
+
+class ManifestCreate(BaseModel):
+    manifest: dict = Field(..., examples=[{"project": {"artifact_id": "..."}}])
+
+
+class ProduceRequest(BaseModel):
+    manifest_version: int | None = None
+    manifest: dict | None = None
+
+
+def _tool_adapter_to_dict(a: ToolAdapter) -> dict:
+    return {
+        "id": str(a.id),
+        "name": a.name,
+        "mcp_server_name": a.mcp_server_name,
+        "execution_mode": a.execution_mode,
+        "requires_license": a.requires_license,
+        "is_active": a.is_active,
+        "created_at": a.created_at.isoformat() if a.created_at else None,
+        "updated_at": a.updated_at.isoformat() if a.updated_at else None,
+    }
+
+
+def _production_template_to_dict(t: ProductionTemplate) -> dict:
+    return {
+        "id": str(t.id),
+        "name": t.name,
+        "content_type": t.content_type,
+        "phase": t.phase,
+        "template_format": t.template_format,
+        "content": t.content or {},
+        "version": t.version,
+        "is_active": t.is_active,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+        "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+    }
+
+
+def _production_manifest_to_dict(m: ProductionManifest) -> dict:
+    return {
+        "id": str(m.id),
+        "artifact_id": str(m.artifact_id),
+        "version": m.version,
+        "manifest": m.manifest or {},
+        "created_at": m.created_at.isoformat() if m.created_at else None,
+    }
+
+
+def _asset_job_to_dict(j: AssetJob) -> dict:
+    return {
+        "id": str(j.id),
+        "artifact_id": str(j.artifact_id),
+        "tool_adapter_id": str(j.tool_adapter_id),
+        "sequence_order": j.sequence_order,
+        "status": j.status,
+        "phase": j.phase,
+        "template_id": str(j.template_id) if j.template_id else None,
+        "manifest_version": j.manifest_version,
+        "input_ref": j.input_ref,
+        "output_path": j.output_path,
+        "external_job_id": j.external_job_id,
+        "cost_estimate": j.cost_estimate or {},
+        "error": j.error,
+        "started_at": j.started_at.isoformat() if j.started_at else None,
+        "completed_at": j.completed_at.isoformat() if j.completed_at else None,
+    }
+
+
+def _get_artifact_or_404(session: Session, artifact_id: uuid.UUID) -> ContentArtifact:
+    artifact = session.get(ContentArtifact, artifact_id)
+    if artifact is None:
+        raise HTTPException(
+            status_code=404, detail=f"artefacto {artifact_id} no encontrado."
+        )
+    return artifact
+
+
+# ---------------------------------------------------------------------
+# CRUD /tool-adapters
+# ---------------------------------------------------------------------
+
+
+@app.get("/tool-adapters", response_model=list[dict])
+def list_tool_adapters(session: Session = Depends(get_session)) -> list[dict]:
+    rows = (
+        session.execute(select(ToolAdapter).order_by(ToolAdapter.created_at.desc()))
+        .scalars()
+        .all()
+    )
+    return [_tool_adapter_to_dict(a) for a in rows]
+
+
+@app.post("/tool-adapters", status_code=201)
+def create_tool_adapter(
+    body: ToolAdapterCreate, session: Session = Depends(get_session)
+) -> dict:
+    exists = session.execute(
+        select(ToolAdapter).where(ToolAdapter.name == body.name)
+    ).scalar_one_or_none()
+    if exists is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Ya existe un tool_adapter con name {body.name!r}.",
+        )
+    adapter = ToolAdapter(**body.model_dump())
+    session.add(adapter)
+    session.commit()
+    session.refresh(adapter)
+    return _tool_adapter_to_dict(adapter)
+
+
+@app.get("/tool-adapters/{adapter_id}", response_model=dict)
+def get_tool_adapter(
+    adapter_id: uuid.UUID, session: Session = Depends(get_session)
+) -> dict:
+    adapter = session.get(ToolAdapter, adapter_id)
+    if adapter is None:
+        raise HTTPException(
+            status_code=404, detail=f"tool_adapter {adapter_id} no encontrado."
+        )
+    return _tool_adapter_to_dict(adapter)
+
+
+@app.patch("/tool-adapters/{adapter_id}", response_model=dict)
+def update_tool_adapter(
+    adapter_id: uuid.UUID,
+    body: ToolAdapterUpdate,
+    session: Session = Depends(get_session),
+) -> dict:
+    adapter = session.get(ToolAdapter, adapter_id)
+    if adapter is None:
+        raise HTTPException(
+            status_code=404, detail=f"tool_adapter {adapter_id} no encontrado."
+        )
+    for field_name, value in body.model_dump(exclude_unset=True).items():
+        setattr(adapter, field_name, value)
+    session.commit()
+    session.refresh(adapter)
+    return _tool_adapter_to_dict(adapter)
+
+
+@app.delete("/tool-adapters/{adapter_id}", status_code=204)
+def delete_tool_adapter(
+    adapter_id: uuid.UUID, session: Session = Depends(get_session)
+) -> None:
+    adapter = session.get(ToolAdapter, adapter_id)
+    if adapter is None:
+        raise HTTPException(
+            status_code=404, detail=f"tool_adapter {adapter_id} no encontrado."
+        )
+    session.delete(adapter)
+    session.commit()
+
+
+# ---------------------------------------------------------------------
+# CRUD /production-templates
+# ---------------------------------------------------------------------
+
+
+@app.get("/production-templates", response_model=list[dict])
+def list_production_templates(
+    content_type: str | None = None,
+    phase: str | None = None,
+    session: Session = Depends(get_session),
+) -> list[dict]:
+    stmt = select(ProductionTemplate)
+    if content_type is not None:
+        stmt = stmt.where(ProductionTemplate.content_type == content_type)
+    if phase is not None:
+        stmt = stmt.where(ProductionTemplate.phase == phase)
+    stmt = stmt.order_by(ProductionTemplate.created_at.desc())
+    rows = session.execute(stmt).scalars().all()
+    return [_production_template_to_dict(t) for t in rows]
+
+
+@app.post("/production-templates", status_code=201)
+def create_production_template(
+    body: ProductionTemplateCreate, session: Session = Depends(get_session)
+) -> dict:
+    exists = session.execute(
+        select(ProductionTemplate).where(ProductionTemplate.name == body.name)
+    ).scalar_one_or_none()
+    if exists is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Ya existe un production_template con name {body.name!r}.",
+        )
+    template = ProductionTemplate(**body.model_dump())
+    session.add(template)
+    session.commit()
+    session.refresh(template)
+    return _production_template_to_dict(template)
+
+
+@app.get("/production-templates/{template_id}", response_model=dict)
+def get_production_template(
+    template_id: uuid.UUID, session: Session = Depends(get_session)
+) -> dict:
+    template = session.get(ProductionTemplate, template_id)
+    if template is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"production_template {template_id} no encontrado.",
+        )
+    return _production_template_to_dict(template)
+
+
+@app.patch("/production-templates/{template_id}", response_model=dict)
+def update_production_template(
+    template_id: uuid.UUID,
+    body: ProductionTemplateUpdate,
+    session: Session = Depends(get_session),
+) -> dict:
+    template = session.get(ProductionTemplate, template_id)
+    if template is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"production_template {template_id} no encontrado.",
+        )
+    for field_name, value in body.model_dump(exclude_unset=True).items():
+        setattr(template, field_name, value)
+    session.commit()
+    session.refresh(template)
+    return _production_template_to_dict(template)
+
+
+@app.delete("/production-templates/{template_id}", status_code=204)
+def delete_production_template(
+    template_id: uuid.UUID, session: Session = Depends(get_session)
+) -> None:
+    template = session.get(ProductionTemplate, template_id)
+    if template is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"production_template {template_id} no encontrado.",
+        )
+    session.delete(template)
+    session.commit()
+
+
+# ---------------------------------------------------------------------
+# Manifiestos por artefacto: /artifacts/{id}/manifests
+# ---------------------------------------------------------------------
+
+
+@app.get("/artifacts/{artifact_id}/manifests", response_model=list[dict])
+def list_artifact_manifests(
+    artifact_id: uuid.UUID, session: Session = Depends(get_session)
+) -> list[dict]:
+    _get_artifact_or_404(session, artifact_id)
+    rows = list_manifests(session, artifact_id)
+    return [_production_manifest_to_dict(m) for m in rows]
+
+
+@app.post("/artifacts/{artifact_id}/manifests", status_code=201)
+def create_artifact_manifest(
+    artifact_id: uuid.UUID,
+    body: ManifestCreate,
+    session: Session = Depends(get_session),
+) -> dict:
+    _get_artifact_or_404(session, artifact_id)
+    manifest = create_manifest(session, artifact_id, body.manifest)
+    session.commit()
+    session.refresh(manifest)
+    return _production_manifest_to_dict(manifest)
+
+
+@app.get("/artifacts/{artifact_id}/manifests/{version}", response_model=dict)
+def get_artifact_manifest(
+    artifact_id: uuid.UUID,
+    version: int,
+    session: Session = Depends(get_session),
+) -> dict:
+    _get_artifact_or_404(session, artifact_id)
+    manifest = load_manifest(session, artifact_id, version)
+    if manifest is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"manifiesto versión {version} del artefacto {artifact_id} no encontrado.",
+        )
+    return _production_manifest_to_dict(manifest)
+
+
+# ---------------------------------------------------------------------
+# Jobs por artefacto: /artifacts/{id}/jobs
+# ---------------------------------------------------------------------
+
+
+@app.get("/artifacts/{artifact_id}/jobs", response_model=list[dict])
+def list_artifact_jobs(
+    artifact_id: uuid.UUID, session: Session = Depends(get_session)
+) -> list[dict]:
+    _get_artifact_or_404(session, artifact_id)
+    rows = (
+        session.execute(
+            select(AssetJob)
+            .where(AssetJob.artifact_id == artifact_id)
+            .order_by(AssetJob.sequence_order)
+        )
+        .scalars()
+        .all()
+    )
+    return [_asset_job_to_dict(j) for j in rows]
+
+
+# ---------------------------------------------------------------------
+# Endpoint disparador: POST /artifacts/{id}/produce
+# ---------------------------------------------------------------------
+
+
+@app.post("/artifacts/{artifact_id}/produce", response_model=dict)
+def produce_artifact(
+    artifact_id: uuid.UUID,
+    body: ProduceRequest | None = None,
+    session: Session = Depends(get_session),
+) -> dict:
+    """Dispara la cadena de herramientas del artefacto (diseño §17 pt. 14).
+
+    Si `body.manifest` viene, crea una versión nueva del manifiesto antes de
+    orquestar. Los errores de orquestación (sin format_spec, sin manifiesto,
+    tool_chain rota) se devuelven como 409; cualquier otro error es 500.
+    """
+    _get_artifact_or_404(session, artifact_id)
+    body = body or ProduceRequest()
+    manifest_version = body.manifest_version
+    if body.manifest is not None:
+        manifest = create_manifest(session, artifact_id, body.manifest)
+        session.commit()
+        session.refresh(manifest)
+        manifest_version = manifest.version
+    try:
+        orchestrator = Orchestrator(session)
+        result = orchestrator.run_tool_chain(artifact_id, manifest_version)
+        session.commit()  # el orquestador no commitea a propósito (Fase 2)
+        return result
+    except OrchestrationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:  # error inesperado del orquestador
+        raise HTTPException(
+            status_code=500, detail=f"Error al producir el artefacto: {exc}"
+        ) from exc
+
+
+# ---------------------------------------------------------------------
+# Validación de la cadena de herramientas (arranque/debug)
+# ---------------------------------------------------------------------
+
+
+@app.get("/tools/validate", response_model=dict)
+def validate_tools(session: Session = Depends(get_session)) -> dict:
+    errors = validate_tool_chain(session)
+    return {"errors": errors}
+
+
+# ---------------------------------------------------------------------
+# Fase 4 — Proyectos (0007): projects + project_versions (diseño §20)
+# ---------------------------------------------------------------------
+
+
+class ProjectCreate(BaseModel):
+    name: str = Field(..., examples=["Corto Escape — IA local"])
+    topic: str = Field(..., examples=["IA local vs nube: costes reales"])
+    template_id: uuid.UUID | None = None
+    brand_objective: str | None = None
+    artifact_type: str | None = None
+
+
+class ProjectUpdate(BaseModel):
+    name: str | None = None
+    topic: str | None = None
+    template_id: uuid.UUID | None = None
+    brand_objective: str | None = None
+    artifact_type: str | None = None
+    status: str | None = None
+
+
+class ProjectApprove(BaseModel):
+    json_editado: dict = Field(..., examples=[{"guion_vocal": "..."}])
+
+
+class ProjectRollback(BaseModel):
+    version: int = Field(..., examples=[1])
+
+
+def _project_to_dict(p: Project) -> dict:
+    return {
+        "id": str(p.id),
+        "name": p.name,
+        "topic": p.topic,
+        "template_id": str(p.template_id) if p.template_id else None,
+        "brand_objective": _val(p.brand_objective),
+        "artifact_type": p.artifact_type,
+        "status": p.status,
+        "current_version": p.current_version,
+        "storage_path": p.storage_path,
+        "created_at": p.created_at.isoformat() if p.created_at else None,
+        "updated_at": p.updated_at.isoformat() if p.updated_at else None,
+    }
+
+
+def _project_version_to_dict(v: ProjectVersion) -> dict:
+    return {
+        "id": str(v.id),
+        "project_id": str(v.project_id),
+        "version": v.version,
+        "snapshot": v.snapshot or {},
+        "created_at": v.created_at.isoformat() if v.created_at else None,
+    }
+
+
+def _get_project_or_404(session: Session, project_id: uuid.UUID) -> Project:
+    project = session.get(Project, project_id)
+    if project is None:
+        raise HTTPException(
+            status_code=404, detail=f"proyecto {project_id} no encontrado."
+        )
+    return project
+
+
+def _get_project_version_or_404(
+    session: Session, project_id: uuid.UUID, version: int
+) -> ProjectVersion:
+    row = session.execute(
+        select(ProjectVersion).where(
+            ProjectVersion.project_id == project_id,
+            ProjectVersion.version == version,
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"versión {version} del proyecto {project_id} no encontrada.",
+        )
+    return row
+
+
+def _next_project_version(session: Session, project_id: uuid.UUID) -> int:
+    rows = (
+        session.execute(
+            select(ProjectVersion.version)
+            .where(ProjectVersion.project_id == project_id)
+            .order_by(ProjectVersion.version.desc())
+        )
+        .scalars()
+        .all()
+    )
+    return (rows[0] if rows else 0) + 1
+
+
+@app.post("/project/new", status_code=201)
+def create_project(
+    body: ProjectCreate, session: Session = Depends(get_session)
+) -> dict:
+    """Crea un proyecto en estado 'borrador' con su versión 1 de snapshot
+    (esqueleto vacío {}; el flujo de generación lo llena después)."""
+    if body.template_id is not None:
+        template = session.get(ProductionTemplate, body.template_id)
+        if template is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"production_template {body.template_id} no encontrado.",
+            )
+    project = Project(
+        name=body.name,
+        topic=body.topic,
+        template_id=body.template_id,
+        brand_objective=body.brand_objective,
+        artifact_type=body.artifact_type,
+        status="borrador",
+        current_version=1,
+    )
+    session.add(project)
+    session.flush()  # asigna id para poder referenciarlo en la versión
+    version = ProjectVersion(project_id=project.id, version=1, snapshot={})
+    session.add(version)
+    session.commit()
+    session.refresh(project)
+    session.refresh(version)
+    return {
+        "project": _project_to_dict(project),
+        "version": _project_version_to_dict(version),
+    }
+
+
+@app.get("/projects", response_model=list[dict])
+def list_projects(
+    status: str | None = None,
+    artifact_type: str | None = None,
+    session: Session = Depends(get_session),
+) -> list[dict]:
+    stmt = select(Project)
+    if status is not None:
+        stmt = stmt.where(Project.status == status)
+    if artifact_type is not None:
+        stmt = stmt.where(Project.artifact_type == artifact_type)
+    stmt = stmt.order_by(Project.created_at.desc())
+    rows = session.execute(stmt).scalars().all()
+    return [_project_to_dict(p) for p in rows]
+
+
+@app.get("/projects/{project_id}", response_model=dict)
+def get_project(project_id: uuid.UUID, session: Session = Depends(get_session)) -> dict:
+    project = _get_project_or_404(session, project_id)
+    return _project_to_dict(project)
+
+
+@app.patch("/projects/{project_id}", response_model=dict)
+def update_project(
+    project_id: uuid.UUID,
+    body: ProjectUpdate,
+    session: Session = Depends(get_session),
+) -> dict:
+    project = _get_project_or_404(session, project_id)
+    for field_name, value in body.model_dump(exclude_unset=True).items():
+        setattr(project, field_name, value)
+    session.commit()
+    session.refresh(project)
+    return _project_to_dict(project)
+
+
+@app.delete("/projects/{project_id}", status_code=204)
+def delete_project(
+    project_id: uuid.UUID, session: Session = Depends(get_session)
+) -> None:
+    project = _get_project_or_404(session, project_id)
+    session.delete(project)  # CASCADE borra las versiones
+    session.commit()
+
+
+@app.get("/projects/{project_id}/versions", response_model=list[dict])
+def list_project_versions(
+    project_id: uuid.UUID, session: Session = Depends(get_session)
+) -> list[dict]:
+    _get_project_or_404(session, project_id)
+    rows = (
+        session.execute(
+            select(ProjectVersion)
+            .where(ProjectVersion.project_id == project_id)
+            .order_by(ProjectVersion.version.desc())
+        )
+        .scalars()
+        .all()
+    )
+    return [_project_version_to_dict(v) for v in rows]
+
+
+@app.get("/projects/{project_id}/versions/{version}", response_model=dict)
+def get_project_version(
+    project_id: uuid.UUID,
+    version: int,
+    session: Session = Depends(get_session),
+) -> dict:
+    _get_project_or_404(session, project_id)
+    row = _get_project_version_or_404(session, project_id, version)
+    return _project_version_to_dict(row)
+
+
+@app.post("/projects/{project_id}/approve", response_model=dict)
+def approve_project(
+    project_id: uuid.UUID,
+    body: ProjectApprove,
+    session: Session = Depends(get_session),
+) -> dict:
+    """Aprueba el JSON editado: lo guarda como versión nueva (max+1),
+    actualiza current_version y marca el proyecto 'aprobado' con su
+    storage_path resuelto contra ASSET_STORAGE_PATH (§20.8)."""
+    project = _get_project_or_404(session, project_id)
+    new_version = _next_project_version(session, project_id)
+    version = ProjectVersion(
+        project_id=project.id, version=new_version, snapshot=body.json_editado
+    )
+    session.add(version)
+    project.current_version = new_version
+    project.status = "aprobado"
+    project.storage_path = f"{get_settings().asset_storage_path}/projects/{project_id}"
+    session.commit()
+    session.refresh(project)
+    session.refresh(version)
+    return {
+        "project": _project_to_dict(project),
+        "version": _project_version_to_dict(version),
+    }
+
+
+@app.post("/projects/{project_id}/rollback", response_model=dict)
+def rollback_project(
+    project_id: uuid.UUID,
+    body: ProjectRollback,
+    session: Session = Depends(get_session),
+) -> dict:
+    """Restaura un snapshot anterior como versión NUEVA (el historial nunca
+    se pierde), actualiza current_version y vuelve a 'en_edicion'."""
+    project = _get_project_or_404(session, project_id)
+    old = _get_project_version_or_404(session, project_id, body.version)
+    new_version = _next_project_version(session, project_id)
+    version = ProjectVersion(
+        project_id=project.id, version=new_version, snapshot=old.snapshot
+    )
+    session.add(version)
+    project.current_version = new_version
+    project.status = "en_edicion"
+    session.commit()
+    session.refresh(project)
+    session.refresh(version)
+    return {
+        "project": _project_to_dict(project),
+        "version": _project_version_to_dict(version),
+    }
+
+
+# ---------------------------------------------------------------------
+# Fase 5 — Flujo agéntico de proyectos (0008, diseño §20.3-§20.5):
+# generate / refine / produce / postproduction
+# ---------------------------------------------------------------------
+
+
+class ProjectGenerate(BaseModel):
+    topic: str | None = None
+
+
+class ProjectRefine(BaseModel):
+    rag_context: str | None = None
+    use_llm: bool = False
+
+
+class ProjectProduce(BaseModel):
+    pass
+
+
+@app.post("/projects/{project_id}/generate", response_model=dict)
+def generate_project(
+    project_id: uuid.UUID,
+    body: ProjectGenerate | None = None,
+    session: Session = Depends(get_session),
+) -> dict:
+    """Genera el snapshot JSON del proyecto vía LLM (compilador, §20.3).
+
+    El LLM escribe datos (el snapshot), nunca edita archivos. Si la decisión
+    requiere aceptación del usuario (degradada/saltada, 0007), NO se guarda
+    versión nueva: se devuelve el contrato con el snapshot determinista para
+    que el humano revise (puede editar y aprobar, o reintentar).
+    """
+    project = _get_project_or_404(session, project_id)
+    template = None
+    if project.template_id is not None:
+        template = session.get(ProductionTemplate, project.template_id)
+    format_spec = resolve_format_spec(
+        session, project.brand_objective, project.artifact_type
+    )
+    result = generate_snapshot(session, project, template, format_spec)
+
+    if result.get("requires_user_acceptance"):
+        # 0007: degradación/skip → el pipeline se pausa; no se guarda versión.
+        return {
+            "project": _project_to_dict(project),
+            "decision": result,
+        }
+
+    new_version = _next_project_version(session, project_id)
+    version = ProjectVersion(
+        project_id=project.id, version=new_version, snapshot=result["snapshot"]
+    )
+    session.add(version)
+    project.current_version = new_version
+    project.status = "en_edicion"
+    session.commit()
+    session.refresh(project)
+    session.refresh(version)
+    return {
+        "project": _project_to_dict(project),
+        "version": _project_version_to_dict(version),
+        "decision": result,
+    }
+
+
+@app.post("/projects/{project_id}/refine", response_model=dict)
+def refine_project(
+    project_id: uuid.UUID,
+    body: ProjectRefine | None = None,
+    session: Session = Depends(get_session),
+) -> dict:
+    """Refina el snapshot actual con reglas deterministas (+ LLM opcional).
+
+    Reglas de negocio en código (qa_checks/constraints de la spec); el LLM
+    solo corrige warnings si use_llm=True y degrada si falla. Si la decisión
+    requiere aceptación del usuario (degradada/saltada, 0007), NO se guarda
+    versión nueva: se devuelve el contrato con el resultado determinista.
+    """
+    project = _get_project_or_404(session, project_id)
+    current = _get_project_version_or_404(session, project_id, project.current_version)
+    result = refine_snapshot(
+        session,
+        project,
+        current.snapshot,
+        rag_context=body.rag_context if body else None,
+        use_llm=body.use_llm if body else False,
+    )
+
+    if result.get("requires_user_acceptance"):
+        # 0007: degradación/skip → el pipeline se pausa; no se guarda versión.
+        return {
+            "project": _project_to_dict(project),
+            "decision": result,
+        }
+
+    new_version = _next_project_version(session, project_id)
+    version = ProjectVersion(
+        project_id=project.id, version=new_version, snapshot=result["snapshot"]
+    )
+    session.add(version)
+    project.current_version = new_version
+    session.commit()
+    session.refresh(project)
+    session.refresh(version)
+    return {
+        "project": _project_to_dict(project),
+        "version": _project_version_to_dict(version),
+        "decision": result,
+    }
+
+
+@app.post("/projects/{project_id}/produce", response_model=dict)
+def produce_project_endpoint(
+    project_id: uuid.UUID,
+    body: ProjectProduce | None = None,
+    session: Session = Depends(get_session),
+) -> dict:
+    """Dispara la cadena de herramientas del proyecto (§20.3).
+
+    Solo proyectos 'aprobado'. El orquestador no commitea a propósito
+    (Fase 2): este endpoint commitea después de produce_project. Los
+    errores de orquestación se mapean a 409; cualquier otro error a 500.
+    """
+    project = _get_project_or_404(session, project_id)
+    if project.status != "aprobado":
+        raise HTTPException(
+            status_code=409,
+            detail="el proyecto debe estar aprobado antes de producir",
+        )
+    current = _get_project_version_or_404(session, project_id, project.current_version)
+    try:
+        result = produce_project(session, project, current.snapshot)
+        session.commit()  # el orquestador no commitea a propósito (Fase 2)
+        return {
+            "project": _project_to_dict(project),
+            "artifact_id": result["artifact_id"],
+            "manifest_version": result["manifest_version"],
+            "result": result["result"],
+        }
+    except OrchestrationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 — error inesperado del orquestador
+        raise HTTPException(
+            status_code=500, detail=f"Error al producir el proyecto: {exc}"
+        ) from exc
+
+
+@app.get("/projects/{project_id}/postproduction", response_model=dict)
+def project_postproduction(
+    project_id: uuid.UUID, session: Session = Depends(get_session)
+) -> dict:
+    """Recomendaciones algorítmicas de post-producción (§20.4, modo 2).
+
+    Deterministas, sin LLM: templates de fase 'postproduccion' agrupados
+    por content_type, parametrizados con el snapshot actual.
+    """
+    project = _get_project_or_404(session, project_id)
+    current = _get_project_version_or_404(session, project_id, project.current_version)
+    return postproduction_recommendations(session, project, current.snapshot)

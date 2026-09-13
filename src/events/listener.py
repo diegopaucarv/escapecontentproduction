@@ -17,6 +17,7 @@ artifact_library, para que la próxima búsqueda de duplicado
 (novelty_router.find_closest_prior_artifact) tenga en cuenta qué tan
 bien funcionó esa pieza, no solo su similitud semántica.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -43,15 +44,16 @@ _METRIC_COLUMN_BY_EVENT_TYPE = {
 
 
 class TelemetryListener:
-    def __init__(self, dsn: str, handler: Handler):
+    def __init__(self, dsn: str, handler: Handler, channel: str = "telemetry_channel"):
         self._dsn = dsn
         self._handler = handler
+        self._channel = channel
         self._conn: asyncpg.Connection | None = None
 
     async def start(self) -> None:
         self._conn = await asyncpg.connect(self._dsn)
-        await self._conn.add_listener("telemetry_channel", self._on_notify)
-        logger.info("Escuchando telemetry_channel...")
+        await self._conn.add_listener(self._channel, self._on_notify)
+        logger.info("Escuchando %s...", self._channel)
         try:
             while True:
                 await asyncio.sleep(3600)  # el listener real reacciona por callback
@@ -60,7 +62,7 @@ class TelemetryListener:
 
     async def stop(self) -> None:
         if self._conn is not None:
-            await self._conn.remove_listener("telemetry_channel", self._on_notify)
+            await self._conn.remove_listener(self._channel, self._on_notify)
             await self._conn.close()
 
     def _on_notify(self, connection, pid, channel, payload: str) -> None:
@@ -83,17 +85,27 @@ async def close_rag_loop(telemetry_event_id: str) -> None:
             int(telemetry_event_id),
         )
         if event is None or event["artifact_id"] is None:
-            logger.info("telemetry_events.id=%s sin artifact_id asociado, se ignora", telemetry_event_id)
+            logger.info(
+                "telemetry_events.id=%s sin artifact_id asociado, se ignora",
+                telemetry_event_id,
+            )
             return
 
         column = _METRIC_COLUMN_BY_EVENT_TYPE.get(event["event_type"])
         if column is None:
-            logger.debug("event_type=%s no mapea a una métrica de artifact_library", event["event_type"])
+            logger.debug(
+                "event_type=%s no mapea a una métrica de artifact_library",
+                event["event_type"],
+            )
             return
 
         value = event["payload"].get("value") if event["payload"] else None
         if value is None:
-            logger.warning("telemetry_events.id=%s (%s) sin 'value' en payload", telemetry_event_id, event["event_type"])
+            logger.warning(
+                "telemetry_events.id=%s (%s) sin 'value' en payload",
+                telemetry_event_id,
+                event["event_type"],
+            )
             return
 
         # Promedio simple con el valor existente (si lo hay). Ver nota
@@ -109,19 +121,52 @@ async def close_rag_loop(telemetry_event_id: str) -> None:
         )
         logger.info(
             "artifact_library actualizada: artifact_id=%s %s=%s",
-            event["artifact_id"], column, value,
+            event["artifact_id"],
+            column,
+            value,
         )
     finally:
         await conn.close()
 
 
+async def on_asset_job_notify(payload: str) -> None:
+    """Handler del canal `asset_jobs_channel` (diseño §17 pt. 14).
+
+    Observabilidad futura: cuando un AssetJob cambia a done/failed, el
+    trigger SQL (aún no creado) notificará por pg_notify y este handler
+    loguea el evento. El endpoint /produce ya ejecuta la cadena de forma
+    síncrona, así que este canal es solo para trazabilidad/automatización
+    posterior — no bloquea la producción.
+    """
+    try:
+        data = json.loads(payload)
+    except (TypeError, ValueError):
+        logger.warning("asset_jobs_channel: payload no-JSON ignorado: %r", payload)
+        return
+    job_id = data.get("job_id") or data.get("id")
+    status = data.get("status")
+    if status in ("done", "failed"):
+        logger.info(
+            "asset_job %s -> %s (artifact_id=%s)",
+            job_id,
+            status,
+            data.get("artifact_id"),
+        )
+    else:
+        logger.debug("asset_job %s -> %s (sin acción)", job_id, status)
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     settings = get_settings()
-    listener = TelemetryListener(settings.database_url_async, close_rag_loop)
-    await listener.start()
+    telemetry = TelemetryListener(settings.database_url_async, close_rag_loop)
+    jobs = TelemetryListener(
+        settings.database_url_async, on_asset_job_notify, channel="asset_jobs_channel"
+    )
+    # Ambos canales en el mismo bucle: telemetría (RAG) y asset_jobs
+    # (observabilidad de producción).
+    await asyncio.gather(telemetry.start(), jobs.start())
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-

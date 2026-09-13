@@ -12,20 +12,21 @@ Este documento **no crea un proceso nuevo**. Toma el proceso de gestión de proy
 
 ### Fuentes que integra (jerarquía de lectura)
 
-| # | Documento | Qué aporta a este pipeline |
-|---|---|---|
-| 1 | Diagrama de proceso general de la organización (versión Mermaid entregada por Diego) | La columna vertebral: fases, gates, timeboxes, roles por color, rutas Fast/Complete/Repetitivo, ciclo Kaizen, aprendizaje automatizado |
-| 2 | `docs/arquitectura_comercial_y_contenidos_escape_ergalia.md` (canon) | Taxonomía de segmentos, catálogo de ofertas, funnel, campos mínimos de brief, reglas de elegibilidad verde/amarillo/rojo |
-| 3 | `docs/ergalia/ergalia_guia_contenidos_y_produccion.md` | Buckets, formatos, reglas de evidencia/anonimización, flujo editorial, métricas Ergalia |
-| 4 | `docs/escape/escape_guia_contenidos_y_produccion.md` | Buckets, formatos, palancas persuasivas, gobernanza editorial, flujo editorial, métricas ESCAPE |
-| 5 | `docs/ergalia/ergalia_lenguaje_visual.md` | Sistema visual Ergalia (paleta, tipografía, composición, biblioteca de assets) |
-| 6 | `docs/escape/escape_lenguaje_visual.md` | Sistema visual ESCAPE (paleta, tipografía, composición, biblioteca de assets) |
-| 7 | `docs/ergalia/ergalia_mkt_operativo.md` | Calendario, protocolo de leads/PoC, roles, métricas, crisis Ergalia |
-| 8 | `docs/escape/escape_mkt_operativo.md` | Calendario, onboarding, comunidad, roles, métricas, crisis ESCAPE |
-| 9 | `docs/ergalia/ergalia_plan_ejecucion.md` / `docs/escape/escape_plan_ejecucion.md` | Fases-gate (G1–G3) del roadmap de cada marca — contexto para `phase_number` |
-| 10 | `docs/guia_dashboard.md` §17 ("Strategic Production OS") | Especificación de las entidades técnicas (`ContentBrief`, `PipelineTemplate`, `ContentArtifact`, `RepurposeLink`, IA) que este documento usa como **funcional de referencia** |
+| #   | Documento                                                                            | Qué aporta a este pipeline                                                                                                                                                    |
+| --- | ------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Diagrama de proceso general de la organización (versión Mermaid entregada por Diego) | La columna vertebral: fases, gates, timeboxes, roles por color, rutas Fast/Complete/Repetitivo, ciclo Kaizen, aprendizaje automatizado                                        |
+| 2   | `docs/arquitectura_comercial_y_contenidos_escape_ergalia.md` (canon)                 | Taxonomía de segmentos, catálogo de ofertas, funnel, campos mínimos de brief, reglas de elegibilidad verde/amarillo/rojo                                                      |
+| 3   | `docs/ergalia/ergalia_guia_contenidos_y_produccion.md`                               | Buckets, formatos, reglas de evidencia/anonimización, flujo editorial, métricas Ergalia                                                                                       |
+| 4   | `docs/escape/escape_guia_contenidos_y_produccion.md`                                 | Buckets, formatos, palancas persuasivas, gobernanza editorial, flujo editorial, métricas ESCAPE                                                                               |
+| 5   | `docs/ergalia/ergalia_lenguaje_visual.md`                                            | Sistema visual Ergalia (paleta, tipografía, composición, biblioteca de assets)                                                                                                |
+| 6   | `docs/escape/escape_lenguaje_visual.md`                                              | Sistema visual ESCAPE (paleta, tipografía, composición, biblioteca de assets)                                                                                                 |
+| 7   | `docs/ergalia/ergalia_mkt_operativo.md`                                              | Calendario, protocolo de leads/PoC, roles, métricas, crisis Ergalia                                                                                                           |
+| 8   | `docs/escape/escape_mkt_operativo.md`                                                | Calendario, onboarding, comunidad, roles, métricas, crisis ESCAPE                                                                                                             |
+| 9   | `docs/ergalia/ergalia_plan_ejecucion.md` / `docs/escape/escape_plan_ejecucion.md`    | Fases-gate (G1–G3) del roadmap de cada marca — contexto para `phase_number`                                                                                                   |
+| 10  | `docs/guia_dashboard.md` §17 ("Strategic Production OS")                             | Especificación de las entidades técnicas (`ContentBrief`, `PipelineTemplate`, `ContentArtifact`, `RepurposeLink`, IA) que este documento usa como **funcional de referencia** |
 
 ### Qué NO reemplaza
+
 - La estrategia de marca (mandan `ergalia_mkt_estrategico.md` y `escape_mkt_estrategico.md`).
 - El tono, los buckets y las reglas editoriales de cada marca (mandan las guías de contenido y producción por marca).
 - El sistema visual de cada marca (mandan los `_lenguaje_visual.md`).
@@ -34,6 +35,7 @@ Este documento **no crea un proceso nuevo**. Toma el proceso de gestión de proy
 Este documento es la **capa de orquestación**: dice en qué orden, con qué gates, con qué artefactos y con qué responsables se ejecuta todo lo anterior.
 
 ### Regla de jerarquía
+
 Si una decisión de este pipeline contradice el canon, una guía de marca o un plan estratégico, **manda el documento de rango superior** (canon > guía de marca > este pipeline en materia de contenido; plan estratégico > todo en materia de negocio). Este documento manda únicamente en materia de **secuencia, gates y trazabilidad de proceso**.
 
 ---
@@ -48,18 +50,18 @@ Lo que cambia entre "un proyecto de producto" y "una pieza de contenido" no es l
 
 ### 1.1 Tabla de equivalencia — fase genérica → fase de contenido
 
-| Fase del proceso general | Equivalente en producción de contenido | Marca(s) |
-|---|---|---|
-| Recepción / Brief | Recepción de idea, dato, hallazgo, solicitud de cliente o slot de calendario → `ContentBrief` | Ambas |
-| Cálculo de novelty_score | Clasificar la pieza en **Repetitiva / Solución previa / Nueva solución** (ver §4.4) | Ambas |
-| Discovery | Ideación editorial: encontrar el ángulo, el dato incómodo o el mecanismo (el "Chispazo") | Ambas |
-| Sprint 2D | Prototipo de una sola pieza (borrador + gancho) probado con 5 lectores/usuarios reales | Ambas |
-| Fast-Probe | Publicación piloto de una pieza nueva a audiencia reducida, con KPIs e iteración acotada | Ambas |
-| Full Development | Producción de una **pieza madre** que se atomiza en múltiples formatos/canales (campaña) | Ambas |
-| Pre-Deploy Gate | Checklist de publicación de marca + revisión de datos/materiales/logística | Ambas, checklist distinto |
-| Kaizen / Producción | Producción recurrente de calendario (posts semanales, shorts, newsletters) | Ambas |
-| Deploy | Publicación, rollout por canal, monitoreo, manejo de incidente | Ambas |
-| Learning & Automation | Métricas, postmortem, alimentación del sistema de IA/plantillas | Ambas |
+| Fase del proceso general | Equivalente en producción de contenido                                                        | Marca(s)                  |
+| ------------------------ | --------------------------------------------------------------------------------------------- | ------------------------- |
+| Recepción / Brief        | Recepción de idea, dato, hallazgo, solicitud de cliente o slot de calendario → `ContentBrief` | Ambas                     |
+| Cálculo de novelty_score | Clasificar la pieza en **Repetitiva / Solución previa / Nueva solución** (ver §4.4)           | Ambas                     |
+| Discovery                | Ideación editorial: encontrar el ángulo, el dato incómodo o el mecanismo (el "Chispazo")      | Ambas                     |
+| Sprint 2D                | Prototipo de una sola pieza (borrador + gancho) probado con 5 lectores/usuarios reales        | Ambas                     |
+| Fast-Probe               | Publicación piloto de una pieza nueva a audiencia reducida, con KPIs e iteración acotada      | Ambas                     |
+| Full Development         | Producción de una **pieza madre** que se atomiza en múltiples formatos/canales (campaña)      | Ambas                     |
+| Pre-Deploy Gate          | Checklist de publicación de marca + revisión de datos/materiales/logística                    | Ambas, checklist distinto |
+| Kaizen / Producción      | Producción recurrente de calendario (posts semanales, shorts, newsletters)                    | Ambas                     |
+| Deploy                   | Publicación, rollout por canal, monitoreo, manejo de incidente                                | Ambas                     |
+| Learning & Automation    | Métricas, postmortem, alimentación del sistema de IA/plantillas                               | Ambas                     |
 
 ---
 
@@ -269,87 +271,87 @@ El Brief es la única ficha que un contenido necesita para atravesar todo el pip
 
 ### 3.1 Bloque A — Identificación y meta (origen: proceso general)
 
-| Campo | Valores / tipo | Descripción |
-|---|---|---|
-| `id` | string | Identificador único del brief |
-| `owner` | string | Responsable que ejecuta y responde por la pieza |
-| `status` | `idea` \| `brief` \| `generando` \| `revision` \| `aprobado` \| `produccion` \| `publicado` \| `aprendido` \| `archivado` | Estado dentro del pipeline |
-| `created_at` / `updated_at` | fecha | Trazabilidad |
+| Campo                       | Valores / tipo                                                                                                            | Descripción                                     |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------- |
+| `id`                        | string                                                                                                                    | Identificador único del brief                   |
+| `owner`                     | string                                                                                                                    | Responsable que ejecuta y responde por la pieza |
+| `status`                    | `idea` \| `brief` \| `generando` \| `revision` \| `aprobado` \| `produccion` \| `publicado` \| `aprendido` \| `archivado` | Estado dentro del pipeline                      |
+| `created_at` / `updated_at` | fecha                                                                                                                     | Trazabilidad                                    |
 
 ### 3.2 Bloque B — Origen y contexto (origen: Brief genérico de la organización)
 
-| Campo | Descripción |
-|---|---|
-| `resumen` | Qué se pide y por qué, en 3–5 líneas |
-| `insight_core` | El "pergamino" — el mecanismo, dato o ángulo central de la pieza |
-| `15s_pitch` | La promesa de la pieza reducida a lo que se entiende en 15 segundos |
-| `prior_attempts` | Piezas anteriores sobre el mismo tema/caso (link a Artifact Library) |
-| `risks` | Riesgos editoriales, reputacionales o de exposición identificados de entrada |
-| `novelty_indicators` | Señales usadas para el enrutamiento (ver §4.4) |
-| `suggested_product_type` | Sugerencia inicial de formato, sujeta a validación en Discovery |
+| Campo                     | Descripción                                                                                                    |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `resumen`                 | Qué se pide y por qué, en 3–5 líneas                                                                           |
+| `insight_core`            | El "pergamino" — el mecanismo, dato o ángulo central de la pieza                                               |
+| `15s_pitch`               | La promesa de la pieza reducida a lo que se entiende en 15 segundos                                            |
+| `prior_attempts`          | Piezas anteriores sobre el mismo tema/caso (link a Artifact Library)                                           |
+| `risks`                   | Riesgos editoriales, reputacionales o de exposición identificados de entrada                                   |
+| `novelty_indicators`      | Señales usadas para el enrutamiento (ver §4.4)                                                                 |
+| `suggested_product_type`  | Sugerencia inicial de formato, sujeta a validación en Discovery                                                |
 | `org_priorities_contrast` | Contraste explícito con las prioridades vigentes del plan de marca (evita piezas "bonitas" sin prioridad real) |
 
 ### 3.3 Bloque C — Jerarquía canónica (origen: canon + `phase_number`/`growth_motor_id` del dashboard)
 
-| Campo | Valores | Descripción |
-|---|---|---|
-| `brand_objective` | `ESCAPE_SOCIAL` \| `ERGALIA_COMERCIAL` \| `HIBRIDO` | Carril de marca — determina lenguaje visual, tono y checklist aplicables |
-| `phase_number` | 1–4 | Fase del roadmap de la marca (`_plan_ejecucion.md`) a la que aporta esta pieza |
-| `segment_client` | S1–S7 | Segmento-cliente canónico (canon §3.1) |
-| `segment_community` | C1–C4 o vacío | Segmento-comunidad canónico (canon §3.2) |
-| `interlocutor_profile` | mando medio, sponsor, cliente puente, aliado, etc. | Perfil transversal (canon §3.3) |
-| `subprofile` | texto libre | Matiz fino dentro del segmento |
-| `audience_tier` | alcance, lead, comunidad, contribuidor, fan/comprador/donante, cliente | Tier de la escalera de valor (canon §7.1) |
-| `need` / `need_id` | texto / FK | Necesidad concreta que activa la pieza |
-| `change_hypothesis` | texto | "Si publicamos X, esperamos Y" |
+| Campo                  | Valores                                                                | Descripción                                                                    |
+| ---------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `brand_objective`      | `ESCAPE_SOCIAL` \| `ERGALIA_COMERCIAL` \| `HIBRIDO`                    | Carril de marca — determina lenguaje visual, tono y checklist aplicables       |
+| `phase_number`         | 1–4                                                                    | Fase del roadmap de la marca (`_plan_ejecucion.md`) a la que aporta esta pieza |
+| `segment_client`       | S1–S7                                                                  | Segmento-cliente canónico (canon §3.1)                                         |
+| `segment_community`    | C1–C4 o vacío                                                          | Segmento-comunidad canónico (canon §3.2)                                       |
+| `interlocutor_profile` | mando medio, sponsor, cliente puente, aliado, etc.                     | Perfil transversal (canon §3.3)                                                |
+| `subprofile`           | texto libre                                                            | Matiz fino dentro del segmento                                                 |
+| `audience_tier`        | alcance, lead, comunidad, contribuidor, fan/comprador/donante, cliente | Tier de la escalera de valor (canon §7.1)                                      |
+| `need` / `need_id`     | texto / FK                                                             | Necesidad concreta que activa la pieza                                         |
+| `change_hypothesis`    | texto                                                                  | "Si publicamos X, esperamos Y"                                                 |
 
 ### 3.4 Bloque D — Bucket y oferta (origen: guías de marca + canon)
 
-| Campo | Valores | Descripción |
-|---|---|---|
-| `content_bucket` | difusión científica, comunidad intelectual, debate informado, herramienta gratuita, formación aplicada, servicio formal, caso/autoridad, artefacto físico-digital, captación directa (canon §9.1) | Determina el `PipelineTemplate` aplicable (§9) |
-| `service_category` | texto | Solo Ergalia — categoría de servicio |
-| `product_anchor` | texto | Producto ancla del catálogo (canon §6) al que apunta la pieza |
-| `entry_offer` | texto | Oferta de entrada asociada |
+| Campo              | Valores                                                                                                                                                                                           | Descripción                                                   |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| `content_bucket`   | difusión científica, comunidad intelectual, debate informado, herramienta gratuita, formación aplicada, servicio formal, caso/autoridad, artefacto físico-digital, captación directa (canon §9.1) | Determina el `PipelineTemplate` aplicable (§9)                |
+| `service_category` | texto                                                                                                                                                                                             | Solo Ergalia — categoría de servicio                          |
+| `product_anchor`   | texto                                                                                                                                                                                             | Producto ancla del catálogo (canon §6) al que apunta la pieza |
+| `entry_offer`      | texto                                                                                                                                                                                             | Oferta de entrada asociada                                    |
 
 ### 3.5 Bloque E — Artefacto y canal
 
-| Campo | Valores | Descripción |
-|---|---|---|
+| Campo           | Valores                                                                                                                                  | Descripción                                              |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
 | `artifact_type` | post, video corto, video largo, carrusel, one-pager, white paper, PDF/recurso, broadcast, poster/QR, webinar, propuesta, app/herramienta | Tipo de artefacto — ver §7 sistema de formatos por marca |
-| `channel` | LinkedIn, TikTok/Reels/Shorts, YouTube, blog/newsletter, WhatsApp, correo, posters/QR, contacto directo, evento | Canal primario de publicación |
-| `channel_role` | alcance, confianza, conversión, retención, autoridad, comunidad | Rol funcional del canal para esta pieza |
-| `cta` | texto (una sola acción) | CTA único — regla no negociable en ambas marcas |
-| `landing` | URL o vacío | Destino si aplica |
-| `funnel_stage` | texto | Etapa del funnel (canon §7.2) |
+| `channel`       | LinkedIn, TikTok/Reels/Shorts, YouTube, blog/newsletter, WhatsApp, correo, posters/QR, contacto directo, evento                          | Canal primario de publicación                            |
+| `channel_role`  | alcance, confianza, conversión, retención, autoridad, comunidad                                                                          | Rol funcional del canal para esta pieza                  |
+| `cta`           | texto (una sola acción)                                                                                                                  | CTA único — regla no negociable en ambas marcas          |
+| `landing`       | URL o vacío                                                                                                                              | Destino si aplica                                        |
+| `funnel_stage`  | texto                                                                                                                                    | Etapa del funnel (canon §7.2)                            |
 
 ### 3.6 Bloque F — Geografía e idioma
 
-| Campo | Valores |
-|---|---|
-| `language` | es, en, bilingüe |
-| `geography_content` | territorio editorial (canon §8.1) |
-| `geography_sales` | territorio comercial, solo Ergalia (canon §8.2) |
+| Campo               | Valores                                         |
+| ------------------- | ----------------------------------------------- |
+| `language`          | es, en, bilingüe                                |
+| `geography_content` | territorio editorial (canon §8.1)               |
+| `geography_sales`   | territorio comercial, solo Ergalia (canon §8.2) |
 
 ### 3.7 Bloque G — Gobernanza, evidencia y reutilización
 
-| Campo | Descripción |
-|---|---|
-| `evidence_source` | Fuente verificable del claim principal |
-| `risk_level` | bajo, medio, alto |
-| `debate_governance` | Reglas aplicables si `content_bucket = debate_informado` (steelman, fuente, derecho de corrección) |
-| `validation_required` | Qué revisión exige antes de publicar: factual, legal, anonimización, doble lectura, OpSec |
-| `repurpose_plan` | **Campo clave para reutilización multi-formato** — lista explícita de las variantes de formato/canal que se derivarán de esta pieza (ver §10) |
+| Campo                 | Descripción                                                                                                                                   |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `evidence_source`     | Fuente verificable del claim principal                                                                                                        |
+| `risk_level`          | bajo, medio, alto                                                                                                                             |
+| `debate_governance`   | Reglas aplicables si `content_bucket = debate_informado` (steelman, fuente, derecho de corrección)                                            |
+| `validation_required` | Qué revisión exige antes de publicar: factual, legal, anonimización, doble lectura, OpSec                                                     |
+| `repurpose_plan`      | **Campo clave para reutilización multi-formato** — lista explícita de las variantes de formato/canal que se derivarán de esta pieza (ver §10) |
 
 ### 3.8 Bloque H — Métricas y enrutamiento
 
-| Campo | Descripción |
-|---|---|
+| Campo                                 | Descripción                                                                                       |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------- |
 | `metric_primary` / `metric_secondary` | Métricas de éxito, tomadas de la tabla de métricas por bucket de la guía de marca correspondiente |
-| `novelty_score` | Puntaje calculado en Fase 0 (§4.4) |
-| `route_decision` | Repetitivo \| Solución previa detectada \| Nueva solución |
-| `production_route` | Fast \| Complete (solo si `route_decision = Nueva solución`) |
-| `pipeline_template_id` | FK al `PipelineTemplate` del bucket (§9) |
+| `novelty_score`                       | Puntaje calculado en Fase 0 (§4.4)                                                                |
+| `route_decision`                      | Repetitivo \| Solución previa detectada \| Nueva solución                                         |
+| `production_route`                    | Fast \| Complete (solo si `route_decision = Nueva solución`)                                      |
+| `pipeline_template_id`                | FK al `PipelineTemplate` del bucket (§9)                                                          |
 
 ### 3.9 Ciclo de vida del Content Brief (máquina de estados)
 
@@ -380,12 +382,14 @@ stateDiagram-v2
 ## 4. Fase 0 — Recepción, Brief y Enrutamiento (0.5–1d)
 
 ### 4.1 Quién origina un brief
+
 - 🟩 **Cliente o prospecto** (Ergalia): solicitud directa, PoC, brief de gobierno.
 - 🟩 **Comunidad** (ESCAPE): pregunta recurrente, patrón detectado en WhatsApp/grupos, solicitud de un Curioso o Solucionador.
 - 🟦 **CM / Editor**: idea de calendario, dato incómodo detectado, corrección sectorial.
 - 🟨 **Estratega / Fundador**: prioridad estratégica, respuesta a coyuntura, apertura de nuevo bucket o formato.
 
 ### 4.2 Secuencia
+
 1. **BRIEF** — se recibe la solicitud y se redacta el Content Brief (bloques A–H de §3, al menos los campos obligatorios de la tabla 4.3).
 2. **ALIGNMENT** — el Estratega contrasta la pieza contra:
    - el plan estratégico vigente de la marca correspondiente,
@@ -393,14 +397,15 @@ stateDiagram-v2
    - la fase-gate activa del roadmap (`_plan_ejecucion.md`) — una pieza no puede exigir capacidad de una fase que la marca todavía no alcanza.
 3. **LAUNCH_DOC** — Documento de Lanzamiento de contenido. Se completa en dos niveles de peso:
 
-| Nivel | Cuándo aplica | Contenido mínimo |
-|---|---|---|
-| **Ligero** | Ruta Repetitivo, o pieza única de ruta Fast | Objetivo, bucket, top-3 riesgos, CTA |
+| Nivel        | Cuándo aplica                                                                   | Contenido mínimo                                                                                                                                                 |
+| ------------ | ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Ligero**   | Ruta Repetitivo, o pieza única de ruta Fast                                     | Objetivo, bucket, top-3 riesgos, CTA                                                                                                                             |
 | **Completo** | Ruta Complete (campaña multi-formato) o cualquier pieza con `risk_level = alto` | Objetivo, bucket, MOSCOW de las variantes de formato, FODA express, top-3 riesgos, presupuesto (si Ergalia produce con terceros), stakeholders internos/externos |
 
 4. **NOVELTY** — se calcula el enrutamiento (§4.4) y la pieza sigue una de tres rutas.
 
 ### 4.3 Campos obligatorios mínimos para abrir un brief
+
 `resumen`, `insight_core`, `brand_objective`, `segment_client` o `segment_community`, `content_bucket`, `owner`. El resto del schema (§3) se completa progresivamente conforme la pieza avanza de fase — no se exige completo desde el día 0.
 
 ### 4.4 Enrutamiento por novedad — cómo se decide
@@ -415,17 +420,27 @@ El enrutamiento no es un único número: es una búsqueda seguida de un puntaje.
 
 **Paso 2 — Puntaje de novedad** (solo si no hubo duplicado). Escala 0–10, suma de:
 
-| Componente | Peso si aplica |
-|---|---|
-| El `content_bucket` nunca se ha producido para esta marca | +3 |
-| El `artifact_type` nunca se ha producido para esta marca | +2 |
-| El `channel` es nuevo para esta marca | +2 |
-| El ángulo/tema no está cubierto en piezas anteriores | +3 |
+| Componente                                                | Peso si aplica |
+| --------------------------------------------------------- | -------------- |
+| El `content_bucket` nunca se ha producido para esta marca | +3             |
+| El `artifact_type` nunca se ha producido para esta marca  | +2             |
+| El `channel` es nuevo para esta marca                     | +2             |
+| El ángulo/tema no está cubierto en piezas anteriores      | +3             |
 
-| Puntaje | Enrutamiento |
-|---|---|
-| 0–3 | **Repetitivo** — es una variación menor de algo ya calendarizado → `ORDER` |
-| 4–10 | **Nueva solución** → `DISCOVERY_NODE` (§7) |
+| Puntaje | Enrutamiento                                                               |
+| ------- | -------------------------------------------------------------------------- |
+| 0–3     | **Repetitivo** — es una variación menor de algo ya calendarizado → `ORDER` |
+| 4–10    | **Nueva solución** → `DISCOVERY_NODE` (§7)                                 |
+
+**Zona gris — refinamiento LLM (0007).** Cuando el Paso 1 no es concluyente
+(0.70 ≤ similitud < 0.86), el refinador LLM (`src/llm/novelty_refinement.py`)
+juzga si el ángulo está cubierto por piezas previas — es el camino por
+defecto, no una excepción. Si confirma ángulo cubierto, se resta el peso
+del ángulo (+3) del `novelty_score`. Si el LLM no está disponible, se usa
+el default determinista (ángulo nuevo) y la decisión queda marcada
+`requires_user_acceptance=True`: el pipeline se pausa para que el humano
+la acepte. El estado del refinamiento se superfície en `refinement_status`
+(`ok` | `degraded` | `skipped`) — nunca se traga silenciosamente.
 
 **Regla:** el umbral (3/4) es configurable por trimestre en la revisión trimestral de cada marca (Módulo 7.3 Ergalia / Módulo 6.3 ESCAPE) — no se cambia a mitad de ciclo sin registrar el motivo en `/kb/`.
 
@@ -443,13 +458,18 @@ flowchart TD
     E -- No --> G[Solución previa detectada]
     D -- No --> G
     G --> H[OBSOLETE_CHECK / RESEARCH_UPDATE]
-    C -- No --> I["Paso 2: score_novelty()\nbucket_nuevo +3, formato_nuevo +2,\ncanal_nuevo +2, angulo_nuevo +3 (fijo)"]
+    C -- No --> GZ{"Zona gris\n0.70 ≤ similitud < 0.86?"}
+    GZ -- Sí --> R["Refinador LLM (novelty_scoring)\n¿ángulo cubierto? — camino por defecto"]
+    R -- "ok: ángulo cubierto → se resta +3" --> I
+    R -- "ok: ángulo nuevo" --> I
+    R -- "degradado/skipped → ángulo nuevo determinista\n+ requiere aceptación del usuario" --> I
+    GZ -- No --> I["Paso 2: score_novelty()\nbucket_nuevo +3, formato_nuevo +2,\ncanal_nuevo +2, angulo_nuevo +3"]
     I --> J{"score ≥ novelty_score_threshold\n(default 4)?"}
     J -- Sí --> K[Nueva solución → DISCOVERY_NODE]
     J -- No --> F
 ```
 
-**Nota de implementación:** el Paso 2 solo se ejecuta si el Paso 1 no encontró nada — por eso `angulo_nuevo` se suma siempre que se llega a `score_novelty()` (si hubiera algo comparable, el flujo ya habría salido en el Paso 1). Ver `tests/test_novelty_router.py` para los casos probados.
+**Nota de implementación:** el Paso 2 solo se ejecuta si el Paso 1 no encontró nada — por eso `angulo_nuevo` se suma siempre que se llega a `score_novelty()` (si hubiera algo comparable, el flujo ya habría salido en el Paso 1). En la zona gris (0.70 ≤ similitud < 0.86) el refinador LLM es el camino por defecto; si degrada u omite, se usa el default determinista (ángulo nuevo) y la decisión queda marcada `requires_user_acceptance=True` — el pipeline se pausa para que el humano la acepte. Ver `tests/test_novelty_router.py` para los casos probados.
 
 ---
 
@@ -458,6 +478,7 @@ flowchart TD
 Esta ruta es la que **ya opera hoy** en ambas marcas a través de los calendarios semanales/mensuales (`ergalia_mkt_operativo.md` Módulo 6, `escape_mkt_operativo.md` Módulo 4). Este pipeline no la reemplaza: la formaliza como una rama explícita del enrutamiento.
 
 ### 5.1 Secuencia
+
 1. **ORDER** — se crea una Orden de Producción a partir de la fila del calendario semanal correspondiente (ej. "martes → Dato incómodo → CM+Diseñador" en Ergalia; "lunes/miércoles/viernes → short → Editor" en ESCAPE).
 2. **ORDER_NOTE** (`/orders/order_<id>.md`) — hereda automáticamente `brand_objective`, `content_bucket`, `artifact_type`, `channel` y `owner` de la fila de calendario; solo se completa `insight_core` y el dato/gancho específico de esa semana.
 3. **EXECUTE_KAIZEN** — el responsable produce usando una plantilla existente de `/components/manifest.md` (ver §16 sobre la biblioteca de plantillas).
@@ -478,6 +499,7 @@ Esta ruta es la que **ya opera hoy** en ambas marcas a través de los calendario
 Esta ruta existe para que **reutilizar contenido viejo nunca sea un atajo sin revisión**. Es, además, el mecanismo formal de "no repetir sin revalidar" que las guías de marca ya piden implícitamente (regla de "revisión mínima" de Ergalia: fuente verificable + segunda lectura; checklist "Evidencia, CTA y REST" de ESCAPE).
 
 ### 6.1 Secuencia
+
 1. **OBSOLETE_CHECK** — el Estratega o el owner responde: ¿la evidencia, el dato o el contexto de la pieza previa sigue vigente?
 2. **Si NO está obsoleta** → la pieza pasa directo a `ATLAS_NOTE` (§7) para decidir en qué formato/canal se reutiliza o amplía. No se repite Discovery completo: se reaprovecha el `insight_core` ya validado.
 3. **Si SÍ está obsoleta** → `RESEARCH_UPDATE`:
@@ -495,6 +517,7 @@ Esta ruta existe para que **reutilizar contenido viejo nunca sea un atajo sin re
 ## 7. Ruta C — Nueva solución → Discovery editorial
 
 ### 7.1 Aprendizaje Express (1d)
+
 Antes de idear, el equipo recibe una síntesis rápida (1–2 páginas) generada a partir de **Context Packs**: extractos ya preparados del canon, de la guía de marca, del lenguaje visual y de piezas anteriores del mismo bucket (ver §19 sobre `AIContextPack`). Esto evita que cada pieza nueva empiece "desde cero" releyendo seis documentos.
 
 ```mermaid
@@ -512,15 +535,17 @@ sequenceDiagram
 La búsqueda de contexto ocurre **antes** de llamar al modelo, no en paralelo — el Context Pack es insumo, no un paso posterior de verificación.
 
 ### 7.2 Discovery (Chispazo)
-| Paso | Detalle | Rol |
-|---|---|---|
-| `DISCOVERY_NODE` | Encontrar el mecanismo o dato incómodo. Para ESCAPE es literalmente su hilo conductor oficial ("el detective de estructuras"); para Ergalia es el bucket "dato incómodo" o "corrección sectorial" | 🟦 equipo |
-| `DISCOVERY_NOTE` | Se redacta el `insight_core` — el pergamino inicial | 🟦 equipo |
-| `TEAM_INPUTS` | Se aportan datos primarios y 2–3 referentes (casos, fuentes, piezas comparables) | 🟩 externo / 🟦 equipo |
-| `LEADER_REFINE` | El Estratega refina el ángulo, decide si cumple la regla de tono de la marca (autoridad sobria + alivio operativo en Ergalia; árbitro informado y compasivo en ESCAPE), y asigna owner | 🟨 líder |
+
+| Paso             | Detalle                                                                                                                                                                                           | Rol                    |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
+| `DISCOVERY_NODE` | Encontrar el mecanismo o dato incómodo. Para ESCAPE es literalmente su hilo conductor oficial ("el detective de estructuras"); para Ergalia es el bucket "dato incómodo" o "corrección sectorial" | 🟦 equipo              |
+| `DISCOVERY_NOTE` | Se redacta el `insight_core` — el pergamino inicial                                                                                                                                               | 🟦 equipo              |
+| `TEAM_INPUTS`    | Se aportan datos primarios y 2–3 referentes (casos, fuentes, piezas comparables)                                                                                                                  | 🟩 externo / 🟦 equipo |
+| `LEADER_REFINE`  | El Estratega refina el ángulo, decide si cumple la regla de tono de la marca (autoridad sobria + alivio operativo en Ergalia; árbitro informado y compasivo en ESCAPE), y asigna owner            | 🟨 líder               |
 
 ### 7.3 Test de gancho 15s (n=5) — pieza nueva en el pipeline
-Este paso **no existe hoy** en las guías de contenido y es la adición de mayor valor práctico de este documento: antes de producir, se lee o muestra únicamente el gancho/primera línea a 5 personas reales del segmento objetivo (o, si no hay acceso directo, a 5 miembros del equipo que simulen el segmento) y se pregunta *"¿qué entendiste que vas a obtener si sigues leyendo/viendo esto?"*.
+
+Este paso **no existe hoy** en las guías de contenido y es la adición de mayor valor práctico de este documento: antes de producir, se lee o muestra únicamente el gancho/primera línea a 5 personas reales del segmento objetivo (o, si no hay acceso directo, a 5 miembros del equipo que simulen el segmento) y se pregunta _"¿qué entendiste que vas a obtener si sigues leyendo/viendo esto?"_.
 
 - **Criterio de paso:** ≥80% (4 de 5) describen correctamente la promesa central.
 - Esto formaliza y hace verificable una regla que ya existe en prosa: la "Promesa de Winston" en el checklist de Ergalia y el "gancho emocional" en la secuencia de guion de ESCAPE.
@@ -528,13 +553,13 @@ Este paso **no existe hoy** en las guías de contenido y es la adición de mayor
 
 ### 7.4 Decidir ruta: Fast vs. Complete
 
-| Criterio | Fast (Sprint 2D → Fast-Probe) | Complete (Full Development) |
-|---|---|---|
-| Número de formatos finales | 1 | 2 o más (se atomiza en varios formatos/canales) |
-| `repurpose_plan` | vacío o mínimo | obligatorio y detallado |
-| Marcas involucradas | 1 | 1 o pieza híbrida (ambas, con transición explícita) |
-| `risk_level` | bajo/medio | cualquiera; alto siempre exige Complete |
-| Ejemplo | un post LinkedIn, un short | un hallazgo de investigación atomizado en video largo + shorts + carrusel + newsletter; un caso Ergalia convertido en mini-caso + one-pager + white paper |
+| Criterio                   | Fast (Sprint 2D → Fast-Probe) | Complete (Full Development)                                                                                                                               |
+| -------------------------- | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Número de formatos finales | 1                             | 2 o más (se atomiza en varios formatos/canales)                                                                                                           |
+| `repurpose_plan`           | vacío o mínimo                | obligatorio y detallado                                                                                                                                   |
+| Marcas involucradas        | 1                             | 1 o pieza híbrida (ambas, con transición explícita)                                                                                                       |
+| `risk_level`               | bajo/medio                    | cualquiera; alto siempre exige Complete                                                                                                                   |
+| Ejemplo                    | un post LinkedIn, un short    | un hallazgo de investigación atomizado en video largo + shorts + carrusel + newsletter; un caso Ergalia convertido en mini-caso + one-pager + white paper |
 
 `ATLAS_NOTE` (`/artifacts/atlas_<id>.md`) registra, en cualquiera de las dos rutas, qué variante de formato se prioriza primero si eventualmente hay más de una.
 
@@ -545,21 +570,23 @@ Este paso **no existe hoy** en las guías de contenido y es la adición de mayor
 Se activa cuando §7.4 decide **Fast**: una sola pieza, un solo formato/canal, riesgo bajo o medio.
 
 ### 8.1 Sprint de Diseño y Prueba (2d)
+
 1. **SPRINT2D** — se produce un prototipo rápido de la pieza (borrador de texto, mockup de carrusel en Figma, guion de short) — no la pieza terminada.
 2. Se prueba con **5 personas reales** del segmento objetivo (o, si no hay acceso directo, 5 miembros de la comunidad C1–C4 más cercana para ESCAPE, o 5 contactos de confianza del segmento para Ergalia).
 3. Este paso reutiliza el mismo criterio del test de gancho (§7.3) pero aplicado a la pieza completa, no solo al hook: ¿la reacción de las 5 personas confirma la hipótesis de `change_hypothesis`?
 
 ### 8.2 Fast-Probe (7d)
-| Paso | Detalle | Rol |
-|---|---|---|
-| `MVP` | Se define la pieza mínima publicable + `metric_primary` como criterio de éxito explícito | 🟦 equipo |
-| `SETUP_EXP` | Se elige una audiencia/canal reducido para el piloto (ej. una sola lista de WhatsApp, un % de seguidores, un solo canal antes de expandir) | 🟦 equipo |
-| `INSTRUMENTATION` | Se configuran UTMs y el tracking de `metric_primary`/`metric_secondary` | 🟦 equipo |
-| `AUTO_DEPLOY` | Publicación piloto programada (Buffer/Later u otra herramienta ya en uso), con capacidad de retiro/corrección inmediata | 🟦 equipo |
-| `FEEDBACK` | Se recolectan métricas y comentarios en la ventana de 24–72h — la ventana estándar de desempeño de contenido social, no un número arbitrario | 🟩 externo (reacciones) / 🟦 equipo (medición) |
-| `PROBE_EVAL` | El owner revisa KPIs contra el criterio de éxito, usando el árbol de decisión **ya existente** en la guía de marca (Módulo 7 Ergalia / Módulo 6 ESCAPE) — este pipeline no inventa un árbol nuevo, reutiliza el que cada marca ya documentó | 🟨 líder |
-| `PROBE_ITER` | Si el resultado es ambiguo, se ajusta hook/copy/horario y se repite — máximo 3 iteraciones | 🟦 equipo |
-| `PROBE_KILL` | Si tras 3 iteraciones no se cumple el criterio, se retira y se documenta como postmortem (§13) | 🟨 líder |
+
+| Paso              | Detalle                                                                                                                                                                                                                                     | Rol                                            |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
+| `MVP`             | Se define la pieza mínima publicable + `metric_primary` como criterio de éxito explícito                                                                                                                                                    | 🟦 equipo                                      |
+| `SETUP_EXP`       | Se elige una audiencia/canal reducido para el piloto (ej. una sola lista de WhatsApp, un % de seguidores, un solo canal antes de expandir)                                                                                                  | 🟦 equipo                                      |
+| `INSTRUMENTATION` | Se configuran UTMs y el tracking de `metric_primary`/`metric_secondary`                                                                                                                                                                     | 🟦 equipo                                      |
+| `AUTO_DEPLOY`     | Publicación piloto programada (Buffer/Later u otra herramienta ya en uso), con capacidad de retiro/corrección inmediata                                                                                                                     | 🟦 equipo                                      |
+| `FEEDBACK`        | Se recolectan métricas y comentarios en la ventana de 24–72h — la ventana estándar de desempeño de contenido social, no un número arbitrario                                                                                                | 🟩 externo (reacciones) / 🟦 equipo (medición) |
+| `PROBE_EVAL`      | El owner revisa KPIs contra el criterio de éxito, usando el árbol de decisión **ya existente** en la guía de marca (Módulo 7 Ergalia / Módulo 6 ESCAPE) — este pipeline no inventa un árbol nuevo, reutiliza el que cada marca ya documentó | 🟨 líder                                       |
+| `PROBE_ITER`      | Si el resultado es ambiguo, se ajusta hook/copy/horario y se repite — máximo 3 iteraciones                                                                                                                                                  | 🟦 equipo                                      |
+| `PROBE_KILL`      | Si tras 3 iteraciones no se cumple el criterio, se retira y se documenta como postmortem (§13)                                                                                                                                              | 🟨 líder                                       |
 
 **Artefacto:** `/probes/probe_<id>.md` (plan, audiencia, instrumentación, criterio de éxito).
 
@@ -584,32 +611,93 @@ Se activa cuando §7.4 decide **Complete**: la pieza madre se atomizará en dos 
 6. **INTEGRATION** — se ensamblan todas las variantes en un paquete de campaña listo para el gate.
 7. **COMPONENTS_NOTE** (`/components/manifest.md`) — se registra cualquier plantilla nueva que valga la pena reutilizar.
 
-### 9.2 El bucle Producer-Critic (implementación real, esqueleto probado)
+### 9.2 El bucle Producer-Critic (implementación real, filosofía 0007)
 
-La producción modular (paso 5, `PROD_DEV` + `QA_VALID`) es exactamente el bucle Producer-Critic implementado en `src/agents/producer_critic.py` (LangGraph 1.2.11). El nodo `critic` ya es real — llama al mismo Gatekeeper de §11; el nodo `producer` es un stub deliberado hasta que haya un ciclo real de contenido corriendo (ver evaluación de arquitectura — construir el generador de IA antes de validar el proceso a mano habría sido adelantarse).
+La producción modular (paso 5, `PROD_DEV` + `QA_VALID`) es exactamente el bucle Producer-Critic implementado en `src/agents/producer_critic.py` (LangGraph 1.2.11). Bajo la filosofía 0007, el LLM es la opción SIEMPRE presente: el nodo `producer` es REAL y guiado por LLM — genera/refina el borrador a partir de `insight_core` + Context Pack + feedback del crítico previo, usando el artefacto compilado `producer_draft` (prompt-as-code para la generación, `src/llm/producer.py`). El nodo `critic` evalúa el borrador contra el checklist de publicación con el crítico LLM (`src/llm/critic.py`, data-driven por bucket) y llama al Gatekeeper real de §11.
+
+**Degradación conservadora (0007):** si el productor o el crítico LLM no están disponibles, el grafo se pausa en `human_review_node` con `requires_user_acceptance=True` — el humano debe aceptar la decisión determinista antes de continuar. El crítico degrada de forma CONSERVADORA: sin LLM, todo el checklist queda `no_evaluado` y el veredicto es `needs_human_review` — NUNCA se simula `auto_pass`. El feedback del crítico (`critic_feedback`) alimenta al productor en la siguiente iteración.
 
 ```mermaid
 sequenceDiagram
     participant P as PLAN_TECNICO (repurpose_plan)
-    participant Prod as Producer (nodo, hoy stub)
+    participant Prod as Producer (nodo LLM — producer_draft)
     participant AL as Artifact Library
-    participant Crit as Critic (Gatekeeper real)
+    participant Crit as Critic (LLM + Gatekeeper real)
     participant H as 🟨 Líder (interrupt)
 
     P->>Prod: generar variante de formato
     Prod->>AL: consultar piezas similares ya validadas (tono/formato)
     AL-->>Prod: referencias
     Prod-->>Crit: borrador
-    Crit->>Crit: evaluate_gate(checklist de pipeline_templates)
+    Crit->>Crit: crítico LLM (checklist data-driven) + evaluate_gate
     alt verdict = fail (máx. 3 iteraciones)
-        Crit-->>Prod: feedback, reintentar
+        Crit-->>Prod: critic_feedback, reintentar
     else verdict = needs_human_review
         Crit->>H: interrupt() — pausa real del grafo
         H-->>Crit: Command(resume={"decision": "approve"})
+    else productor/crítico LLM no disponible (degradación determinista)
+        Crit->>H: interrupt() — requires_user_acceptance=True
+        H-->>Crit: Command(resume={"decision": "approve"}) — acepta la decisión determinista
     else verdict = auto_pass
         Crit-->>P: listo, sin intervención humana
     end
     Crit->>AL: INSERT content_artifacts + repurpose_links
 ```
 
-**Ya probado (no solo diseñado):** el grafo compila, ejecuta, se pausa de verdad en `interrupt()` para riesgo alto o segmento S5/S6, y se reanuda con la decisión humana — ver `tests/test_producer_critic.py`. El checklist que usa el Critic en este esqueleto está simulado (todos los ítems en `True`); antes de producción real, cada ítem de `pipeline_templates.checklist` necesita una verificación automática de verdad (longitud de CTA, fuente citada, anonimización vía regex/NER).
+**Ya probado (no solo diseñado):** el grafo compila, ejecuta, se pausa de verdad en `interrupt()` para riesgo alto o segmento S5/S6, y se reanuda con la decisión humana — ver `tests/test_producer_critic.py`. El productor es guiado por LLM (prompt-as-code vía `producer_draft`, con degradación determinista que requiere aceptación), el crítico degrada de forma conservadora (`no_evaluado` → `needs_human_review`, nunca `auto_pass` simulado) y cualquier degradación determinista pausa el grafo para aceptación humana. El checklist que usa el Critic es data-driven (spec `critic_checklist`); la verificación mecánica por regex/NER (longitud de CTA, fuente citada, anonimización) sigue pendiente como complemento.
+
+### 9.3 Vista end-to-end del estado actual (implementado y probado)
+
+El diagrama completo del sistema tal como está implementado hoy: recepción del brief, alineamiento estratégico (reinforcement + novelty router), aprobación humana (OWNER_APPROVAL), bucle Producer-Critic y cadena de herramientas. Cada decisión lleva su `decision_source` (`llm`/`deterministic`/`human`) y toda degradación determinista pausa el flujo con `requires_user_acceptance=True` — el humano acepta antes de continuar.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor L as 🟨 Líder (humano)
+    participant API as src/api/main.py
+    participant RL as Reinforcement (LLM/SLM)
+    participant NR as Novelty Router (LLM/SLM)
+    participant G as Grafo Producer-Critic (LangGraph)
+    participant Prod as Producer (LLM — producer_draft)
+    participant Crit as Critic (LLM + Gatekeeper)
+    participant ORCH as src/tools/orchestrator.py
+    participant DB as Postgres (pgvector)
+
+    L->>API: POST /briefs {segmento, objetivo}
+    API->>DB: INSERT content_briefs (draft)
+    L->>API: POST /briefs/{id}/alignment
+    API->>RL: alinear con plan de marca (checklist + novelty_weights)
+    alt LLM ok
+        RL-->>API: decision_source=llm, requires_user_acceptance=False
+    else degradación determinista
+        RL-->>API: decision_source=deterministic, requires_user_acceptance=True
+    end
+    API->>NR: route_brief (novedad → ruta A/B/C)
+    NR-->>API: route_decision + refinement_status
+    API-->>L: semáforo 🟢🟡🔴 + decision_source + requires_user_acceptance
+    L->>API: POST /briefs/{id}/approve (OWNER_APPROVAL)
+    API->>DB: UPDATE briefs → aprobado
+    L->>API: POST /briefs/{id}/produce (grafo con sesión real)
+    API->>G: run_produce — thread_id = brief_id
+    G->>Prod: generar borrador (insight_core + Context Pack + critic_feedback)
+    alt productor LLM ok
+        Prod-->>G: draft (decision_source=llm)
+    else degradación determinista
+        Prod-->>G: DETERMINISTIC_DRAFT + requires_user_acceptance=True
+    end
+    G->>Crit: evaluar checklist (data-driven por bucket) + evaluate_gate
+    alt verdict = fail (máx. 3 iteraciones)
+        Crit-->>Prod: critic_feedback → reintentar
+    else verdict = needs_human_review o degradación
+        Crit->>G: requires_user_acceptance=True
+        G->>L: interrupt() — pausa real del grafo
+        L->>API: POST /briefs/{id}/produce/resume {decision: approve}
+        API->>G: Command(resume={"decision": "approve"})
+    else verdict = auto_pass
+        API->>DB: INSERT content_artifacts (status borrador)
+    end
+    API->>ORCH: run_tool_chain (LLM_STEP="producer" explícito)
+    ORCH->>DB: asset_jobs + repurpose_links
+```
+
+**Lectura rápida:** el LLM orquesta cada decisión (alineamiento, ruta, generación, crítica) y el SLM la resuelve; el humano solo interviene en tres momentos — aprobar el brief, aceptar una degradación determinista, o desbloquear un `needs_human_review`. Si el LLM no está disponible, el flujo NUNCA sigue solo: se pausa y pregunta.

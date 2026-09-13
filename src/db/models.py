@@ -242,6 +242,8 @@ class ContentBrief(Base):
     pipeline_template_id: Mapped[int | None] = mapped_column(
         ForeignKey("pipeline_templates.id"), nullable=True
     )
+    # 0007: la última decisión (alineamiento/refuerzo) fue determinista y requiere aceptación explícita del usuario.
+    requires_user_acceptance: Mapped[bool] = mapped_column(default=False)
 
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
@@ -264,6 +266,16 @@ class ContentArtifact(Base):
     status: Mapped[str] = mapped_column(String(30), default="borrador")
     published_at: Mapped[datetime | None] = mapped_column(nullable=True)
     utm_campaign: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    # Spec de formato aplicada (0005) — qué cadena de herramientas usar.
+    format_spec_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("format_specs.id"), nullable=True
+    )
+    # Proyecto que materializa este artefacto (0008, Fase 5 §20.3).
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("projects.id"), nullable=True
+    )
+    # Especificación visual de la variante (UX_DESIGN, 0005).
+    visual_spec: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
@@ -485,3 +497,214 @@ class EmbeddingSetting(Base):
     is_active: Mapped[bool] = mapped_column(default=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class FormatSpec(Base):
+    """Spec de formato por marca (0005). Data-driven: define la estructura,
+    restricciones, reglas de derivación, requisitos visuales, QA checks y la
+    cadena de herramientas (tool_chain) para cada (brand_objective,
+    artifact_type). El orquestador (src/tools/) la usa como datos, no como
+    if/else por formato en el código.
+    """
+
+    __tablename__ = "format_specs"
+    __table_args__ = (UniqueConstraint("brand_objective", "artifact_type"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    brand_objective: Mapped[BrandObjective] = mapped_column(
+        _pg_enum(BrandObjective, "brand_objective_t")
+    )
+    artifact_type: Mapped[str] = mapped_column(String(50))
+    structure: Mapped[dict] = mapped_column(JSONB, default=dict)
+    constraints: Mapped[dict] = mapped_column(JSONB, default=dict)
+    derivation_rules: Mapped[list] = mapped_column(JSONB, default=list)
+    visual_requirements: Mapped[dict] = mapped_column(JSONB, default=dict)
+    qa_checks: Mapped[list] = mapped_column(JSONB, default=list)
+    tool_chain: Mapped[list] = mapped_column(JSONB, default=list)
+    phases: Mapped[dict] = mapped_column(JSONB, default=dict)
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class ComponentLibrary(Base):
+    """Patrones reutilizables por marca/formato (0005).
+
+    component_type: 'visual' | 'textual' | 'estructura'. El contenido es
+    JSONB libre (ej. un bloque de copy, un patrón de iconografía, una
+    plantilla de estructura). usage_count se incrementa al reutilizarse.
+    """
+
+    __tablename__ = "component_library"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    brand_objective: Mapped[BrandObjective | None] = mapped_column(
+        _pg_enum(BrandObjective, "brand_objective_t"), nullable=True
+    )
+    artifact_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    component_type: Mapped[str] = mapped_column(String(20))
+    name: Mapped[str] = mapped_column(String(100))
+    content: Mapped[dict] = mapped_column(JSONB, default=dict)
+    usage_count: Mapped[int] = mapped_column(default=0)
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class ToolAdapter(Base):
+    """Catálogo de MCP servers disponibles (0005).
+
+    Misma filosofía data-driven que pipeline_templates y format_specs: no
+    hardcodear qué herramienta usa cada formato en el código del agente.
+    mcp_server_name debe coincidir exactamente con la clave en mcp.servers
+    de OpenClaw (el registry lo valida al arrancar).
+    """
+
+    __tablename__ = "tool_adapters"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    name: Mapped[str] = mapped_column(String(50), unique=True)
+    mcp_server_name: Mapped[str] = mapped_column(String(100))
+    execution_mode: Mapped[str] = mapped_column(String(50))
+    requires_license: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class AssetJob(Base):
+    """Un paso ejecutado en una cadena de herramientas para un
+    ContentArtifact (0005) — la trazabilidad entre 'aprobado por QA' y
+    'archivo final en disco'.
+
+    status: 'pending' | 'running' | 'done' | 'failed'. cost_estimate
+    registra créditos/costo si aplica (ElevenLabs, Veo 3).
+    """
+
+    __tablename__ = "asset_jobs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    artifact_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("content_artifacts.id", ondelete="CASCADE")
+    )
+    tool_adapter_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tool_adapters.id"))
+    sequence_order: Mapped[int] = mapped_column(default=1)
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    input_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
+    output_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    external_job_id: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    cost_estimate: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    phase: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    template_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("production_templates.id"), nullable=True
+    )
+    manifest_version: Mapped[int | None] = mapped_column(nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class ProductionTemplate(Base):
+    """Template estático por tipo de contenido y fase (0006).
+
+    Única fuente de plantillas: la IA las selecciona y parametriza con el
+    manifiesto, nunca las edita en runtime. content es JSONB libre (el raw
+    embebido si el template no es JSON: otio/ass/cube/svg/txt).
+    """
+
+    __tablename__ = "production_templates"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    name: Mapped[str] = mapped_column(String(150), unique=True)
+    content_type: Mapped[str] = mapped_column(String(20))
+    phase: Mapped[str] = mapped_column(String(20))
+    template_format: Mapped[str] = mapped_column(String(20))
+    content: Mapped[dict] = mapped_column(JSONB, default=dict)
+    version: Mapped[str] = mapped_column(String(20), default="1.0")
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class ProductionManifest(Base):
+    """Manifiesto versionado e inmutable por artefacto (0006).
+
+    Única fuente de verdad por artefacto: cada versión es inmutable y se
+    identifica por (artifact_id, version). El orquestador lee la última
+    versión para materializar la cadena de herramientas.
+    """
+
+    __tablename__ = "production_manifests"
+    __table_args__ = (UniqueConstraint("artifact_id", "version"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    artifact_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("content_artifacts.id", ondelete="CASCADE")
+    )
+    version: Mapped[int] = mapped_column()
+    manifest: Mapped[dict] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class Project(Base):
+    """Camino técnico de producción (0007, diseño §20.2).
+
+    projects guarda solo metadatos + current_version (la versión activa del
+    snapshot); el snapshot JSON editable vive versionado e inmutable en
+    project_versions. status: 'borrador' | 'en_edicion' | 'aprobado' |
+    'en_produccion' | 'listo' | 'fallido'.
+    """
+
+    __tablename__ = "projects"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    name: Mapped[str] = mapped_column(String(200))
+    topic: Mapped[str] = mapped_column(Text)
+    template_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("production_templates.id"), nullable=True
+    )
+    brand_objective: Mapped[BrandObjective | None] = mapped_column(
+        _pg_enum(BrandObjective, "brand_objective_t"), nullable=True
+    )
+    artifact_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default="borrador")
+    current_version: Mapped[int] = mapped_column(default=0)
+    storage_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class ProjectVersion(Base):
+    """Snapshot JSON editable e INMUTABLE por proyecto (0007, §20.2).
+
+    Nunca se hace UPDATE: cada cambio (generación, approve, rollback) es un
+    INSERT con versión nueva. El rollback restaura un snapshot anterior
+    como versión nueva — el historial nunca se pierde.
+    """
+
+    __tablename__ = "project_versions"
+    __table_args__ = (UniqueConstraint("project_id", "version"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE")
+    )
+    version: Mapped[int] = mapped_column()
+    snapshot: Mapped[dict] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())

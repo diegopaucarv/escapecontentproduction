@@ -64,6 +64,9 @@ def test_refine_skipped_without_settings():
     result = refine_angle_novelty(_FakeSession([]), {}, [])
     assert result["status"] == "skipped"
     assert result["reason"] == "no_settings"
+    # 0007: sin LLM la decisión es determinista y requiere aceptación.
+    assert result["decision_source"] == "deterministic"
+    assert result["requires_user_acceptance"] is True
 
 
 def test_refine_skipped_without_artifact(monkeypatch):
@@ -71,6 +74,8 @@ def test_refine_skipped_without_artifact(monkeypatch):
     result = refine_angle_novelty(_FakeSession([_settings()]), {}, [])
     assert result["status"] == "skipped"
     assert result["reason"] == "not_compiled"
+    assert result["decision_source"] == "deterministic"
+    assert result["requires_user_acceptance"] is True
 
 
 def test_refine_ok_angle_new(monkeypatch):
@@ -83,6 +88,9 @@ def test_refine_ok_angle_new(monkeypatch):
     assert result["status"] == "ok"
     assert result["angulo_nuevo"] is True
     assert result["reasoning"] == "perspectiva no vista"
+    # 0007: decisión del LLM — revisable, sin aceptación obligatoria.
+    assert result["decision_source"] == "llm"
+    assert result["requires_user_acceptance"] is False
 
 
 def test_refine_ok_angle_covered(monkeypatch):
@@ -94,6 +102,8 @@ def test_refine_ok_angle_covered(monkeypatch):
     result = refine_angle_novelty(_FakeSession([_settings()]), {}, [])
     assert result["status"] == "ok"
     assert result["angulo_nuevo"] is False
+    assert result["decision_source"] == "llm"
+    assert result["requires_user_acceptance"] is False
 
 
 def test_refine_degraded_when_llm_unavailable(monkeypatch):
@@ -110,6 +120,9 @@ def test_refine_degraded_when_llm_unavailable(monkeypatch):
     result = refine_angle_novelty(_FakeSession([_settings()]), {}, [])
     assert result["status"] == "degraded"
     assert result["angulo_nuevo"] is True  # default determinista
+    # 0007: degradación a determinista SIEMPRE requiere aceptación.
+    assert result["decision_source"] == "deterministic"
+    assert result["requires_user_acceptance"] is True
 
 
 def test_refine_degraded_on_invalid_output(monkeypatch):
@@ -118,3 +131,5 @@ def test_refine_degraded_on_invalid_output(monkeypatch):
     result = refine_angle_novelty(_FakeSession([_settings()]), {}, [])
     assert result["status"] == "degraded"
     assert result["angulo_nuevo"] is True
+    assert result["decision_source"] == "deterministic"
+    assert result["requires_user_acceptance"] is True

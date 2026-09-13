@@ -1,0 +1,73 @@
+{
+  "json_editado": {
+    "topic": "IA local vs nube",
+    "template": "Storyboard_Spec",
+    "duracion_seg": 45,
+    "tono": "directo, cientifico-accesible",
+    "estilo": "subtitulos grandes, fondo limpio",
+    "voz": "voz_neutral_es_M_150wpm_directo_cientifico_accesible.wav",
+    "guion": "IA local versus nube. Local: corre en tu equipo, privacidad total sin conexion, limitada por hardware. Nube: potencia a demanda, actualizaciones constantes, dependencia de conexion y coste. Elige segun privacidad y recursos disponibles.",
+    "montaje": "montaje_corte_seco_45s_subtitulos_grandes_fondo_limpio.mp4",
+    "subtitulos": "IA local vs nube\nLocal: corre en tu equipo\nPrivacidad total, sin conexion\nNube: potencia a demanda\nMas potencia, dependencia y coste\nElige segun privacidad y recursos",
+    "assets_visuales": [
+      "fondo limpio blanco con tipografia grande IA local vs nube",
+      "laptop con icono de casa y flujo de datos interno",
+      "candado y grafico de privacidad alta",
+      "nube de servidores con flechas de datos subiendo",
+      "comparacion lado a lado velocidad vs coste",
+      "balanza y texto final Elige segun privacidad y recursos"
+    ],
+    "hook_15s": "IA local versus nube. Local: corre en tu equipo, privacidad total sin conexion",
+    "cta": "Elige segun privacidad y recursos disponibles.",
+    "escenas": [
+      {
+        "inicio": 0.0,
+        "fin": 6.0,
+        "tipo_plano": "plano medio",
+        "prompt_visual": "fondo limpio blanco, tipografia grande centrada IA local vs nube, iluminacion neutra",
+        "texto_pantalla": "IA local vs nube",
+        "sfx": "whoosh"
+      },
+      {
+        "inicio": 6.0,
+        "fin": 12.0,
+        "tipo_plano": "plano detalle",
+        "prompt_visual": "laptop sobre mesa minimalista, icono de casa sobre el equipo, datos circulando dentro sin salir",
+        "texto_pantalla": "Local: corre en tu equipo",
+        "sfx": "click"
+      },
+      {
+        "inicio": 12.0,
+        "fin": 18.0,
+        "tipo_plano": "plano medio",
+        "prompt_visual": "candado cerrado grande, grafico de privacidad al 100%, fondo limpio",
+        "texto_pantalla": "Privacidad total, sin conexion",
+        "sfx": "soft beep"
+      },
+      {
+        "inicio": 18.0,
+        "fin": 24.0,
+        "tipo_plano": "plano amplio",
+        "prompt_visual": "ilustracion minimalista de nube con servidores, flechas de datos subiendo desde un dispositivo",
+        "texto_pantalla": "Nube: potencia a demanda",
+        "sfx": "whoosh"
+      },
+      {
+        "inicio": 24.0,
+        "fin": 32.0,
+        "tipo_plano": "plano medio",
+        "prompt_visual": "comparacion lado a lado, izquierda potencia alta, derecha coste y conexion, iconos simples",
+        "texto_pantalla": "Mas potencia, dependencia y coste",
+        "sfx": "tick"
+      },
+      {
+        "inicio": 32.0,
+        "fin": 45.0,
+        "tipo_plano": "plano medio",
+        "prompt_visual": "balanza equilibrada entre icono de casa y nube, texto final centrado sobre fondo limpio",
+        "texto_pantalla": "Elige segun privacidad y recursos",
+        "sfx": "chime"
+      }
+    ]
+  }
+}

@@ -118,6 +118,9 @@ def test_critic_skipped_without_settings():
     )
     assert result["status"] == "skipped"
     assert result["reason"] == "no_settings"
+    # 0007: sin LLM la decisión es determinista y requiere aceptación.
+    assert result["decision_source"] == "deterministic"
+    assert result["requires_user_acceptance"] is True
 
 
 def test_critic_skipped_without_artifact(monkeypatch):
@@ -127,6 +130,8 @@ def test_critic_skipped_without_artifact(monkeypatch):
     )
     assert result["status"] == "skipped"
     assert result["reason"] == "not_compiled"
+    assert result["decision_source"] == "deterministic"
+    assert result["requires_user_acceptance"] is True
 
 
 def test_critic_ok_all_items_evaluated(monkeypatch):
@@ -157,6 +162,9 @@ def test_critic_ok_all_items_evaluated(monkeypatch):
     }
     assert result["verdict"] == "auto_pass"
     assert result["model_used"] == "small"
+    # 0007: decisión del LLM — revisable, sin aceptación obligatoria.
+    assert result["decision_source"] == "llm"
+    assert result["requires_user_acceptance"] is False
 
 
 def test_critic_item_without_interpretation_is_no_evaluado(monkeypatch):
@@ -185,6 +193,8 @@ def test_critic_item_without_interpretation_is_no_evaluado(monkeypatch):
         "fuente_verificable": "ok",
         "revision_legal": "no_evaluado",
     }
+    assert result["decision_source"] == "llm"
+    assert result["requires_user_acceptance"] is False
 
 
 def test_critic_item_missing_from_llm_output_is_no_evaluado(monkeypatch):
@@ -205,6 +215,8 @@ def test_critic_item_missing_from_llm_output_is_no_evaluado(monkeypatch):
         "obj",
     )
     assert result["checklist_results"]["cta_unico"] == "no_evaluado"
+    assert result["decision_source"] == "llm"
+    assert result["requires_user_acceptance"] is False
 
 
 def test_critic_degraded_when_llm_unavailable(monkeypatch):
@@ -227,6 +239,9 @@ def test_critic_degraded_when_llm_unavailable(monkeypatch):
     assert result["status"] == "degraded"
     assert result["reason"] == "llm_unavailable"
     assert result["checklist_results"] == {"fuente_verificable": "no_evaluado"}
+    # 0007: degradación a determinista SIEMPRE requiere aceptación.
+    assert result["decision_source"] == "deterministic"
+    assert result["requires_user_acceptance"] is True
 
 
 def test_critic_invalid_output_is_no_evaluado(monkeypatch):
@@ -241,6 +256,8 @@ def test_critic_invalid_output_is_no_evaluado(monkeypatch):
     assert result["status"] == "ok"
     assert result["checklist_results"] == {"fuente_verificable": "no_evaluado"}
     assert result["verdict"] is None
+    assert result["decision_source"] == "llm"
+    assert result["requires_user_acceptance"] is False
 
 
 # ---------------------------------------------------------------------
@@ -265,6 +282,13 @@ def _base_state(**overrides):
         "checklist_results": {},
         "verdict": None,
         "human_decision": None,
+        # 0007: contexto de generación y estado de aceptación.
+        "insight_core": "insight de prueba",
+        "context_pack": {"contexto": "pack de prueba"},
+        "artifact_type": "video_corto",
+        "channel": "tiktok",
+        "requires_user_acceptance": False,
+        "critic_feedback": None,
     }
     state.update(overrides)
     return state
@@ -273,6 +297,9 @@ def _base_state(**overrides):
 def test_critic_node_uses_llm_checklist():
     from src.agents.producer_critic import build_graph
 
+    def fake_producer(brief_data, context_pack, critic_feedback=None):
+        return {"status": "ok", "draft": "borrador LLM"}
+
     def fake_critic(draft, checklist, brand_objective):
         return {
             "status": "ok",
@@ -280,9 +307,10 @@ def test_critic_node_uses_llm_checklist():
                 "fuente_verificable": "ok",
                 "cta_unico": "fail",
             },
+            "reasoning": "el CTA no es único",
         }
 
-    graph = build_graph(critic_checklist_fn=fake_critic)
+    graph = build_graph(producer_fn=fake_producer, critic_checklist_fn=fake_critic)
     result = graph.invoke(
         _base_state(), config={"configurable": {"thread_id": "t-critic-1"}}
     )
@@ -291,10 +319,16 @@ def test_critic_node_uses_llm_checklist():
         "cta_unico": False,
     }
     assert result["verdict"] == "fail"
+    # 0007: productor ok -> el crítico ok conserva la bandera en False.
+    assert result["requires_user_acceptance"] is False
+    assert result["critic_feedback"] == "el CTA no es único"
 
 
 def test_critic_node_no_evaluado_blocks():
     from src.agents.producer_critic import build_graph
+
+    def fake_producer(brief_data, context_pack, critic_feedback=None):
+        return {"status": "ok", "draft": "borrador LLM"}
 
     def fake_critic(draft, checklist, brand_objective):
         return {
@@ -303,9 +337,10 @@ def test_critic_node_no_evaluado_blocks():
                 "fuente_verificable": "ok",
                 "cta_unico": "no_evaluado",
             },
+            "reasoning": "CTA sin interpretación",
         }
 
-    graph = build_graph(critic_checklist_fn=fake_critic)
+    graph = build_graph(producer_fn=fake_producer, critic_checklist_fn=fake_critic)
     result = graph.invoke(
         _base_state(), config={"configurable": {"thread_id": "t-critic-2"}}
     )
@@ -314,33 +349,53 @@ def test_critic_node_no_evaluado_blocks():
         "cta_unico": False,
     }
     assert result["verdict"] == "fail"
+    assert result["requires_user_acceptance"] is False
+    assert result["critic_feedback"] == "CTA sin interpretación"
 
 
-def test_critic_node_degraded_falls_back_to_simulated():
+def test_critic_node_degraded_requires_human_review():
+    """0007: crítico degradado -> NADA evaluado, needs_human_review y el
+    grafo se PAUSA en human_review_node (nunca auto_pass simulado)."""
     from src.agents.producer_critic import build_graph
+
+    def fake_producer(brief_data, context_pack, critic_feedback=None):
+        return {"status": "ok", "draft": "borrador LLM"}
 
     def fake_critic(draft, checklist, brand_objective):
         return {"status": "degraded", "reason": "llm_unavailable"}
 
-    graph = build_graph(critic_checklist_fn=fake_critic)
+    graph = build_graph(producer_fn=fake_producer, critic_checklist_fn=fake_critic)
     result = graph.invoke(
         _base_state(), config={"configurable": {"thread_id": "t-critic-3"}}
     )
     assert result["checklist_results"] == {
-        "fuente_verificable": True,
-        "cta_unico": True,
+        "fuente_verificable": False,
+        "cta_unico": False,
     }
-    assert result["verdict"] == "auto_pass"
+    assert result["verdict"] == "needs_human_review"
+    assert result["requires_user_acceptance"] is True
+    assert "__interrupt__" in result
 
 
-def test_critic_node_raising_critic_falls_back():
+def test_critic_node_raising_critic_requires_human_review():
+    """0007: crítico con excepción -> mismo tratamiento conservador:
+    nada evaluado, needs_human_review y pausa para aceptación humana."""
     from src.agents.producer_critic import build_graph
+
+    def fake_producer(brief_data, context_pack, critic_feedback=None):
+        return {"status": "ok", "draft": "borrador LLM"}
 
     def boom(draft, checklist, brand_objective):
         raise RuntimeError("critico caído")
 
-    graph = build_graph(critic_checklist_fn=boom)
+    graph = build_graph(producer_fn=fake_producer, critic_checklist_fn=boom)
     result = graph.invoke(
         _base_state(), config={"configurable": {"thread_id": "t-critic-4"}}
     )
-    assert result["verdict"] == "auto_pass"
+    assert result["checklist_results"] == {
+        "fuente_verificable": False,
+        "cta_unico": False,
+    }
+    assert result["verdict"] == "needs_human_review"
+    assert result["requires_user_acceptance"] is True
+    assert "__interrupt__" in result

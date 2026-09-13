@@ -10,6 +10,10 @@ Diseño deliberado:
   el Paso 2 (puntaje ponderado) tal como quedaron definidos en el pipeline.
   No inventa un "novelty_score" mágico de una sola fórmula: primero busca,
   y solo puntúa si no encontró nada comparable.
+- La degradación del refinamiento LLM de la zona gris se SUPERPICIE (0007):
+  si el refinador degrada/omite o lanza, el resultado lo refleja en
+  `refinement_status` y `requires_user_acceptance=True` — la decisión es
+  determinista y el pipeline debe pausar para que el humano la acepte.
 
 Implementación concreta de `EmbedFn`: src/embeddings.py::embed_text
 (Jina jina-embeddings-v5-text-nano, inferencia local). Se pasa por
@@ -67,6 +71,10 @@ class NoveltyResult:
     novelty_score: int | None
     matched_artifact_id: str | None
     reasoning: str
+    # 0007: estado del refinamiento LLM de la zona gris. Si degradó/omitió,
+    # la decisión es determinista y requiere aceptación del usuario.
+    refinement_status: str | None = None  # "ok" | "degraded" | "skipped" | None
+    requires_user_acceptance: bool = False
 
 
 def find_closest_prior_artifact(
@@ -144,6 +152,11 @@ def route_brief(
     El callable recibe (brief_data, prior_artifacts) y devuelve un dict
     con `angulo_nuevo`; si falla o no está disponible, se degrada al
     default determinista.
+
+    La degradación del refinamiento NO se traga (0007): si el refinador
+    degrada/omite o lanza, el resultado lo refleja en
+    `refinement_status` y `requires_user_acceptance=True` — la decisión
+    es determinista y el pipeline debe pausar para que el humano la acepte.
     """
     match, similarity = find_closest_prior_artifact(
         session, embed_fn, inputs.insight_core, inputs.brand_objective
@@ -174,6 +187,8 @@ def route_brief(
     # inyectado, se le consulta SOLO el ángulo y SOLO en la banda gris
     # (ni duplicado claro ni claramente nuevo); si falla, se degrada
     # al default determinista (ángulo nuevo).
+    refinement_status: str | None = None
+    requires_acceptance = False
     if (
         refine_angle is not None
         and GRAY_ZONE_LOW_THRESHOLD <= similarity < DUPLICATE_SIMILARITY_THRESHOLD
@@ -187,18 +202,30 @@ def route_brief(
             }
             prior_artifacts = [_artifact_to_dict(match)] if match is not None else []
             refinement = refine_angle(brief_data, prior_artifacts)
-            if (
-                refinement.get("status") == "ok"
-                and refinement.get("angulo_nuevo") is False
-            ):
-                # El ángulo ya está cubierto: se resta el peso del ángulo.
-                score -= inputs.weights.get("angulo_nuevo", 3)
-        except Exception:  # noqa: BLE001 — degradación elegante
-            pass
+            if refinement.get("status") == "ok":
+                refinement_status = "ok"
+                if refinement.get("angulo_nuevo") is False:
+                    # El ángulo ya está cubierto: se resta el peso del ángulo.
+                    score -= inputs.weights.get("angulo_nuevo", 3)
+            elif refinement.get("status") in ("degraded", "skipped"):
+                # Degradación visible (0007): la decisión es determinista y
+                # requiere aceptación del usuario.
+                refinement_status = refinement.get("status")
+                requires_acceptance = True
+        except Exception:  # noqa: BLE001 — degradación visible, no silenciosa
+            refinement_status = "degraded"
+            requires_acceptance = True
 
     decision = "nueva_solucion" if score >= score_threshold else "repetitivo"
     reasoning = f"Sin duplicado (mejor similitud={similarity:.2f}); score={score} -> {decision}."
-    return NoveltyResult(decision, score, None, reasoning)
+    return NoveltyResult(
+        decision,
+        score,
+        None,
+        reasoning,
+        refinement_status=refinement_status,
+        requires_user_acceptance=requires_acceptance,
+    )
 
 
 def route_brief_with_refinement(

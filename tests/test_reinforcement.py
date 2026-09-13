@@ -105,6 +105,9 @@ def test_reinforce_skipped_without_settings():
     result = reinforce_alignment(session, {}, "auto_pass", [])
     assert result["status"] == "skipped"
     assert result["reason"] == "no_settings"
+    # 0007: sin LLM la decisión es determinista y requiere aceptación.
+    assert result["decision_source"] == "deterministic"
+    assert result["requires_user_acceptance"] is True
 
 
 def test_reinforce_skipped_without_artifact(monkeypatch):
@@ -113,6 +116,9 @@ def test_reinforce_skipped_without_artifact(monkeypatch):
     result = reinforce_alignment(session, {}, "auto_pass", [])
     assert result["status"] == "skipped"
     assert result["reason"] == "not_compiled"
+    # 0007: sin artefacto compilado la decisión es determinista.
+    assert result["decision_source"] == "deterministic"
+    assert result["requires_user_acceptance"] is True
 
 
 def test_reinforce_ok_auto_pass(monkeypatch):
@@ -129,6 +135,9 @@ def test_reinforce_ok_auto_pass(monkeypatch):
     assert result["verdict"] == "auto_pass"
     assert result["llm_verdict"] == "auto_pass"
     assert result["model_used"] == "small"
+    # 0007: decisión del LLM — revisable, pero sin aceptación obligatoria.
+    assert result["decision_source"] == "llm"
+    assert result["requires_user_acceptance"] is False
 
 
 def test_reinforce_escalates_auto_pass_to_human(monkeypatch):
@@ -148,6 +157,8 @@ def test_reinforce_escalates_auto_pass_to_human(monkeypatch):
     assert result["status"] == "ok"
     assert result["verdict"] == "needs_human_review"
     assert result["risks_detected"] == ["marca mencionada sin contexto"]
+    assert result["decision_source"] == "llm"
+    assert result["requires_user_acceptance"] is False
 
 
 def test_reinforce_fail_stays_fail(monkeypatch):
@@ -158,6 +169,8 @@ def test_reinforce_fail_stays_fail(monkeypatch):
     )
     result = reinforce_alignment(session, {}, "fail", [])
     assert result["verdict"] == "fail"
+    assert result["decision_source"] == "llm"
+    assert result["requires_user_acceptance"] is False
 
 
 def test_reinforce_invalid_llm_verdict_is_conservative(monkeypatch):
@@ -168,6 +181,8 @@ def test_reinforce_invalid_llm_verdict_is_conservative(monkeypatch):
     assert result["status"] == "ok"
     assert result["llm_verdict"] is None
     assert result["verdict"] == "auto_pass"  # conservador: no escala sin señal
+    assert result["decision_source"] == "llm"
+    assert result["requires_user_acceptance"] is False
 
 
 def test_reinforce_degraded_when_llm_unavailable(monkeypatch):
@@ -186,6 +201,9 @@ def test_reinforce_degraded_when_llm_unavailable(monkeypatch):
     assert result["status"] == "degraded"
     assert result["reason"] == "llm_unavailable"
     assert result["verdict"] == "auto_pass"  # solo reglas
+    # 0007: degradación a determinista SIEMPRE requiere aceptación.
+    assert result["decision_source"] == "deterministic"
+    assert result["requires_user_acceptance"] is True
 
 
 def test_reinforce_uses_fallback_after_retries(monkeypatch):
@@ -213,3 +231,5 @@ def test_reinforce_uses_fallback_after_retries(monkeypatch):
     assert result["model_used"] == "deepseek-ai/DeepSeek-V4-Flash-0731"
     assert calls.count("small") == 3  # reintentos agotados
     assert calls.count("deepseek-ai/DeepSeek-V4-Flash-0731") == 1
+    assert result["decision_source"] == "llm"
+    assert result["requires_user_acceptance"] is False

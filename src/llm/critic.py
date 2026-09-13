@@ -2,15 +2,18 @@
 Consumidor del spec `critic_checklist` (0004).
 
 Diseño (aprobado por el usuario):
-- El crítico LLM verifica el borrador contra el checklist de publicación
-  recibido COMO DATO (array), usando las interpretaciones del spec. El
-  checklist es variable por bucket (pipeline_templates.checklist), así
-  que nunca se hardcodea en el prompt.
+- El LLM es la opción SIEMPRE presente: la decisión se orquesta por LLM y
+  se resuelve con el SLM (modelo pequeño). El crítico LLM verifica el
+  borrador contra el checklist de publicación recibido COMO DATO (array),
+  usando las interpretaciones del spec. El checklist es variable por bucket
+  (pipeline_templates.checklist), así que nunca se hardcodea en el prompt.
 - Regla defensiva EN CÓDIGO: todo ítem del checklist SIN interpretación
   en rules -> status "no_evaluado", NUNCA "ok". El prompt también lo
   pide, pero el código lo garantiza (no depende de que el LLM obedezca).
 - Reintentos: session_settings.llm_retries (default 3). Agotados ->
-  fallback_model -> agotados -> degradación elegante.
+  fallback_model -> agotados -> degradación elegante. La degradación es
+  determinista y SIEMPRE requiere aceptación del usuario
+  (requires_user_acceptance=True).
 - JSON schema SIEMPRE forzado (response_format json_object) en la llamada
   al modelo pequeño.
 """
@@ -23,23 +26,20 @@ from typing import Callable
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from src.db.models import PromptTemplate, SessionSettings
-from src.llm.reinforcement import _call_with_retries, _parse_llm_output
+from src.db.models import PromptTemplate
+from src.llm.base import (
+    call_with_retries,
+    degraded_result,
+    load_settings,
+    ok_result,
+    parse_llm_output,
+    skipped_result,
+)
 
 # Veredictos válidos del output_schema de critic_checklist.
 VALID_VERDICTS = {"auto_pass", "needs_human_review", "fail"}
 
 CRITIC_TASK_KEY = "critic_checklist"
-
-
-def _load_settings(session: Session) -> SessionSettings | None:
-    return (
-        session.execute(
-            select(SessionSettings).where(SessionSettings.is_active.is_(True))
-        )
-        .scalars()
-        .first()
-    )
 
 
 def _interpreted_items(spec_rules: list[str], checklist: list[str]) -> set[str]:
@@ -121,9 +121,9 @@ def run_critic_checklist(
     }
     Nunca lanza: ante cualquier fallo degrada (status 'degraded'/'skipped').
     """
-    settings = _load_settings(session)
+    settings = load_settings(session)
     if settings is None:
-        return {"status": "skipped", "reason": "no_settings"}
+        return skipped_result("no_settings")
 
     small_model = settings.small_model
     fallback = getattr(settings, "fallback_model", None) or None
@@ -137,7 +137,7 @@ def run_critic_checklist(
     except Exception:  # noqa: BLE001
         artifact = None
     if artifact is None:
-        return {"status": "skipped", "reason": "not_compiled"}
+        return skipped_result("not_compiled")
 
     # Spec activa: sus rules definen qué ítems tienen interpretación.
     template = (
@@ -160,7 +160,7 @@ def run_critic_checklist(
     user_message = json.dumps(user_payload, ensure_ascii=False)
 
     try:
-        text, model_used, used_fallback = _call_with_retries(
+        text, model_used, used_fallback = call_with_retries(
             session,
             prompt=user_message,
             system=artifact.prompt_text,
@@ -170,17 +170,18 @@ def run_critic_checklist(
             fallback_model=fallback,
         )
     except Exception:  # noqa: BLE001 — LLM no disponible: degradación elegante
-        return {
-            "status": "degraded",
-            "reason": "llm_unavailable",
-            "checklist_results": {item: "no_evaluado" for item in checklist},
-            "verdict": None,
-            "model_used": small_model,
-            "fallback_used": False,
-        }
+        return degraded_result(
+            "llm_unavailable",
+            checklist_results={item: "no_evaluado" for item in checklist},
+            verdict=None,
+            model_used=small_model,
+            fallback_used=False,
+        )
 
-    parsed = _parse_llm_output(text)
-    return _normalize(parsed, checklist, covered, model_used, used_fallback)
+    parsed = parse_llm_output(text)
+    return ok_result(
+        **_normalize(parsed, checklist, covered, model_used, used_fallback)
+    )
 
 
 def make_critic_checklist_fn(session: Session) -> Callable[[str, list, str], dict]:

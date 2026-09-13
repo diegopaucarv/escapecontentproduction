@@ -271,7 +271,7 @@ def compile_prompts(session: Session) -> dict:
         session.execute(
             select(LlmModel).where(
                 LlmModel.is_active.is_(True),
-                LlmModel.model_size.in_(("small", "large")),
+                LlmModel.model_size.in_(("small", "large", "vision")),
             )
         )
         .scalars()

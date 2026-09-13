@@ -66,13 +66,15 @@ def test_seed_data_has_3_models():
     assert sizes["jinaai/jina-embeddings-v5-text-nano"] == "embedding"
 
 
-def test_seed_data_has_4_templates():
+def test_seed_data_has_6_templates():
     keys = [t["task_key"] for t in TEMPLATES]
     assert keys == [
         "alignment_reinforcement",
         "critic_checklist",
         "novelty_scoring",
         "producer_draft",
+        "project_generator",
+        "project_refine",
     ]
     for t in TEMPLATES:
         assert t["version"] == "1.0"
@@ -84,12 +86,12 @@ def test_seed_upserts_without_duplicates():
     fake = _FakeSession()
     result1 = seed(session=fake)
     assert len(result1["model_names"]) == 3
-    assert len(result1["task_keys"]) == 4
+    assert len(result1["task_keys"]) == 6
 
     # Segunda corrida: no duplica (upsert por clave única).
     result2 = seed(session=fake)
     assert len(fake.models) == 3
-    assert len(fake.templates) == 4
+    assert len(fake.templates) == 6
     assert result2["model_names"] == result1["model_names"]
     assert result2["task_keys"] == result1["task_keys"]
 
@@ -98,7 +100,7 @@ def test_seed_returns_summary_with_ids():
     fake = _FakeSession()
     result = seed(session=fake)
     assert "models" in result and len(result["models"]) == 3
-    assert "templates" in result and len(result["templates"]) == 4
+    assert "templates" in result and len(result["templates"]) == 6
     for mid in result["models"]:
         uuid.UUID(mid)  # no lanza
     for tid in result["templates"]:

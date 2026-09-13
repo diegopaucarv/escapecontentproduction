@@ -3,9 +3,9 @@ Seed de la infraestructura de IA modular (0004).
 
 Inserta/actualiza:
   1. El registro de modelos en `llm_models` (pequeño, grande, embeddings).
-  2. Las specs agnósticas de prompts en `prompt_templates` (los 4 tasks
+  2. Las specs agnósticas de prompts en `prompt_templates` (los 6 tasks
      iniciales: alignment_reinforcement, critic_checklist, novelty_scoring,
-     producer_draft).
+     producer_draft, project_generator, project_refine).
 
 A diferencia de src/db/seed_llm.py, NO requiere ninguna variable de entorno:
 es datos puros. Tampoco compila artefactos — eso lo hace el compilador
@@ -121,8 +121,10 @@ TEMPLATES = [
         "task_key": "alignment_reinforcement",
         "version": "1.0",
         "intent": (
-            "Eres el refuerzo del semaforo de alineamiento estrategico. "
-            "Tu unica funcion es detectar riesgos que el checklist automatico no cubre."
+            "Eres el orquestador por defecto de la decision de alineamiento "
+            "estrategico. Refuerzas el semaforo basado en reglas: tu funcion es "
+            "detectar riesgos que el checklist automatico no cubre. La degradacion "
+            "a solo-reglas (sin LLM) requiere aceptacion del usuario."
         ),
         "rules": [
             (
@@ -134,6 +136,7 @@ TEMPLATES = [
                 "No repetir verificaciones que ya hace el checklist automatico "
                 "(fuente, CTA, segmentos S5/S6)"
             ),
+            "La degradacion a solo-reglas (sin LLM) requiere aceptacion del usuario",
         ],
         "input_schema": {
             "brief": "object",
@@ -154,7 +157,8 @@ TEMPLATES = [
             "Eres el critico editorial. Verificas el borrador contra el checklist "
             "de publicacion recibido como dato. Cada item del checklist debe tener "
             "su interpretacion en rules; si un item no tiene interpretacion, "
-            "marcalo como no_evaluado, nunca ok."
+            "marcalo como no_evaluado, nunca ok. Si el critico no esta disponible, "
+            "el fallback deterministico (no_evaluado) requiere aceptacion humana."
         ),
         "rules": [
             "fuente_verificable: el claim principal cita una fuente verificable",
@@ -190,9 +194,11 @@ TEMPLATES = [
         "task_key": "novelty_scoring",
         "version": "1.0",
         "intent": (
-            "Eres el refinador de novedad. Solo se te consulta en la zona gris "
-            "del enrutamiento. Tu unica tarea es juzgar si el angulo/tema de esta "
-            "pieza esta cubierto por piezas anteriores de la marca."
+            "Eres el refinador de novedad. Por defecto se te consulta en la zona "
+            "gris del enrutamiento. Tu unica tarea es juzgar si el angulo/tema de "
+            "esta pieza esta cubierto por piezas anteriores de la marca. Si no estas "
+            "disponible, el default deterministico (angulo_nuevo = true) requiere "
+            "aceptacion del usuario."
         ),
         "rules": [
             "Compara el angulo de la pieza nueva contra los angulos de las piezas anteriores",
@@ -210,14 +216,20 @@ TEMPLATES = [
         "task_key": "producer_draft",
         "version": "1.0",
         "intent": (
-            "Eres el productor editorial. Generas el borrador de una pieza a "
-            "partir del insight_core y el Context Pack, respetando el tono de la marca."
+            "Eres el productor editorial, el paso de generacion guiado por LLM "
+            "por defecto. Generas o refinas el borrador de una pieza a partir del "
+            "insight_core y el Context Pack, respetando el tono de la marca e "
+            "incorporando el critic_feedback de la iteracion anterior si lo recibes."
         ),
         "rules": [
             "Abrir con el gancho de 15 segundos",
             "Un solo CTA al final",
             "Respetar el tono de la marca (brand_objective)",
             "No inventar datos: usar solo lo del Context Pack",
+            (
+                "Si recibes critic_feedback de la iteración anterior, "
+                "incorpóralo al nuevo borrador"
+            ),
         ],
         "input_schema": {
             "insight_core": "string",
@@ -225,12 +237,55 @@ TEMPLATES = [
             "brand_objective": "string",
             "artifact_type": "string",
             "channel": "string",
+            "critic_feedback": "string",
         },
         "output_schema": {
             "draft": "string",
             "hook_15s": "string",
             "cta": "string",
         },
+        "few_shot": [],
+    },
+    {
+        "task_key": "project_generator",
+        "version": "1.0",
+        "intent": (
+            "Eres el compilador de contenido de Pipeline OS. Escribes el snapshot "
+            "JSON editable de un proyecto a partir del topic, el template de "
+            "producción y la spec de formato. Nunca editas archivos."
+        ),
+        "rules": [
+            "Escribir SOLO datos (el snapshot JSON)",
+            "No inventar reglas nuevas",
+            "Incluir los campos que la estructura del formato define",
+            "Salida JSON estricta",
+        ],
+        "input_schema": {
+            "topic": "string",
+            "template": "object",
+            "format_spec": "object",
+        },
+        "output_schema": {"snapshot": "object"},
+        "few_shot": [],
+    },
+    {
+        "task_key": "project_refine",
+        "version": "1.0",
+        "intent": (
+            "Eres el editor de copywriting/prompts/guiones de Pipeline OS. "
+            "Corriges SOLO los warnings del snapshot JSON de un proyecto."
+        ),
+        "rules": [
+            "Corregir solo los warnings",
+            "No cambiar contenido que no esté en los warnings",
+            "Salida JSON estricta",
+        ],
+        "input_schema": {
+            "topic": "string",
+            "snapshot": "object",
+            "warnings": "array",
+        },
+        "output_schema": {"snapshot": "object"},
         "few_shot": [],
     },
 ]
