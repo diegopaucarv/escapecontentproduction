@@ -4,26 +4,27 @@ exactamente sql/001_init.sql. Se mantienen sincronizados a mano por ahora;
 en cuanto haya una segunda migración, introducir Alembic (ver README) en
 vez de seguir editando 001_init.sql directamente.
 """
+
 from __future__ import annotations
 
 import enum
 import uuid
 from datetime import datetime
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    JSON,
     CheckConstraint,
     ForeignKey,
-    JSON,
     SmallInteger,
     String,
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import ENUM as PgEnum, JSONB, UUID
+from sqlalchemy.dialects.postgresql import ENUM as PgEnum
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
-
-from pgvector.sqlalchemy import Vector
 
 # La dimensión vive fijada aquí Y en sql/001_init.sql (vector(1024)) a
 # propósito: es un cambio de esquema, no de configuración de runtime.
@@ -106,11 +107,18 @@ def _pg_enum(py_enum, name: str) -> PgEnum:
 class AppUser(Base):
     __tablename__ = "app_users"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
     full_name: Mapped[str] = mapped_column(String(150))
     email: Mapped[str] = mapped_column(String(150), unique=True)
     role: Mapped[UserRole] = mapped_column(_pg_enum(UserRole, "user_role_t"))
-    brand_scope: Mapped[BrandObjective | None] = mapped_column(_pg_enum(BrandObjective, "brand_objective_t"), nullable=True)
+    brand_scope: Mapped[BrandObjective | None] = mapped_column(
+        _pg_enum(BrandObjective, "brand_objective_t"), nullable=True
+    )
+    hashed_password: Mapped[str | None] = mapped_column(
+        String(255), nullable=True
+    )  # añadido en 0002 — NULL = usuario sin login (ej. externo)
     is_active: Mapped[bool] = mapped_column(default=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
@@ -120,9 +128,15 @@ class PipelineTemplate(Base):
     __table_args__ = (UniqueConstraint("brand_objective", "content_bucket"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    brand_objective: Mapped[BrandObjective] = mapped_column(_pg_enum(BrandObjective, "brand_objective_t"))
-    content_bucket: Mapped[ContentBucket] = mapped_column(_pg_enum(ContentBucket, "content_bucket_t"))
-    default_route: Mapped[ProductionRoute | None] = mapped_column(_pg_enum(ProductionRoute, "production_route_t"), nullable=True)
+    brand_objective: Mapped[BrandObjective] = mapped_column(
+        _pg_enum(BrandObjective, "brand_objective_t")
+    )
+    content_bucket: Mapped[ContentBucket] = mapped_column(
+        _pg_enum(ContentBucket, "content_bucket_t")
+    )
+    default_route: Mapped[ProductionRoute | None] = mapped_column(
+        _pg_enum(ProductionRoute, "production_route_t"), nullable=True
+    )
     checklist: Mapped[list] = mapped_column(JSONB, default=list)
     novelty_weights: Mapped[dict] = mapped_column(JSONB, default=dict)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
@@ -132,6 +146,7 @@ class PipelineTemplate(Base):
 class PipelineStage(Base):
     """Tabla de referencia (lookup) — poblada por el seed de 001_init.sql,
     no se escribe desde la app salvo para agregar una etapa nueva."""
+
     __tablename__ = "pipeline_stages"
 
     stage_code: Mapped[str] = mapped_column(String(50), primary_key=True)
@@ -148,9 +163,15 @@ class ContentBrief(Base):
         ),
     )
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
-    owner_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("app_users.id"), nullable=True)
-    status: Mapped[BriefStatus] = mapped_column(_pg_enum(BriefStatus, "brief_status_t"), default=BriefStatus.idea)
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("app_users.id"), nullable=True
+    )
+    status: Mapped[BriefStatus] = mapped_column(
+        _pg_enum(BriefStatus, "brief_status_t"), default=BriefStatus.idea
+    )
 
     # Bloque B
     resumen: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -159,11 +180,15 @@ class ContentBrief(Base):
     prior_attempts: Mapped[str | None] = mapped_column(Text, nullable=True)
     risks: Mapped[str | None] = mapped_column(Text, nullable=True)
     novelty_indicators: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    suggested_product_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    suggested_product_type: Mapped[str | None] = mapped_column(
+        String(100), nullable=True
+    )
     org_priorities_contrast: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Bloque C
-    brand_objective: Mapped[BrandObjective] = mapped_column(_pg_enum(BrandObjective, "brand_objective_t"))
+    brand_objective: Mapped[BrandObjective] = mapped_column(
+        _pg_enum(BrandObjective, "brand_objective_t")
+    )
     phase_number: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     segment_client: Mapped[str | None] = mapped_column(String(2), nullable=True)
     segment_community: Mapped[str | None] = mapped_column(String(2), nullable=True)
@@ -175,7 +200,9 @@ class ContentBrief(Base):
     change_hypothesis: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Bloque D
-    content_bucket: Mapped[ContentBucket] = mapped_column(_pg_enum(ContentBucket, "content_bucket_t"))
+    content_bucket: Mapped[ContentBucket] = mapped_column(
+        _pg_enum(ContentBucket, "content_bucket_t")
+    )
     service_category: Mapped[str | None] = mapped_column(String(100), nullable=True)
     product_anchor: Mapped[str | None] = mapped_column(String(150), nullable=True)
     entry_offer: Mapped[str | None] = mapped_column(String(150), nullable=True)
@@ -195,7 +222,9 @@ class ContentBrief(Base):
 
     # Bloque G
     evidence_source: Mapped[str | None] = mapped_column(Text, nullable=True)
-    risk_level: Mapped[RiskLevel] = mapped_column(_pg_enum(RiskLevel, "risk_level_t"), default=RiskLevel.bajo)
+    risk_level: Mapped[RiskLevel] = mapped_column(
+        _pg_enum(RiskLevel, "risk_level_t"), default=RiskLevel.bajo
+    )
     debate_governance: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     validation_required: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     repurpose_plan: Mapped[list | None] = mapped_column(JSONB, nullable=True)
@@ -204,9 +233,15 @@ class ContentBrief(Base):
     metric_primary: Mapped[str | None] = mapped_column(String(100), nullable=True)
     metric_secondary: Mapped[str | None] = mapped_column(String(100), nullable=True)
     novelty_score: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
-    route_decision: Mapped[RouteDecision | None] = mapped_column(_pg_enum(RouteDecision, "route_decision_t"), nullable=True)
-    production_route: Mapped[ProductionRoute | None] = mapped_column(_pg_enum(ProductionRoute, "production_route_t"), nullable=True)
-    pipeline_template_id: Mapped[int | None] = mapped_column(ForeignKey("pipeline_templates.id"), nullable=True)
+    route_decision: Mapped[RouteDecision | None] = mapped_column(
+        _pg_enum(RouteDecision, "route_decision_t"), nullable=True
+    )
+    production_route: Mapped[ProductionRoute | None] = mapped_column(
+        _pg_enum(ProductionRoute, "production_route_t"), nullable=True
+    )
+    pipeline_template_id: Mapped[int | None] = mapped_column(
+        ForeignKey("pipeline_templates.id"), nullable=True
+    )
 
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
@@ -217,8 +252,12 @@ class ContentBrief(Base):
 class ContentArtifact(Base):
     __tablename__ = "content_artifacts"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
-    brief_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("content_briefs.id", ondelete="CASCADE"))
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    brief_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("content_briefs.id", ondelete="CASCADE")
+    )
     artifact_type: Mapped[str] = mapped_column(String(50))
     channel: Mapped[str] = mapped_column(String(50))
     storage_path: Mapped[str | None] = mapped_column(String(300), nullable=True)
@@ -234,13 +273,21 @@ class ContentArtifact(Base):
 class RepurposeLink(Base):
     __tablename__ = "repurpose_links"
     __table_args__ = (
-        CheckConstraint("source_artifact_id <> target_artifact_id", name="chk_no_self_link"),
+        CheckConstraint(
+            "source_artifact_id <> target_artifact_id", name="chk_no_self_link"
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    source_artifact_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("content_artifacts.id", ondelete="CASCADE"))
-    target_artifact_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("content_artifacts.id", ondelete="CASCADE"))
-    link_type: Mapped[RepurposeLinkType] = mapped_column(_pg_enum(RepurposeLinkType, "repurpose_link_t"))
+    source_artifact_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("content_artifacts.id", ondelete="CASCADE")
+    )
+    target_artifact_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("content_artifacts.id", ondelete="CASCADE")
+    )
+    link_type: Mapped[RepurposeLinkType] = mapped_column(
+        _pg_enum(RepurposeLinkType, "repurpose_link_t")
+    )
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
@@ -248,23 +295,32 @@ class ProductionLog(Base):
     __tablename__ = "production_logs"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    brief_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("content_briefs.id", ondelete="CASCADE"))
+    brief_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("content_briefs.id", ondelete="CASCADE")
+    )
     stage_code: Mapped[str] = mapped_column(ForeignKey("pipeline_stages.stage_code"))
     entered_at: Mapped[datetime] = mapped_column(server_default=func.now())
     exited_at: Mapped[datetime | None] = mapped_column(nullable=True)
     rework_count: Mapped[int] = mapped_column(default=0)
     # lead_time_minutes es GENERATED ALWAYS en la base — solo lectura desde el ORM
-    lead_time_minutes: Mapped[int | None] = mapped_column(nullable=True, insert_default=None)
+    lead_time_minutes: Mapped[int | None] = mapped_column(
+        nullable=True, insert_default=None
+    )
 
 
 class ArtifactLibraryRow(Base):
     """Índice vectorial para RAG / Context Packs / búsqueda de duplicado
     (Paso 1 del enrutamiento por novedad, src/agents/novelty_router.py)."""
+
     __tablename__ = "artifact_library"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    artifact_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("content_artifacts.id", ondelete="CASCADE"), nullable=True)
-    brief_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("content_briefs.id", ondelete="CASCADE"), nullable=True)
+    artifact_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("content_artifacts.id", ondelete="CASCADE"), nullable=True
+    )
+    brief_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("content_briefs.id", ondelete="CASCADE"), nullable=True
+    )
     content_summary: Mapped[str] = mapped_column(Text)
     embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIM))
     retention_24h: Mapped[float | None] = mapped_column(nullable=True)
@@ -276,7 +332,50 @@ class TelemetryEvent(Base):
     __tablename__ = "telemetry_events"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    artifact_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("content_artifacts.id", ondelete="SET NULL"), nullable=True)
+    artifact_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("content_artifacts.id", ondelete="SET NULL"), nullable=True
+    )
     event_type: Mapped[str] = mapped_column(String(50))
     payload: Mapped[dict] = mapped_column(JSONB, default=dict)
     received_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class ApiKey(Base):
+    """Claves de API por proveedor (Together, OpenAI, ...). La clave en sí
+    es un secreto: se inserta vía seed/env (src/db/seed_llm.py) y NUNCA se
+    devuelve completa por la API — solo enmascarada."""
+
+    __tablename__ = "api_keys"
+    __table_args__ = (UniqueConstraint("provider", "key_name"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    provider: Mapped[str] = mapped_column(String(50))
+    key_name: Mapped[str] = mapped_column(String(100))
+    api_key: Mapped[str] = mapped_column(Text)
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class SessionSettings(Base):
+    """Settings de sesión: modelos pequeño/grande + parámetros, referenciando
+    UNA api_key. Solo una fila activa a la vez (singleton, ver
+    uq_session_settings_active en sql/002_llm_infra.sql)."""
+
+    __tablename__ = "session_settings"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    api_key_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("api_keys.id"))
+    small_model: Mapped[str] = mapped_column(String(150))
+    large_model: Mapped[str] = mapped_column(String(150))
+    temperature_small: Mapped[float] = mapped_column(default=0.7)
+    temperature_large: Mapped[float] = mapped_column(default=0.7)
+    max_tokens_small: Mapped[int] = mapped_column(default=2048)
+    max_tokens_large: Mapped[int] = mapped_column(default=4096)
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now())

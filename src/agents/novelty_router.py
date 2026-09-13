@@ -10,6 +10,10 @@ Diseño deliberado:
   el Paso 2 (puntaje ponderado) tal como quedaron definidos en el pipeline.
   No inventa un "novelty_score" mágico de una sola fórmula: primero busca,
   y solo puntúa si no encontró nada comparable.
+
+Implementación concreta de `EmbedFn`: src/embeddings.py::embed_text
+(Voyage AI). Se pasa por parámetro para no acoplar esta lógica de
+enrutamiento a un proveedor específico ni a la disponibilidad de red.
 """
 from __future__ import annotations
 

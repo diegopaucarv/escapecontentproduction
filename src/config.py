@@ -9,16 +9,24 @@ default aquí. Si el equipo prefiere OpenAI, basta con cambiar
 EMBEDDING_PROVIDER y EMBEDDING_DIM — el resto del código no asume
 ningún proveedor específico.
 """
+
 from functools import lru_cache
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
 
     # Base de datos
-    database_url: str = "postgresql+psycopg2://ergalia_user:changeme@localhost:5432/escape_ergalia_os"
-    database_url_async: str = "postgresql://ergalia_user:changeme@localhost:5432/escape_ergalia_os"
+    database_url: str = (
+        "postgresql+psycopg2://ergalia_user:changeme@localhost:5432/escape_ergalia_os"
+    )
+    database_url_async: str = (
+        "postgresql://ergalia_user:changeme@localhost:5432/escape_ergalia_os"
+    )
 
     # Embeddings — ver docstring del módulo
     embedding_provider: str = "voyage"  # "voyage" | "openai"
@@ -37,6 +45,9 @@ class Settings(BaseSettings):
     # API
     api_host: str = "0.0.0.0"
     api_port: int = 8000
+
+    # Autenticación (RBAC — ver src/auth.py)
+    jwt_secret: str = ""  # JWT_SECRET en .env — generar con secrets.token_hex(32)
 
 
 @lru_cache
