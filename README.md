@@ -11,17 +11,23 @@ cp .env.example .env
 # editar .env: POSTGRES_PASSWORD, JWT_SECRET (generar con
 # `python -c "import secrets; print(secrets.token_hex(32))"`)
 # Las claves de IA y los modelos NO van en .env: viven en la base de
-# datos (tablas api_keys y session_settings). Insertarlas con el seed:
+# datos (tablas api_keys, session_settings, llm_models, prompt_templates).
 docker compose up -d --build
 docker compose run --rm -e TOGETHER_API_KEY=tgp_v1_... api python -m src.db.seed_llm
+docker compose run --rm api python -m src.db.seed_ai
+docker compose run --rm api python -m src.llm.compile_prompts
 curl localhost:8000/health
 ```
 
 El seed (`src/db/seed_llm.py`) inserta la clave de Together en `api_keys`
 y crea la `session_settings` activa con los modelos pequeño/grande
 (`meta-models/Muse-Glimmer-30B` y `deepseek-ai/DeepSeek-V4-Flash-0731`).
-Después se pueden editar desde la API: `GET/POST/PUT/DELETE /api-keys` y
-`/settings` (la clave nunca se devuelve completa, solo enmascarada).
+El seed (`src/db/seed_ai.py`) registra los modelos en `llm_models` y las
+specs de prompts en `prompt_templates`. El compilador
+(`src/llm/compile_prompts.py`) transpila las specs a artefactos inmutables
+en `prompt_artifacts`. Después se pueden editar desde la API:
+`GET/POST/PUT/DELETE /api-keys`, `/settings`, `/llm-models`,
+`/prompt-templates` (la clave nunca se devuelve completa, solo enmascarada).
 
 `docker compose up` levanta `db` → `migrate` (corre `alembic upgrade head`
 una sola vez y termina) → `api` + `agent_worker` (esperan a que `migrate`
@@ -96,6 +102,28 @@ el camino feliz:
   `complete(session, prompt, model_size="small"|"large")` lee la config
   activa desde la DB y llama a `api.together.xyz` (API compatible con
   OpenAI). Probado con la DB real: seed → `GET /api-keys` → `GET /settings`.
+- **Infraestructura de IA modular** (`alembic/versions/0004_ai_modular_infra.py`)
+  — registro de modelos (`llm_models`), specs agnósticas de prompts
+  (`prompt_templates`), artefactos compilados inmutables (`prompt_artifacts`)
+  y settings de embeddings (`embedding_settings`). El compilador
+  (`src/llm/compiler.py`) transpila cada spec a un prompt congelado por
+  modelo usando el `syntax_profile` de cada modelo como datos (no if/else
+  por proveedor) — maneja modelos comerciales y abiertos (Mistral,
+  DeepSeek, Llama, Nemotron...). `prompt_artifacts` es INMUTABLE:
+  recompilar = INSERT nueva versión + desactivar la anterior.
+- **Refuerzo LLM del semáforo** (`src/llm/reinforcement.py`) — el modelo
+  pequeño detecta riesgos que el checklist automático no cubre. Fusión
+  CONSERVADORA: solo puede escalar (auto_pass → needs_human_review),
+  nunca bajar la severidad. Reintentos (`session_settings.llm_retries`,
+  default 3) → fallback (`fallback_model`) → solo-reglas (degradación
+  elegante). JSON schema siempre forzado (`response_format`). Probado en
+  vivo contra Together: el refuerzo detectó 2 riesgos no cubiertos por el
+  checklist y no bajó el veredicto `fail` de las reglas.
+- **Refinador de novedad** (`src/llm/novelty_refinement.py`) — el LLM
+  SOLO se consulta en la zona gris del enrutamiento (búsqueda vectorial
+  inconclusa) y SOLO para juzgar `ángulo no cubierto`. El scoring
+  determinista (`score_novelty`) sigue siendo el default; si el LLM no
+  está disponible, se degrada al comportamiento actual.
 - **Enrutamiento por novedad y Gatekeeper** — lógica pura con tests
   unitarios (`tests/test_novelty_router.py`, `tests/test_gatekeeper.py`).
 - **Esqueleto Producer-Critic** (`src/agents/producer_critic.py`,
@@ -104,8 +132,61 @@ el camino feliz:
   **reanuda** correctamente con `Command(resume=...)`. El nodo `critic`
   llama al Gatekeeper real; el nodo `producer` es un stub explícito.
 
-`pytest tests/ -v` → 46/46 pasan, sin necesitar Postgres (toda la lógica
+`pytest tests/ -v` → 91/91 pasan, sin necesitar Postgres (toda la lógica
 de agentes está separada de la capa de datos a propósito).
+
+## Infraestructura de IA modular (0004)
+
+### Endpoints nuevos
+
+| Método           | Ruta                       | Descripción                                     |
+| ---------------- | -------------------------- | ----------------------------------------------- |
+| `GET/POST`       | `/llm-models`              | Lista/crea modelos (registro `llm_models`)      |
+| `GET/PUT/DELETE` | `/llm-models/{id}`         | Detalle/edita/borra un modelo                   |
+| `GET/POST`       | `/prompt-templates`        | Lista/crea specs de prompts                     |
+| `GET/PUT/DELETE` | `/prompt-templates/{id}`   | Detalle/edita/borra una spec                    |
+| `GET`            | `/prompt-artifacts`        | Lista artefactos compilados (sin `prompt_text`) |
+| `GET`            | `/prompt-artifacts/{id}`   | Detalle con `prompt_text`                       |
+| `GET/POST`       | `/embedding-settings`      | Lee/crea la config de embeddings (singleton)    |
+| `PUT/DELETE`     | `/embedding-settings/{id}` | Edita/borra la config de embeddings             |
+| `POST`           | `/settings/ensure-prompts` | Compila specs → artefactos (idempotente)        |
+
+### Flujo Prompt-as-Code
+
+```
+[Spec agnóstica] (prompt_templates)  --compilador determinista-->
+[Artefacto inmutable] (prompt_artifacts)  --runtime-->
+```
+
+1. **Editar** la spec en `prompt_templates` (CRUD por API).
+2. **Compilar** con `POST /settings/ensure-prompts` (o
+   `python -m src.llm.compile_prompts`). Si el contenido cambió, se
+   INSERTA una versión nueva y se desactiva la anterior — nunca UPDATE.
+3. **Ejecutar** — el runtime (`src/llm/reinforcement.py`,
+   `src/llm/novelty_refinement.py`) lee el artefacto activo y lo usa
+   tal cual. Prompt caching de prefijo intacto: el bloque estático no
+   cambia a mitad de sesión.
+
+### Reglas de diseño (aprobadas)
+
+- **`alignment_reinforcement`** contiene SOLO la regla que el código no
+  puede evaluar: "si detectas un riesgo NO cubierto por el checklist
+  automático, escala". Las verificaciones mecánicas (fuente, CTA, S5/S6)
+  las impone el código, no el prompt — no hay segunda fuente de verdad.
+- **Fusión conservadora**: el LLM nunca baja la severidad. `fail` se
+  queda `fail`; `auto_pass` + riesgo LLM → `needs_human_review`.
+- **Reintentos y fallback**: `session_settings.llm_retries` (default 3)
+  → `fallback_model` → solo-reglas (degradación elegante).
+- **JSON schema siempre forzado** en la llamada al modelo pequeño.
+- **`critic_checklist`**: data-driven (checklist como dato). Todo ítem de
+  `pipeline_templates.checklist` debe tener su interpretación en `rules`
+  (validado en el CRUD con 422 y en el compilador con warning). Ítem sin
+  interpretación → `no_evaluado`, nunca `ok`.
+- **`novelty_scoring`**: el scoring determinista sigue siendo el default.
+  El LLM solo se consulta en la zona gris y solo para juzgar `ángulo no
+cubierto`.
+- **`prompt_artifacts` es inmutable** — recompilar = INSERT + desactivar
+  la anterior.
 
 ## Qué sigue abierto, a propósito
 
@@ -138,14 +219,20 @@ sin implementar:
 
 - **Nodo `producer` real** — conectar el SDK de Together (o Anthropic) para
   generar/ajustar el borrador a partir de `insight_core` + Context Pack.
-  No se implementó porque no hay forma de probarlo sin un ciclo real de
-  contenido por el pipeline — ver la evaluación crítica original sobre
-  secuenciación.
+  La spec `producer_draft` ya está compilada en `prompt_artifacts`; falta
+  el nodo que la consuma. No se implementó porque no hay forma de probarlo
+  sin un ciclo real de contenido por el pipeline — ver la evaluación
+  crítica original sobre secuenciación.
+- **Clave de Voyage** — la infraestructura de embeddings
+  (`embedding_settings` + `llm_models` con `voyage-3-large`) existe y
+  falla ruidosamente si no hay config; falta que el usuario provea la
+  clave y cree la `embedding_settings` activa vía `POST /embedding-settings`.
 - **Checklist automático real en el Critic** — hoy `critic_node` marca
   todos los ítems del checklist como `True` (simulado). Antes de
   producción, cada ítem de `pipeline_templates.checklist` necesita una
   verificación real (longitud de CTA, fuente citada, anonimización vía
-  regex/NER) en vez de un valor fijo.
+  regex/NER) en vez de un valor fijo. La spec `critic_checklist` ya
+  valida que todo ítem tenga interpretación.
 - **Checkpointer persistente** — el grafo usa `InMemorySaver`. Para que
   un `interrupt()` sobreviva un reinicio del contenedor, cambiar a
   `langgraph-checkpoint-postgres` (comentado en `requirements.txt`).

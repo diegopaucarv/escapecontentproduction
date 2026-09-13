@@ -26,7 +26,11 @@ from src.db.models import (
     ApiKey,
     AppUser,
     ContentBrief,
+    EmbeddingSetting,
+    LlmModel,
     PipelineTemplate,
+    PromptArtifact,
+    PromptTemplate,
     SessionSettings,
     TelemetryEvent,
 )
@@ -249,25 +253,57 @@ def align_brief(brief_id: uuid.UUID, session: Session = Depends(get_session)) ->
     )
     result = run_alignment(inputs)
 
+    # Refuerzo LLM del semáforo (0004): el modelo pequeño detecta riesgos
+    # que el checklist automático no cubre. Fusión CONSERVADORA: solo
+    # puede escalar (auto_pass -> needs_human_review), nunca bajar la
+    # severidad. Si el LLM no está disponible, degrada a solo-reglas.
+    llm_reinforcement = None
+    final_verdict = result.verdict.value
+    try:
+        from src.llm.reinforcement import reinforce_alignment
+
+        brief_data = {
+            "resumen": brief.resumen,
+            "insight_core": brief.insight_core,
+            "pitch_15s": brief.pitch_15s,
+            "risk_level": _val(brief.risk_level),
+            "segment_client": _val(brief.segment_client),
+            "content_bucket": _val(brief.content_bucket),
+            "brand_objective": _val(brief.brand_objective),
+        }
+        llm_reinforcement = reinforce_alignment(
+            session,
+            brief_data=brief_data,
+            rule_verdict=result.verdict.value,
+            checklist_results=[
+                {"item": r.item, "status": r.status.value}
+                for r in result.checklist_results
+            ],
+        )
+        if llm_reinforcement.get("status") == "ok":
+            final_verdict = llm_reinforcement["verdict"]
+    except Exception:  # noqa: BLE001 — el refuerzo nunca rompe el alineamiento
+        llm_reinforcement = {"status": "error", "reason": "reinforcement_failed"}
+
     # El veredicto del Gatekeeper decide el estado del brief (§3.9):
     # fail → retrabajo (generando); needs_human_review/auto_pass → revisión
     # (esperando la aprobación del 🟨 líder vía POST /briefs/{id}/approve).
     if _val(brief.status) in ("idea", "brief", "revision", "generando"):
-        brief.status = "generando" if result.verdict.value == "fail" else "revision"
+        brief.status = "generando" if final_verdict == "fail" else "revision"
         session.commit()
 
     semaforo = {
         "auto_pass": "🟢",
         "needs_human_review": "🟡",
         "fail": "🔴",
-    }[result.verdict.value]
+    }[final_verdict]
 
     return {
         "brief_id": str(brief.id),
         "brand_objective": _val(brief.brand_objective),
         "content_bucket": _val(brief.content_bucket),
         "semaforo": semaforo,
-        "verdict": result.verdict.value,
+        "verdict": final_verdict,
         "checklist": [
             {"item": r.item, "status": r.status.value, "reason": r.reason}
             for r in result.checklist_results
@@ -280,6 +316,7 @@ def align_brief(brief_id: uuid.UUID, session: Session = Depends(get_session)) ->
             "novelty_score": brief.novelty_score,
         },
         "reasoning": result.reasoning,
+        "llm_reinforcement": llm_reinforcement,
     }
 
 
@@ -377,6 +414,8 @@ class SettingsCreate(BaseModel):
     api_key_id: uuid.UUID
     small_model: str = Field(..., examples=["meta-models/Muse-Glimmer-30B"])
     large_model: str = Field(..., examples=["deepseek-ai/DeepSeek-V4-Flash-0731"])
+    fallback_model: str | None = None
+    llm_retries: int = 3
     temperature_small: float = 0.7
     temperature_large: float = 0.7
     max_tokens_small: int = 2048
@@ -388,6 +427,8 @@ class SettingsUpdate(BaseModel):
     api_key_id: uuid.UUID | None = None
     small_model: str | None = None
     large_model: str | None = None
+    fallback_model: str | None = None
+    llm_retries: int | None = None
     temperature_small: float | None = None
     temperature_large: float | None = None
     max_tokens_small: int | None = None
@@ -474,6 +515,8 @@ def _settings_to_dict(s: SessionSettings) -> dict:
         "api_key_id": str(s.api_key_id),
         "small_model": s.small_model,
         "large_model": s.large_model,
+        "fallback_model": s.fallback_model,
+        "llm_retries": int(s.llm_retries),
         "temperature_small": float(s.temperature_small),
         "temperature_large": float(s.temperature_large),
         "max_tokens_small": int(s.max_tokens_small),
@@ -519,6 +562,8 @@ def create_settings(
         api_key_id=body.api_key_id,
         small_model=body.small_model,
         large_model=body.large_model,
+        fallback_model=body.fallback_model,
+        llm_retries=body.llm_retries,
         temperature_small=body.temperature_small,
         temperature_large=body.temperature_large,
         max_tokens_small=body.max_tokens_small,
@@ -553,6 +598,10 @@ def update_settings(
         settings.small_model = body.small_model
     if body.large_model is not None:
         settings.large_model = body.large_model
+    if body.fallback_model is not None:
+        settings.fallback_model = body.fallback_model
+    if body.llm_retries is not None:
+        settings.llm_retries = body.llm_retries
     if body.temperature_small is not None:
         settings.temperature_small = body.temperature_small
     if body.temperature_large is not None:
@@ -579,3 +628,443 @@ def delete_settings(
         )
     session.delete(settings)
     session.commit()
+
+
+# ---------------------------------------------------------------------
+# Infraestructura de IA modular (0004) — CRUD de modelos, specs y artefactos
+# ---------------------------------------------------------------------
+
+
+class LlmModelCreate(BaseModel):
+    model_name: str = Field(..., examples=["meta-models/Muse-Glimmer-30B"])
+    provider: str = Field(..., examples=["together"])
+    model_size: str = Field(..., examples=["small"])  # small | large | embedding
+    context_window: int = 0
+    max_output_tokens: int = 0
+    temperature_default: float = 0.7
+    strengths: list[str] = []
+    weaknesses: list[str] = []
+    prompt_style: str = ""
+    syntax_profile: dict = {}
+    is_active: bool = True
+
+
+class LlmModelUpdate(BaseModel):
+    model_name: str | None = None
+    provider: str | None = None
+    model_size: str | None = None
+    context_window: int | None = None
+    max_output_tokens: int | None = None
+    temperature_default: float | None = None
+    strengths: list[str] | None = None
+    weaknesses: list[str] | None = None
+    prompt_style: str | None = None
+    syntax_profile: dict | None = None
+    is_active: bool | None = None
+
+
+class PromptTemplateCreate(BaseModel):
+    task_key: str = Field(..., examples=["alignment_reinforcement"])
+    version: str = "1.0"
+    intent: str = Field(..., examples=["Eres el refuerzo del semáforo..."])
+    rules: list[str] = []
+    input_schema: dict = {}
+    output_schema: dict = {}
+    few_shot: list = []
+    is_active: bool = True
+    # Ítems del checklist de pipeline_templates para validar critic_checklist.
+    checklist_items: list[str] | None = None
+
+
+class PromptTemplateUpdate(BaseModel):
+    task_key: str | None = None
+    version: str | None = None
+    intent: str | None = None
+    rules: list[str] | None = None
+    input_schema: dict | None = None
+    output_schema: dict | None = None
+    few_shot: list | None = None
+    is_active: bool | None = None
+    checklist_items: list[str] | None = None
+
+
+class EmbeddingSettingsCreate(BaseModel):
+    api_key_id: uuid.UUID
+    llm_model_id: uuid.UUID
+    dimension: int = 1024
+    is_active: bool = True
+
+
+class EmbeddingSettingsUpdate(BaseModel):
+    api_key_id: uuid.UUID | None = None
+    llm_model_id: uuid.UUID | None = None
+    dimension: int | None = None
+    is_active: bool | None = None
+
+
+def _llm_model_to_dict(m: LlmModel) -> dict:
+    return {
+        "id": str(m.id),
+        "model_name": m.model_name,
+        "provider": m.provider,
+        "model_size": m.model_size,
+        "context_window": m.context_window,
+        "max_output_tokens": m.max_output_tokens,
+        "temperature_default": float(m.temperature_default),
+        "strengths": m.strengths or [],
+        "weaknesses": m.weaknesses or [],
+        "prompt_style": m.prompt_style,
+        "syntax_profile": m.syntax_profile or {},
+        "is_active": m.is_active,
+        "created_at": m.created_at.isoformat() if m.created_at else None,
+        "updated_at": m.updated_at.isoformat() if m.updated_at else None,
+    }
+
+
+def _prompt_template_to_dict(t: PromptTemplate) -> dict:
+    return {
+        "id": str(t.id),
+        "task_key": t.task_key,
+        "version": t.version,
+        "intent": t.intent,
+        "rules": t.rules or [],
+        "input_schema": t.input_schema or {},
+        "output_schema": t.output_schema or {},
+        "few_shot": t.few_shot or [],
+        "is_active": t.is_active,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+        "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+    }
+
+
+def _prompt_artifact_to_dict(a: PromptArtifact, include_text: bool = False) -> dict:
+    data = {
+        "id": str(a.id),
+        "llm_model_id": str(a.llm_model_id),
+        "task_key": a.task_key,
+        "spec_version": a.spec_version,
+        "artifact_version": a.artifact_version,
+        "content_hash": a.content_hash,
+        "compiled_by": a.compiled_by,
+        "is_active": a.is_active,
+        "created_at": a.created_at.isoformat() if a.created_at else None,
+    }
+    if include_text:
+        data["prompt_text"] = a.prompt_text
+    return data
+
+
+def _embedding_settings_to_dict(s: EmbeddingSetting) -> dict:
+    return {
+        "id": str(s.id),
+        "api_key_id": str(s.api_key_id),
+        "llm_model_id": str(s.llm_model_id),
+        "dimension": int(s.dimension),
+        "is_active": s.is_active,
+        "created_at": s.created_at.isoformat() if s.created_at else None,
+        "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+    }
+
+
+def _validate_critic(
+    template: PromptTemplate, checklist_items: list[str] | None
+) -> None:
+    """Valida que todo ítem del checklist tenga interpretación en rules.
+    Import lazy: el compilador puede no existir aún en algunos entornos."""
+    if template.task_key != "critic_checklist" or not checklist_items:
+        return
+    try:
+        from src.llm.compiler import validate_critic_spec
+
+        missing = validate_critic_spec(template, checklist_items)
+    except Exception:  # noqa: BLE001 — si el compilador no está, no bloqueamos
+        return
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Ítems del checklist sin interpretación en rules de critic_checklist: "
+                f"{', '.join(missing)}. Añade una regla '<item>: ...' para cada uno."
+            ),
+        )
+
+
+@app.get("/llm-models", response_model=list[dict])
+def list_llm_models(session: Session = Depends(get_session)) -> list[dict]:
+    rows = (
+        session.execute(select(LlmModel).order_by(LlmModel.created_at.desc()))
+        .scalars()
+        .all()
+    )
+    return [_llm_model_to_dict(m) for m in rows]
+
+
+@app.post("/llm-models", status_code=201)
+def create_llm_model(
+    body: LlmModelCreate, session: Session = Depends(get_session)
+) -> dict:
+    exists = session.execute(
+        select(LlmModel).where(LlmModel.model_name == body.model_name)
+    ).scalar_one_or_none()
+    if exists is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Ya existe un modelo con nombre {body.model_name!r}.",
+        )
+    model = LlmModel(**body.model_dump())
+    session.add(model)
+    session.commit()
+    session.refresh(model)
+    return _llm_model_to_dict(model)
+
+
+@app.get("/llm-models/{model_id}", response_model=dict)
+def get_llm_model(model_id: uuid.UUID, session: Session = Depends(get_session)) -> dict:
+    model = session.get(LlmModel, model_id)
+    if model is None:
+        raise HTTPException(
+            status_code=404, detail=f"llm_model {model_id} no encontrado."
+        )
+    return _llm_model_to_dict(model)
+
+
+@app.put("/llm-models/{model_id}", response_model=dict)
+def update_llm_model(
+    model_id: uuid.UUID,
+    body: LlmModelUpdate,
+    session: Session = Depends(get_session),
+) -> dict:
+    model = session.get(LlmModel, model_id)
+    if model is None:
+        raise HTTPException(
+            status_code=404, detail=f"llm_model {model_id} no encontrado."
+        )
+    for field_name, value in body.model_dump(exclude_unset=True).items():
+        setattr(model, field_name, value)
+    session.commit()
+    session.refresh(model)
+    return _llm_model_to_dict(model)
+
+
+@app.delete("/llm-models/{model_id}", status_code=204)
+def delete_llm_model(
+    model_id: uuid.UUID, session: Session = Depends(get_session)
+) -> None:
+    model = session.get(LlmModel, model_id)
+    if model is None:
+        raise HTTPException(
+            status_code=404, detail=f"llm_model {model_id} no encontrado."
+        )
+    session.delete(model)
+    session.commit()
+
+
+@app.get("/prompt-templates", response_model=list[dict])
+def list_prompt_templates(session: Session = Depends(get_session)) -> list[dict]:
+    rows = (
+        session.execute(
+            select(PromptTemplate).order_by(PromptTemplate.created_at.desc())
+        )
+        .scalars()
+        .all()
+    )
+    return [_prompt_template_to_dict(t) for t in rows]
+
+
+@app.post("/prompt-templates", status_code=201)
+def create_prompt_template(
+    body: PromptTemplateCreate, session: Session = Depends(get_session)
+) -> dict:
+    exists = session.execute(
+        select(PromptTemplate).where(PromptTemplate.task_key == body.task_key)
+    ).scalar_one_or_none()
+    if exists is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Ya existe un template con task_key {body.task_key!r}.",
+        )
+    data = body.model_dump(exclude={"checklist_items"})
+    template = PromptTemplate(**data)
+    _validate_critic(template, body.checklist_items)
+    session.add(template)
+    session.commit()
+    session.refresh(template)
+    return _prompt_template_to_dict(template)
+
+
+@app.get("/prompt-templates/{template_id}", response_model=dict)
+def get_prompt_template(
+    template_id: uuid.UUID, session: Session = Depends(get_session)
+) -> dict:
+    template = session.get(PromptTemplate, template_id)
+    if template is None:
+        raise HTTPException(
+            status_code=404, detail=f"prompt_template {template_id} no encontrado."
+        )
+    return _prompt_template_to_dict(template)
+
+
+@app.put("/prompt-templates/{template_id}", response_model=dict)
+def update_prompt_template(
+    template_id: uuid.UUID,
+    body: PromptTemplateUpdate,
+    session: Session = Depends(get_session),
+) -> dict:
+    template = session.get(PromptTemplate, template_id)
+    if template is None:
+        raise HTTPException(
+            status_code=404, detail=f"prompt_template {template_id} no encontrado."
+        )
+    data = body.model_dump(exclude_unset=True, exclude={"checklist_items"})
+    for field_name, value in data.items():
+        setattr(template, field_name, value)
+    _validate_critic(template, body.checklist_items)
+    session.commit()
+    session.refresh(template)
+    return _prompt_template_to_dict(template)
+
+
+@app.delete("/prompt-templates/{template_id}", status_code=204)
+def delete_prompt_template(
+    template_id: uuid.UUID, session: Session = Depends(get_session)
+) -> None:
+    template = session.get(PromptTemplate, template_id)
+    if template is None:
+        raise HTTPException(
+            status_code=404, detail=f"prompt_template {template_id} no encontrado."
+        )
+    session.delete(template)
+    session.commit()
+
+
+@app.get("/prompt-artifacts", response_model=list[dict])
+def list_prompt_artifacts(session: Session = Depends(get_session)) -> list[dict]:
+    """Lista SIN prompt_text (es grande); el detalle individual lo incluye."""
+    rows = (
+        session.execute(
+            select(PromptArtifact).order_by(PromptArtifact.created_at.desc())
+        )
+        .scalars()
+        .all()
+    )
+    return [_prompt_artifact_to_dict(a) for a in rows]
+
+
+@app.get("/prompt-artifacts/{artifact_id}", response_model=dict)
+def get_prompt_artifact(
+    artifact_id: uuid.UUID, session: Session = Depends(get_session)
+) -> dict:
+    artifact = session.get(PromptArtifact, artifact_id)
+    if artifact is None:
+        raise HTTPException(
+            status_code=404, detail=f"prompt_artifact {artifact_id} no encontrado."
+        )
+    return _prompt_artifact_to_dict(artifact, include_text=True)
+
+
+@app.get("/embedding-settings", response_model=dict)
+def get_active_embedding_settings(session: Session = Depends(get_session)) -> dict:
+    setting = (
+        session.execute(
+            select(EmbeddingSetting).where(EmbeddingSetting.is_active.is_(True))
+        )
+        .scalars()
+        .first()
+    )
+    if setting is None:
+        raise HTTPException(status_code=404, detail="No hay embedding_settings activa.")
+    return _embedding_settings_to_dict(setting)
+
+
+@app.post("/embedding-settings", status_code=201)
+def create_embedding_settings(
+    body: EmbeddingSettingsCreate, session: Session = Depends(get_session)
+) -> dict:
+    key = session.get(ApiKey, body.api_key_id)
+    if key is None:
+        raise HTTPException(
+            status_code=404, detail=f"api_key {body.api_key_id} no encontrada."
+        )
+    model = session.get(LlmModel, body.llm_model_id)
+    if model is None:
+        raise HTTPException(
+            status_code=404, detail=f"llm_model {body.llm_model_id} no encontrado."
+        )
+    if body.is_active:
+        session.execute(
+            update(EmbeddingSetting)
+            .where(EmbeddingSetting.is_active.is_(True))
+            .values(is_active=False)
+        )
+    setting = EmbeddingSetting(
+        api_key_id=body.api_key_id,
+        llm_model_id=body.llm_model_id,
+        dimension=body.dimension,
+        is_active=body.is_active,
+    )
+    session.add(setting)
+    session.commit()
+    session.refresh(setting)
+    return _embedding_settings_to_dict(setting)
+
+
+@app.put("/embedding-settings/{settings_id}", response_model=dict)
+def update_embedding_settings(
+    settings_id: uuid.UUID,
+    body: EmbeddingSettingsUpdate,
+    session: Session = Depends(get_session),
+) -> dict:
+    setting = session.get(EmbeddingSetting, settings_id)
+    if setting is None:
+        raise HTTPException(
+            status_code=404, detail=f"embedding_settings {settings_id} no encontrada."
+        )
+    if body.api_key_id is not None:
+        key = session.get(ApiKey, body.api_key_id)
+        if key is None:
+            raise HTTPException(
+                status_code=404, detail=f"api_key {body.api_key_id} no encontrada."
+            )
+        setting.api_key_id = body.api_key_id
+    if body.llm_model_id is not None:
+        model = session.get(LlmModel, body.llm_model_id)
+        if model is None:
+            raise HTTPException(
+                status_code=404, detail=f"llm_model {body.llm_model_id} no encontrado."
+            )
+        setting.llm_model_id = body.llm_model_id
+    if body.dimension is not None:
+        setting.dimension = body.dimension
+    if body.is_active is not None:
+        setting.is_active = body.is_active
+    session.commit()
+    session.refresh(setting)
+    return _embedding_settings_to_dict(setting)
+
+
+@app.delete("/embedding-settings/{settings_id}", status_code=204)
+def delete_embedding_settings(
+    settings_id: uuid.UUID, session: Session = Depends(get_session)
+) -> None:
+    setting = session.get(EmbeddingSetting, settings_id)
+    if setting is None:
+        raise HTTPException(
+            status_code=404, detail=f"embedding_settings {settings_id} no encontrada."
+        )
+    session.delete(setting)
+    session.commit()
+
+
+@app.post("/settings/ensure-prompts", response_model=dict)
+def ensure_prompts(session: Session = Depends(get_session)) -> dict:
+    """Compila las specs a artefactos inmutables (idempotente).
+    Import lazy: el compilador puede no existir aún en algunos entornos."""
+    try:
+        from src.llm.compiler import compile_prompts
+
+        return compile_prompts(session)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500,
+            detail=f"No se pudo compilar los prompts: {exc}",
+        )

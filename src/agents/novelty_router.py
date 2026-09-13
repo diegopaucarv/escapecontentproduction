@@ -15,6 +15,7 @@ Implementación concreta de `EmbedFn`: src/embeddings.py::embed_text
 (Voyage AI). Se pasa por parámetro para no acoplar esta lógica de
 enrutamiento a un proveedor específico ni a la disponibilidad de red.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -27,9 +28,14 @@ from src.db.models import ArtifactLibraryRow  # ver nota al final del archivo
 
 EmbedFn = Callable[[str], Sequence[float]]
 
-# Similitud coseno mínima para considerar dos piezas "el mismo núcleo temático".
+# Similitud cosena mínima para considerar dos piezas "el mismo núcleo temático".
 # Empírico — calibrar con datos reales de cada marca antes de confiar en el default.
 DUPLICATE_SIMILARITY_THRESHOLD = 0.86
+
+# Zona gris (0004): si la mejor similitud cae entre este umbral y
+# DUPLICATE_SIMILARITY_THRESHOLD, el Paso 1 es inconcluso y se puede
+# consultar al LLM (refine_angle_novelty) para juzgar el ángulo.
+GRAY_ZONE_LOW_THRESHOLD = 0.70
 
 DEFAULT_WEIGHTS = {
     "bucket_nuevo": 3,
@@ -42,6 +48,7 @@ DEFAULT_WEIGHTS = {
 @dataclass
 class NoveltyInputs:
     """Lo mínimo que hace falta del Content Brief para enrutar."""
+
     brand_objective: str
     content_bucket: str
     artifact_type: str | None
@@ -76,7 +83,9 @@ def find_closest_prior_artifact(
     stmt = (
         select(
             ArtifactLibraryRow,
-            (1 - ArtifactLibraryRow.embedding.cosine_distance(query_vector)).label("similarity"),
+            (1 - ArtifactLibraryRow.embedding.cosine_distance(query_vector)).label(
+                "similarity"
+            ),
         )
         .order_by(ArtifactLibraryRow.embedding.cosine_distance(query_vector))
         .limit(1)
@@ -111,9 +120,18 @@ def route_brief(
     inputs: NoveltyInputs,
     evidence_is_current: Callable[[ArtifactLibraryRow], bool] | None = None,
     score_threshold: int = 4,
+    refine_angle: Callable[[dict, list], dict] | None = None,
 ) -> NoveltyResult:
     """Punto de entrada único. Reemplaza la idea de un `novelty_score`
-    calculado a ciegas: primero busca duplicado, luego decide."""
+    calculado a ciegas: primero busca duplicado, luego decide.
+
+    `refine_angle` (0004, opt-in): callable que juzga si el ángulo está
+    cubierto por piezas previas (zona gris). Si se omite, se usa el
+    comportamiento determinista actual (ángulo nuevo por definición).
+    El callable recibe (brief_data, prior_artifacts) y devuelve un dict
+    con `angulo_nuevo`; si falla o no está disponible, se degrada al
+    default determinista.
+    """
     match, similarity = find_closest_prior_artifact(
         session, embed_fn, inputs.insight_core, inputs.brand_objective
     )
@@ -121,7 +139,9 @@ def route_brief(
     if match is not None and similarity >= DUPLICATE_SIMILARITY_THRESHOLD:
         is_current = evidence_is_current(match) if evidence_is_current else True
         if is_current:
-            decision = "repetitivo" if inputs.bucket_ever_used_by_brand else "solucion_previa"
+            decision = (
+                "repetitivo" if inputs.bucket_ever_used_by_brand else "solucion_previa"
+            )
             reasoning = (
                 f"Coincidencia con pieza previa (similitud={similarity:.2f}); "
                 f"evidencia vigente -> {decision}."
@@ -135,6 +155,29 @@ def route_brief(
         return NoveltyResult(decision, None, str(match.id), reasoning)
 
     score = score_novelty(inputs)
+
+    # Zona gris (0004): sin duplicado claro, el ángulo es el único
+    # componente que el código asume fijo. Si hay un refinador LLM
+    # inyectado, se le consulta SOLO el ángulo; si falla, se degrada
+    # al default determinista (ángulo nuevo).
+    if refine_angle is not None and similarity < DUPLICATE_SIMILARITY_THRESHOLD:
+        try:
+            brief_data = {
+                "insight_core": inputs.insight_core,
+                "content_bucket": inputs.content_bucket,
+                "artifact_type": inputs.artifact_type,
+                "channel": inputs.channel,
+            }
+            refinement = refine_angle(brief_data, [])
+            if (
+                refinement.get("status") == "ok"
+                and refinement.get("angulo_nuevo") is False
+            ):
+                # El ángulo ya está cubierto: se resta el peso del ángulo.
+                score -= inputs.weights.get("angulo_nuevo", 3)
+        except Exception:  # noqa: BLE001 — degradación elegante
+            pass
+
     decision = "nueva_solucion" if score >= score_threshold else "repetitivo"
     reasoning = f"Sin duplicado (mejor similitud={similarity:.2f}); score={score} -> {decision}."
     return NoveltyResult(decision, score, None, reasoning)

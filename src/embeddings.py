@@ -4,31 +4,68 @@ proveedor es Voyage AI — novelty_router.py y todo lo demás reciben un
 `EmbedFn` (str -> list[float]) inyectado, así que cambiar de proveedor
 en el futuro no toca lógica de negocio, solo este archivo.
 
+Desde 0004, la configuración (clave + modelo + dimensión) NO vive en
+.env: se lee de la base (embedding_settings -> api_keys + llm_models).
+La clave de Voyage aún no la ha provisto el usuario; la infraestructura
+existe y falla ruidosamente (no silenciosamente) si no hay settings.
+
 Firma verificada contra voyageai==0.5.0 instalado en el entorno de
 prueba (voyageai.Client.embed real, no supuesta de memoria):
 embed(texts: list[str], model=..., input_type=..., output_dimension=...)
 -> EmbeddingsObject con atributo `.embeddings: list[list[float]]`.
 """
+
 from __future__ import annotations
 
-from functools import lru_cache
-
 import voyageai
+from sqlalchemy import select
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from src.config import get_settings
+from src.db.models import ApiKey, EmbeddingSetting, LlmModel
+from src.db.session import SessionLocal
 
 
-@lru_cache
-def _client() -> voyageai.Client:
-    settings = get_settings()
-    if not settings.voyage_api_key:
-        raise RuntimeError(
-            "VOYAGE_API_KEY no configurada. Sin esto, novelty_router no puede "
-            "hacer la búsqueda de duplicado (Paso 1) y todo caería en la "
-            "rama de puntaje por defecto — falla ruidosa, no silenciosa."
+def _active_embedding_config(session=None) -> tuple[str, str, int]:
+    """Lee la embedding_settings activa + su api_key + su modelo.
+
+    Devuelve (api_key, model_name, dimension). Lanza RuntimeError con un
+    mensaje claro si falta configuración — falla ruidosa, no silenciosa.
+    """
+    own_session = session is None
+    if own_session:
+        session = SessionLocal()
+    try:
+        setting = (
+            session.execute(
+                select(EmbeddingSetting).where(EmbeddingSetting.is_active.is_(True))
+            )
+            .scalars()
+            .first()
         )
-    return voyageai.Client(api_key=settings.voyage_api_key)
+        if setting is None:
+            raise RuntimeError(
+                "No hay embedding_settings activa. Créala vía POST /embedding-settings "
+                "(referenciando una api_key de Voyage y un llm_model con "
+                "model_size='embedding')."
+            )
+        key = session.get(ApiKey, setting.api_key_id)
+        if key is None or not key.is_active:
+            raise RuntimeError(
+                "La api_key referenciada por embedding_settings no existe o está inactiva."
+            )
+        model = session.get(LlmModel, setting.llm_model_id)
+        if model is None or not model.is_active:
+            raise RuntimeError(
+                "El llm_model referenciado por embedding_settings no existe o está inactivo."
+            )
+        return key.api_key, model.model_name, int(setting.dimension)
+    finally:
+        if own_session:
+            session.close()
+
+
+def _client(api_key: str) -> voyageai.Client:
+    return voyageai.Client(api_key=api_key)
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
@@ -38,11 +75,11 @@ def embed_text(text: str, input_type: str = "document") -> list[float]:
     brief nuevo; `'document'` cuando se indexa una pieza ya publicada
     en artifact_library — Voyage distingue ambos casos para mejor
     calidad de recuperación, no es un detalle cosmético."""
-    settings = get_settings()
-    result = _client().embed(
+    api_key, model_name, dimension = _active_embedding_config()
+    result = _client(api_key).embed(
         texts=[text],
-        model=settings.embedding_model,
+        model=model_name,
         input_type=input_type,
-        output_dimension=settings.embedding_dim,
+        output_dimension=dimension,
     )
     return result.embeddings[0]

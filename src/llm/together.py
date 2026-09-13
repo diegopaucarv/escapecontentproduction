@@ -16,10 +16,14 @@ from dataclasses import dataclass
 import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 from src.db.models import ApiKey, SessionSettings
 
 TOGETHER_CHAT_URL = "https://api.together.xyz/v1/chat/completions"
+
+# Reintentos por defecto si no hay session_settings.llm_retries disponible.
+DEFAULT_LLM_RETRIES = 3
 
 
 class LLMConfigError(RuntimeError):
@@ -67,6 +71,24 @@ def get_active_llm_config(session: Session) -> LLMConfig:
     )
 
 
+def _llm_retries(session: Session) -> int:
+    """Lee session_settings.llm_retries (0004). Si la sesión no lo soporta
+    (tests con sesiones falsas), devuelve el default 3."""
+    try:
+        settings = (
+            session.execute(
+                select(SessionSettings).where(SessionSettings.is_active.is_(True))
+            )
+            .scalars()
+            .first()
+        )
+        if settings is not None and getattr(settings, "llm_retries", None):
+            return int(settings.llm_retries)
+    except Exception:
+        pass
+    return DEFAULT_LLM_RETRIES
+
+
 def complete(
     session: Session,
     prompt: str,
@@ -75,12 +97,14 @@ def complete(
     temperature: float | None = None,
     max_tokens: int | None = None,
     timeout: float = 60.0,
+    response_format: dict | None = None,
 ) -> str:
     """Llama al modelo pequeño o grande vía Together y devuelve el texto.
 
     model_size: "small" | "large". Los valores por defecto de temperature
     y max_tokens salen de session_settings; se pueden sobreescribir por
-    llamada.
+    llamada. `response_format` (0004) fuerza salida estructurada
+    (p. ej. {"type": "json_object"}) cuando el modelo lo soporta.
     """
     if model_size not in ("small", "large"):
         raise ValueError(f"model_size debe ser 'small' o 'large', no {model_size!r}")
@@ -103,20 +127,34 @@ def complete(
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
-    resp = httpx.post(
-        TOGETHER_CHAT_URL,
-        headers={
-            "Authorization": f"Bearer {cfg.api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "messages": messages,
-            "temperature": temp,
-            "max_tokens": tokens,
-        },
-        timeout=timeout,
+    body: dict = {
+        "model": model,
+        "messages": messages,
+        "temperature": temp,
+        "max_tokens": tokens,
+    }
+    if response_format is not None:
+        body["response_format"] = response_format
+
+    retries = _llm_retries(session)
+
+    @retry(
+        stop=stop_after_attempt(retries),
+        wait=wait_exponential(multiplier=1, min=1, max=8),
+        reraise=True,
     )
+    def _post() -> httpx.Response:
+        return httpx.post(
+            TOGETHER_CHAT_URL,
+            headers={
+                "Authorization": f"Bearer {cfg.api_key}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=timeout,
+        )
+
+    resp = _post()
     resp.raise_for_status()
     data = resp.json()
     return data["choices"][0]["message"]["content"]

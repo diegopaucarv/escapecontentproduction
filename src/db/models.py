@@ -372,10 +372,116 @@ class SessionSettings(Base):
     api_key_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("api_keys.id"))
     small_model: Mapped[str] = mapped_column(String(150))
     large_model: Mapped[str] = mapped_column(String(150))
+    # Modelo de respaldo si el pequeño falla tras agotar reintentos (0004).
+    fallback_model: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    # Reintentos por llamada LLM (0004) — default 3.
+    llm_retries: Mapped[int] = mapped_column(default=3)
     temperature_small: Mapped[float] = mapped_column(default=0.7)
     temperature_large: Mapped[float] = mapped_column(default=0.7)
     max_tokens_small: Mapped[int] = mapped_column(default=2048)
     max_tokens_large: Mapped[int] = mapped_column(default=4096)
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class LlmModel(Base):
+    """Registro de modelos LLM (0004). CRUD-editable vía /llm-models.
+
+    `syntax_profile` (JSONB) describe CÓMO hablarle a cada modelo/proveedor
+    (api_style, system_role_name, instruction_formatting, structured_output,
+    tool_calling, prompt_caching, reasoning_mode). El compilador
+    (src/llm/compiler.py) lo usa como datos, no como if/else por proveedor.
+    """
+
+    __tablename__ = "llm_models"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    model_name: Mapped[str] = mapped_column(String(150), unique=True)
+    provider: Mapped[str] = mapped_column(String(50))
+    model_size: Mapped[str] = mapped_column(
+        String(20)
+    )  # 'small' | 'large' | 'embedding'
+    context_window: Mapped[int] = mapped_column(default=0)
+    max_output_tokens: Mapped[int] = mapped_column(default=0)
+    temperature_default: Mapped[float] = mapped_column(default=0.7)
+    strengths: Mapped[list] = mapped_column(JSONB, default=list)
+    weaknesses: Mapped[list] = mapped_column(JSONB, default=list)
+    prompt_style: Mapped[str] = mapped_column(Text, default="")
+    syntax_profile: Mapped[dict] = mapped_column(JSONB, default=dict)
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class PromptTemplate(Base):
+    """Spec agnóstica de un prompt (0004). CRUD-editable vía /prompt-templates.
+
+    NO es un archivo YAML suelto: vive en la base para que el usuario pueda
+    editarlo sin tocar código. El compilador lo transpila a un artefacto
+    inmutable por modelo (prompt_artifacts).
+    """
+
+    __tablename__ = "prompt_templates"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    task_key: Mapped[str] = mapped_column(String(100), unique=True)
+    version: Mapped[str] = mapped_column(String(20), default="1.0")
+    intent: Mapped[str] = mapped_column(Text)
+    rules: Mapped[list] = mapped_column(JSONB, default=list)
+    input_schema: Mapped[dict] = mapped_column(JSONB, default=dict)
+    output_schema: Mapped[dict] = mapped_column(JSONB, default=dict)
+    few_shot: Mapped[list] = mapped_column(JSONB, default=list)
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class PromptArtifact(Base):
+    """Prompt compilado, congelado e INMUTABLE (0004).
+
+    Nunca se hace UPDATE de una fila: recompilar = INSERT nueva versión
+    (artifact_version + 1) y desactivar la anterior. Así el runtime siempre
+    ejecuta un prompt determinista y auditable, y el prompt caching de
+    prefijo no se rompe por cambios a mitad de sesión.
+    """
+
+    __tablename__ = "prompt_artifacts"
+    __table_args__ = (UniqueConstraint("llm_model_id", "task_key", "artifact_version"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    llm_model_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("llm_models.id"))
+    task_key: Mapped[str] = mapped_column(String(100))
+    spec_version: Mapped[str] = mapped_column(String(20))
+    artifact_version: Mapped[int] = mapped_column(default=1)
+    prompt_text: Mapped[str] = mapped_column(Text)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    compiled_by: Mapped[str] = mapped_column(String(100), default="compiler")
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class EmbeddingSetting(Base):
+    """Settings de embeddings (0004). Singleton: a lo sumo una fila activa.
+
+    Referencia la api_key (voyage) y el modelo de embeddings (llm_models con
+    model_size='embedding'). src/embeddings.py lee de aquí en vez de .env.
+    """
+
+    __tablename__ = "embedding_settings"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    api_key_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("api_keys.id"))
+    llm_model_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("llm_models.id"))
+    dimension: Mapped[int] = mapped_column(default=1024)
     is_active: Mapped[bool] = mapped_column(default=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
