@@ -181,3 +181,53 @@ def test_alignment_404_when_no_brand_plan(client):
 
     assert resp.status_code == 404
     assert "plan de marca" in resp.json()["detail"]
+
+
+def test_alignment_fail_moves_brief_to_generando(client):
+    """Veredicto fail → retrabajo: el brief NO queda en revision (no se
+    puede aprobar), va a generando (§3.9: revision --> generando: fail)."""
+    brief = _make_brief(
+        status="idea",
+        evidence_source=None,  # checklist 'fuente_verificable' falla
+        pitch_15s=None,
+        cta=None,
+    )
+    template = _make_template()
+    app.dependency_overrides[get_session] = lambda: _FakeSession(
+        {brief.id: brief}, [template]
+    )
+    try:
+        resp = client.post(f"/briefs/{brief.id}/alignment")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["verdict"] == "fail"
+    assert body["semaforo"] == "🔴"
+    assert brief.status == "generando"
+
+
+def test_alignment_needs_human_review_moves_to_revision(client):
+    """Veredicto needs_human_review → revision: esperando al 🟨 líder."""
+    brief = _make_brief(
+        status="idea",
+        evidence_source="Estudio 2026.",
+        pitch_15s="¿Crees que ya no necesitas el refuerzo?",
+        cta="Descarga la guía",
+        risk_level="medio",  # riesgo medio => needs_human_review
+        route_decision="nueva_solucion",
+        production_route="complete",
+    )
+    template = _make_template()
+    app.dependency_overrides[get_session] = lambda: _FakeSession(
+        {brief.id: brief}, [template]
+    )
+    try:
+        resp = client.post(f"/briefs/{brief.id}/alignment")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    assert resp.json()["verdict"] == "needs_human_review"
+    assert brief.status == "revision"

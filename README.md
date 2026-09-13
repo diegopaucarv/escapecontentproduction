@@ -9,11 +9,19 @@ deliberadamente como esqueleto y por qué.
 ```bash
 cp .env.example .env
 # editar .env: POSTGRES_PASSWORD, JWT_SECRET (generar con
-# `python -c "import secrets; print(secrets.token_hex(32))"`),
-# VOYAGE_API_KEY, ANTHROPIC_API_KEY
+# `python -c "import secrets; print(secrets.token_hex(32))"`)
+# Las claves de IA y los modelos NO van en .env: viven en la base de
+# datos (tablas api_keys y session_settings). Insertarlas con el seed:
 docker compose up -d --build
+docker compose run --rm -e TOGETHER_API_KEY=tgp_v1_... api python -m src.db.seed_llm
 curl localhost:8000/health
 ```
+
+El seed (`src/db/seed_llm.py`) inserta la clave de Together en `api_keys`
+y crea la `session_settings` activa con los modelos pequeño/grande
+(`meta-models/Muse-Glimmer-30B` y `deepseek-ai/DeepSeek-V4-Flash-0731`).
+Después se pueden editar desde la API: `GET/POST/PUT/DELETE /api-keys` y
+`/settings` (la clave nunca se devuelve completa, solo enmascarada).
 
 `docker compose up` levanta `db` → `migrate` (corre `alembic upgrade head`
 una sola vez y termina) → `api` + `agent_worker` (esperan a que `migrate`
@@ -47,7 +55,7 @@ with SessionLocal() as s:
 
 ## Qué está resuelto y probado de verdad (no solo "debería funcionar")
 
-Todo lo siguiente se corrió contra Postgres 16 + pgvector real en el
+Todo lo siguiente se corrió contra Postgres 17 + pgvector real en el
 entorno de desarrollo, con casos que deben fallar incluidos, no solo
 el camino feliz:
 
@@ -62,11 +70,13 @@ el camino feliz:
 - **API** (`src/api/main.py`) — probada con `TestClient` contra la base
   real: creación de brief (201 y 422 sin segmento), webhook de
   telemetría, login, y el endpoint de aprobación.
-- **RBAC** (`src/auth.py`) — flujo completo probado: login líder (200),
-  login equipo (200) pero **403** al intentar aprobar, líder aprobando
-  (200), password incorrecta (401), sin token (401). El endpoint
-  `POST /briefs/{id}/approve` es la implementación real de
-  `OWNER_APPROVAL` del diagrama de estados — restringido a rol `lider`.
+- **RBAC** (`src/auth.py`, `POST /auth/token` + `POST /briefs/{id}/approve`)
+  — flujo completo probado: login líder (200), login equipo (200) pero
+  **403** al intentar aprobar, líder aprobando (200), password incorrecta
+  (401), sin token (401). El endpoint `POST /briefs/{id}/approve` es la
+  implementación real de `OWNER_APPROVAL` del diagrama de estados —
+  restringido a rol `lider` y solo válido desde estado `revision`
+  (409 si el brief no está en revisión).
 - **Cierre del bucle RAG** (`src/events/listener.py`) — un evento de
   telemetría real actualiza `retention_24h`/`conversion_30d` en
   `artifact_library`; probado que eventos sucesivos promedian
@@ -78,6 +88,14 @@ el camino feliz:
   No probado con una llamada de red real (sin API key en este entorno);
   la lógica y el manejo de errores (`VOYAGE_API_KEY` ausente → falla
   ruidosa, no silenciosa) sí están.
+- **Infraestructura LLM** (`src/llm/together.py`, tablas `api_keys` +
+  `session_settings` en `alembic/versions/0003_llm_infra.py`) — la clave
+  de Together y los modelos pequeño/grande viven en la base de datos, no
+  en `.env` ni en código. CRUD completo por API (`/api-keys`, `/settings`)
+  con la clave siempre enmascarada (`tgp_v1_****R6yo`). El cliente
+  `complete(session, prompt, model_size="small"|"large")` lee la config
+  activa desde la DB y llama a `api.together.xyz` (API compatible con
+  OpenAI). Probado con la DB real: seed → `GET /api-keys` → `GET /settings`.
 - **Enrutamiento por novedad y Gatekeeper** — lógica pura con tests
   unitarios (`tests/test_novelty_router.py`, `tests/test_gatekeeper.py`).
 - **Esqueleto Producer-Critic** (`src/agents/producer_critic.py`,
@@ -86,17 +104,43 @@ el camino feliz:
   **reanuda** correctamente con `Command(resume=...)`. El nodo `critic`
   llama al Gatekeeper real; el nodo `producer` es un stub explícito.
 
-`pytest tests/ -v` → 10/10 pasan, sin necesitar Postgres (toda la lógica
+`pytest tests/ -v` → 46/46 pasan, sin necesitar Postgres (toda la lógica
 de agentes está separada de la capa de datos a propósito).
 
 ## Qué sigue abierto, a propósito
 
-- **Nodo `producer` real** — conectar `langchain-anthropic` (o el SDK de
-  Anthropic directo) para generar/ajustar el borrador a partir de
-  `insight_core` + Context Pack. No se implementó porque no hay forma de
-  probarlo en este entorno sin `ANTHROPIC_API_KEY`, y porque sigue sin
-  haber corrido un ciclo real de contenido por el pipeline — ver la
-  evaluación crítica original sobre secuenciación.
+El mapa completo del pipeline (rutas A/B/C, Fast/Complete, Kaizen,
+Deploy, Learning) está en `docs/pipeline_unificado_produccion_contenidos(1).md`.
+Lo implementado cubre la **Fase 0** (brief + alineamiento + enrutamiento)
+y el esqueleto del bucle Producer-Critic. Las fases siguientes siguen
+sin implementar:
+
+- **Ruta B — Solución previa detectada** — `OBSOLETE_CHECK` (¿evidencia/ángulo
+  obsoleto?) y `RESEARCH_UPDATE` (verificación de evidencia) del §6 del doc.
+- **Ruta C — Nueva solución** — Discovery editorial (el "Chispazo"), test de
+  gancho 15s (n=5) y decisión Fast/Complete del §7.
+- **Sub-ruta Fast** — Sprint de Diseño y Prueba (2d) + Fast-Probe (7d):
+  MVP, setup de piloto, instrumentación, publicación piloto, evaluación
+  de KPIs, iteración (máx. 3) y kill con postmortem (§8).
+- **Sub-ruta Complete** — SPEC/repurpose_plan, plan técnico, handoff,
+  ritual de riesgos, integración y components manifest (§9.1). El bucle
+  Producer-Critic (§9.2) es el esqueleto probado; el resto de la secuencia no.
+- **Pre-Deploy Gate** — readiness check, materiales y logística (§11).
+  Solo existe `OWNER_APPROVAL` (`POST /briefs/{id}/approve`, rol `lider`).
+- **Kaizen** — órdenes de producción desde calendario, KPIs de proceso
+  (LeadTime, CycleTime, FPQ, Rework Rate), micro-experimentos y micro-rituales (§5).
+- **Deploy** — rollout por secuencia de canales, monitoreo 24–72h/7d/30d/90d,
+  protocolo de crisis/retiro (§12).
+- **Learning & Automation** — postmortem automatizado y prefill de templates
+  (§13). El cierre del bucle RAG (telemetría → `artifact_library`) ya existe.
+
+### Deudas técnicas puntuales
+
+- **Nodo `producer` real** — conectar el SDK de Together (o Anthropic) para
+  generar/ajustar el borrador a partir de `insight_core` + Context Pack.
+  No se implementó porque no hay forma de probarlo sin un ciclo real de
+  contenido por el pipeline — ver la evaluación crítica original sobre
+  secuenciación.
 - **Checklist automático real en el Critic** — hoy `critic_node` marca
   todos los ítems del checklist como `True` (simulado). Antes de
   producción, cada ítem de `pipeline_templates.checklist` necesita una

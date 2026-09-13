@@ -11,13 +11,20 @@ from __future__ import annotations
 import uuid
 
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from src.agents.alignment import AlignmentInput, run_alignment
+from src.auth import (
+    authenticate_user,
+    create_access_token,
+    require_role,
+)
 from src.db.models import (
     ApiKey,
+    AppUser,
     ContentBrief,
     PipelineTemplate,
     SessionSettings,
@@ -31,6 +38,24 @@ app = FastAPI(title="Pipeline Unificado — ESCAPE / Ergalia", version="0.1.0")
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+@app.post("/auth/token")
+def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    session: Session = Depends(get_session),
+) -> dict:
+    """Login OAuth2 (form: username=email, password). Devuelve un JWT
+    firmado con JWT_SECRET. Es el flujo real de RBAC — ver src/auth.py."""
+    user = authenticate_user(session, form_data.username, form_data.password)
+    if user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Email o password incorrectos.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = create_access_token(user)
+    return {"access_token": token, "token_type": "bearer"}
 
 
 class TelemetryPayload(BaseModel):
@@ -224,9 +249,11 @@ def align_brief(brief_id: uuid.UUID, session: Session = Depends(get_session)) ->
     )
     result = run_alignment(inputs)
 
-    # El brief entra en revisión estratégica (etapa 'alignment').
-    if _val(brief.status) in ("idea", "brief"):
-        brief.status = "revision"
+    # El veredicto del Gatekeeper decide el estado del brief (§3.9):
+    # fail → retrabajo (generando); needs_human_review/auto_pass → revisión
+    # (esperando la aprobación del 🟨 líder vía POST /briefs/{id}/approve).
+    if _val(brief.status) in ("idea", "brief", "revision", "generando"):
+        brief.status = "generando" if result.verdict.value == "fail" else "revision"
         session.commit()
 
     semaforo = {
@@ -253,6 +280,42 @@ def align_brief(brief_id: uuid.UUID, session: Session = Depends(get_session)) ->
             "novelty_score": brief.novelty_score,
         },
         "reasoning": result.reasoning,
+    }
+
+
+@app.post("/briefs/{brief_id}/approve", response_model=dict)
+def approve_brief(
+    brief_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    user: AppUser = Depends(require_role("lider")),
+) -> dict:
+    """OWNER_APPROVAL del Pre-Deploy Gate — decisión humana explícita.
+
+    Solo un 🟨 líder puede aprobar. Mueve el brief de `revision` a
+    `aprobado` (ver máquina de estados §3.9 del doc). El Gatekeeper
+    (src/agents/gatekeeper.py) nunca puede aprobar en solitario cuando
+    el riesgo/segmento/ruta exige revisión humana — este endpoint es
+    ese paso humano.
+    """
+    brief = session.get(ContentBrief, brief_id)
+    if brief is None:
+        raise HTTPException(status_code=404, detail=f"Brief {brief_id} no encontrado.")
+    if _val(brief.status) != "revision":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Solo se puede aprobar un brief en estado 'revision'; "
+                f"este está en '{_val(brief.status)}'."
+            ),
+        )
+    brief.status = "aprobado"
+    session.commit()
+    session.refresh(brief)
+    return {
+        "brief_id": str(brief.id),
+        "status": _val(brief.status),
+        "approved_by": str(user.id),
+        "approved_at": brief.updated_at.isoformat() if brief.updated_at else None,
     }
 
 
