@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import enum
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     JSON,
     CheckConstraint,
+    Date,
     ForeignKey,
     SmallInteger,
     String,
@@ -338,6 +339,45 @@ class ArtifactLibraryRow(Base):
     retention_24h: Mapped[float | None] = mapped_column(nullable=True)
     conversion_30d: Mapped[float | None] = mapped_column(nullable=True)
     indexed_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class BrandKnowledge(Base):
+    """Canon de marca consultable como Context Pack (0012).
+
+    Filas etiquetadas por brand_objective + content_bucket (sección del
+    canon): tono, buckets, reglas editoriales, lenguaje visual. El seed
+    (src/db/seed_brand_knowledge.py) la puebla con mockups marcados
+    is_mock=True hasta que los documentos reales existan; build_context_pack()
+    la consulta para que el Producer no "adivine" el tono por el nombre del
+    bucket.
+    """
+
+    __tablename__ = "brand_knowledge"
+    __table_args__ = (
+        UniqueConstraint(
+            "brand_objective",
+            "content_bucket",
+            "section_key",
+            name="uq_brand_knowledge_section",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    brand_objective: Mapped[BrandObjective] = mapped_column(
+        _pg_enum(BrandObjective, "brand_objective_t")
+    )
+    content_bucket: Mapped[ContentBucket | None] = mapped_column(
+        _pg_enum(ContentBucket, "content_bucket_t"), nullable=True
+    )
+    section_key: Mapped[str] = mapped_column(String(100))
+    section_title: Mapped[str] = mapped_column(String(200))
+    content: Mapped[str] = mapped_column(Text)
+    # Documento canónico de origen (ej. docs/escape/escape_guia_contenidos_y_produccion.md).
+    source_doc: Mapped[str] = mapped_column(String(300))
+    # True = mockup de relleno hasta que exista el documento real (instrucción #3).
+    is_mock: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
 class TelemetryEvent(Base):
@@ -681,6 +721,18 @@ class Project(Base):
         _pg_enum(BrandObjective, "brand_objective_t"), nullable=True
     )
     artifact_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    # Gobernanza real (0009/0010): el proyecto declara el segmento y el
+    # riesgo de su caso real; produce_project los usa para el brief
+    # compañero y el Gatekeeper — nunca S1/bajo hardcodeados.
+    segment_client: Mapped[str | None] = mapped_column(String(2), nullable=True)
+    risk_level: Mapped[RiskLevel | None] = mapped_column(
+        _pg_enum(RiskLevel, "risk_level_t"), nullable=True
+    )
+    # Brief compañero (0009/0010): se crea en el primer /produce y se
+    # reutiliza en los siguientes (re-produce tras aprobación humana).
+    companion_brief_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("content_briefs.id"), nullable=True
+    )
     status: Mapped[str] = mapped_column(String(30), default="borrador")
     current_version: Mapped[int] = mapped_column(default=0)
     storage_path: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -707,4 +759,106 @@ class ProjectVersion(Base):
     )
     version: Mapped[int] = mapped_column()
     snapshot: Mapped[dict] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class CalendarSlot(Base):
+    """Fila del calendario editorial recurrente (Ruta A, §5.2).
+
+    La Orden de Producción hereda de aquí brand_objective, content_bucket,
+    artifact_type, channel y owner (ORDER_NOTE). Se puebla con los
+    calendarios operativos reales de ambas marcas vía src/db/seed_calendar.py
+    (ergalia_mkt_operativo.md Módulo 6, escape_mkt_operativo.md Módulo 4).
+    """
+
+    __tablename__ = "calendar_slots"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    slot_code: Mapped[str] = mapped_column(String(100), unique=True)
+    brand_objective: Mapped[BrandObjective] = mapped_column(
+        _pg_enum(BrandObjective, "brand_objective_t")
+    )
+    content_bucket: Mapped[ContentBucket] = mapped_column(
+        _pg_enum(ContentBucket, "content_bucket_t")
+    )
+    artifact_type: Mapped[str] = mapped_column(String(50))
+    channel: Mapped[str] = mapped_column(String(50))
+    default_owner_role: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    cadence: Mapped[str] = mapped_column(String(20), default="semanal")
+    weekday: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class ProductionOrder(Base):
+    """Orden de Producción de la Ruta A (ORDER, §5.1).
+
+    Se crea a partir de un calendar_slot + el insight_core/dato de la
+    semana. Solo se completa el dato/gancho específico de esa semana; el
+    resto se hereda del slot (ORDER_NOTE, §5.2).
+
+    status: 'creada' -> 'en_produccion' -> 'en_gate' -> 'aprobada' ->
+            'publicada' -> 'medida' -> 'archivada'
+    (publicación manual por ahora: 'publicada' se marca a mano cuando la
+    pieza sale al canal; la capa DEPLOY automática aún no está construida.)
+    """
+
+    __tablename__ = "production_orders"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    calendar_slot: Mapped[str] = mapped_column(ForeignKey("calendar_slots.slot_code"))
+    brand_objective: Mapped[BrandObjective] = mapped_column(
+        _pg_enum(BrandObjective, "brand_objective_t")
+    )
+    content_bucket: Mapped[ContentBucket] = mapped_column(
+        _pg_enum(ContentBucket, "content_bucket_t")
+    )
+    artifact_type: Mapped[str] = mapped_column(String(50))
+    channel: Mapped[str] = mapped_column(String(50))
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("app_users.id"), nullable=True
+    )
+    scheduled_date: Mapped[date] = mapped_column(Date)
+    insight_core: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(30), default="creada")
+    brief_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("content_briefs.id"), nullable=True
+    )
+    artifact_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("content_artifacts.id"), nullable=True
+    )
+    template_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("production_templates.id"), nullable=True
+    )
+    kpis: Mapped[dict] = mapped_column(JSONB, default=dict)
+    kaizen_decision: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class KaizenCycle(Base):
+    """Registro de KAIZEN_DECISION (Ruta A, §5.7).
+
+    update_registry: la plantilla mejora para todo el equipo (se actualiza
+    /components/manifest.md y /kb/kaizen_<id>.md). archive: se documenta
+    igual, sin cambiar la plantilla base. Ambas salidas convergen en
+    PRE_DEPLOY_ENTRY (§11).
+    """
+
+    __tablename__ = "kaizen_cycles"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    order_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("production_orders.id", ondelete="CASCADE")
+    )
+    decision: Mapped[str] = mapped_column(String(20))
+    improvement_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metrics: Mapped[dict] = mapped_column(JSONB, default=dict)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())

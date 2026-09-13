@@ -14,10 +14,11 @@ from __future__ import annotations
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from src.agents.producer_critic import ProducerCriticState, build_graph
-from src.db.models import ContentBrief, PipelineTemplate
+from src.db.models import BrandKnowledge, ContentBrief, PipelineTemplate
 from src.llm.critic import make_critic_checklist_fn
 from src.llm.producer import make_producer_fn
 
@@ -31,17 +32,71 @@ def _val(v):
     return v.value if hasattr(v, "value") else v
 
 
-def build_context_pack(brief: ContentBrief) -> dict:
-    """Context Pack mínimo desde el brief (sin RAG todavía)."""
-    return {
+def load_brand_knowledge(session: Session, brief: ContentBrief) -> list[dict]:
+    """Consulta el canon de marca (brand_knowledge) para el brief.
+
+    Devuelve las secciones del canon etiquetadas por brand_objective y
+    content_bucket: primero las transversales de la marca (bucket NULL) y
+    luego las específicas del bucket. Cada fila incluye section_key,
+    section_title, content, source_doc e is_mock para que el Producer sepa
+    qué es canon real y qué es mockup de relleno.
+    """
+    brand = _val(brief.brand_objective)
+    bucket = _val(brief.content_bucket)
+    rows = (
+        session.execute(
+            select(BrandKnowledge)
+            .where(
+                BrandKnowledge.brand_objective == brand,
+                (BrandKnowledge.content_bucket == bucket)
+                | (BrandKnowledge.content_bucket.is_(None)),
+            )
+            .order_by(
+                BrandKnowledge.content_bucket.is_(None).desc(),
+                BrandKnowledge.section_key,
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        {
+            "section_key": r.section_key,
+            "section_title": r.section_title,
+            "content": r.content,
+            "source_doc": r.source_doc,
+            "is_mock": r.is_mock,
+        }
+        for r in rows
+    ]
+
+
+def build_context_pack(session: Session, brief: ContentBrief) -> dict:
+    """Context Pack desde el brief + el canon de marca consultable.
+
+    Incluye el canon (brand_knowledge) etiquetado por marca/bucket para que
+    el Producer no "adivine" el tono por el nombre del bucket. Si la tabla
+    no está poblada (seed no corrido), el canon queda vacío y el pack sigue
+    siendo el mínimo del brief — degradación silenciosa, no bloqueante.
+    """
+    pack = {
         "resumen": brief.resumen,
         "evidence_source": brief.evidence_source,
         "prior_attempts": brief.prior_attempts,
         "repurpose_plan": brief.repurpose_plan,
     }
+    try:
+        canon = load_brand_knowledge(session, brief)
+    except Exception:  # noqa: BLE001 — el canon nunca rompe la generación
+        canon = []
+    if canon:
+        pack["brand_knowledge"] = canon
+    return pack
 
 
-def build_state(brief: ContentBrief, template: PipelineTemplate) -> ProducerCriticState:
+def build_state(
+    session: Session, brief: ContentBrief, template: PipelineTemplate
+) -> ProducerCriticState:
     """Construye el estado inicial del grafo desde el brief + su plan de marca."""
     return {
         "brief_id": str(brief.id),
@@ -58,7 +113,7 @@ def build_state(brief: ContentBrief, template: PipelineTemplate) -> ProducerCrit
         "verdict": None,
         "human_decision": None,
         "insight_core": brief.insight_core or "",
-        "context_pack": build_context_pack(brief),
+        "context_pack": build_context_pack(session, brief),
         "artifact_type": _val(brief.artifact_type),
         "channel": brief.channel,
         "requires_user_acceptance": False,
@@ -81,7 +136,7 @@ def run_produce(
         critic_checklist_fn=make_critic_checklist_fn(session),
     )
     config = {"configurable": {"thread_id": str(brief.id)}}
-    return graph.invoke(build_state(brief, template), config=config)
+    return graph.invoke(build_state(session, brief, template), config=config)
 
 
 def resume_produce(session: Session, brief_id: str, decision: str) -> dict:

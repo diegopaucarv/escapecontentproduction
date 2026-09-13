@@ -13,7 +13,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src.api.main import app, get_session
+from src.auth import hash_password
 from src.db.models import (
+    AppUser,
     BrandObjective,
     ContentArtifact,
     FormatSpec,
@@ -62,6 +64,23 @@ class _FakeSession:
     def get(self, model, ident):
         name = getattr(model, "__name__", "")
         return self._rows(name).get(ident)
+
+    def scalar(self, stmt):
+        # select(AppUser).where(AppUser.email == email, AppUser.is_active.is_(True))
+        email = None
+        for crit in getattr(stmt, "_where_criteria", []):
+            if getattr(crit.left, "name", None) == "email":
+                email = crit.right.value
+        if email is None:
+            return None
+        return next(
+            (
+                u
+                for u in self._rows("AppUser").values()
+                if u.email == email and u.is_active
+            ),
+            None,
+        )
 
     def execute(self, stmt):
         entity = stmt.column_descriptions[0]["entity"]
@@ -118,7 +137,12 @@ def client():
 
 def _new_project(client, **overrides) -> dict:
     """Crea un proyecto vía API y devuelve el body de la respuesta."""
-    payload = dict(name="Corto Escape", topic="IA local vs nube")
+    payload = dict(
+        name="Corto Escape",
+        topic="IA local vs nube",
+        segment_client="S1",
+        risk_level="bajo",
+    )
     payload.update(overrides)
     resp = client.post("/project/new", json=payload)
     assert resp.status_code == 201
@@ -220,12 +244,76 @@ def _patch_complete(monkeypatch, text):
     monkeypatch.setattr(together_mod, "complete", fake_complete)
 
 
-def _approve(client, project_id: str) -> None:
+def _approve(client, project_id: str, fake) -> None:
+    """Crea un 🟨 líder y aprueba el proyecto con su token."""
+    lider = AppUser(
+        id=uuid.uuid4(),
+        full_name="Líder de Prueba",
+        email="lider@ergalia.com",
+        role="lider",
+        hashed_password=hash_password("clave-segura"),
+        is_active=True,
+    )
+    fake.add(lider)
+    fake.flush()
+    resp = client.post(
+        "/auth/token",
+        data={"username": "lider@ergalia.com", "password": "clave-segura"},
+    )
+    assert resp.status_code == 200
+    token = resp.json()["access_token"]
     resp = client.post(
         f"/projects/{project_id}/approve",
         json={"json_editado": {"guion_vocal": "Hola"}},
+        headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 200
+
+
+def _produce_and_approve_brief(client, project_id: str, fake) -> None:
+    """Dispara /produce (el gate pide revisión humana), aprueba el brief
+    compañero como 🟨 líder y re-dispara /produce hasta que la cadena corre.
+
+    Gobernanza 0009/0010: el brief compañero nace en 'revision' y el
+    Gatekeeper exige OWNER_APPROVAL (nueva_solucion + complete siempre
+    requieren revisión humana). Este helper simula ese paso humano.
+    """
+    lider = AppUser(
+        id=uuid.uuid4(),
+        full_name="Líder de Prueba",
+        email="lider@ergalia.com",
+        role="lider",
+        hashed_password=hash_password("clave-segura"),
+        is_active=True,
+    )
+    fake.add(lider)
+    fake.flush()
+    resp = client.post(
+        "/auth/token",
+        data={"username": "lider@ergalia.com", "password": "clave-segura"},
+    )
+    assert resp.status_code == 200
+    token = resp.json()["access_token"]
+
+    # 1er produce: el gate pide revisión humana -> 409 con brief_id
+    resp = client.post(f"/projects/{project_id}/produce")
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert "brief" in detail
+    # "El brief compañero {id} exige..." -> el id está en la posición 3
+    brief_id = detail.split(" ")[3]
+
+    # aprobar el brief compañero (OWNER_APPROVAL)
+    resp = client.post(
+        f"/briefs/{brief_id}/approve",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+
+    # 2do produce: el brief ya está aprobado -> corre la cadena
+    resp = client.post(f"/projects/{project_id}/produce")
+    assert resp.status_code == 200
+    return resp.json()
 
 
 # ----------------------------------------------------------------------
@@ -379,7 +467,7 @@ def test_refine_applies_deterministic_rules(client):
             client, brand_objective="ESCAPE_SOCIAL", artifact_type="video_corto"
         )
         project_id = body["project"]["id"]
-        _approve(client, project_id)  # snapshot sin cta
+        _approve(client, project_id, fake)  # snapshot sin cta
 
         resp = client.post(f"/projects/{project_id}/refine", json={})
         assert resp.status_code == 200
@@ -405,7 +493,7 @@ def test_refine_with_rag_context_hook(client):
     try:
         body = _new_project(client)
         project_id = body["project"]["id"]
-        _approve(client, project_id)
+        _approve(client, project_id, fake)
 
         resp = client.post(
             f"/projects/{project_id}/refine",
@@ -437,7 +525,7 @@ def test_refine_llm_degrades_gracefully(client, monkeypatch):
     try:
         body = _new_project(client)
         project_id = body["project"]["id"]
-        _approve(client, project_id)  # v2
+        _approve(client, project_id, fake)  # v2
 
         resp = client.post(f"/projects/{project_id}/refine", json={"use_llm": True})
         assert resp.status_code == 200
@@ -468,7 +556,7 @@ def test_refine_saves_new_version(client):
             client, brand_objective="ESCAPE_SOCIAL", artifact_type="video_corto"
         )
         project_id = body["project"]["id"]
-        _approve(client, project_id)  # v2
+        _approve(client, project_id, fake)  # v2
 
         resp = client.post(f"/projects/{project_id}/refine", json={})
         assert resp.status_code == 200
@@ -514,11 +602,9 @@ def test_produce_runs_tool_chain(client):
             client, brand_objective="ESCAPE_SOCIAL", artifact_type="video_corto"
         )
         project_id = body["project"]["id"]
-        _approve(client, project_id)
+        _approve(client, project_id, fake)
 
-        resp = client.post(f"/projects/{project_id}/produce")
-        assert resp.status_code == 200
-        result = resp.json()
+        result = _produce_and_approve_brief(client, project_id, fake)
 
         assert result["artifact_id"]
         assert result["manifest_version"] == 1
@@ -536,6 +622,43 @@ def test_produce_runs_tool_chain(client):
         app.dependency_overrides.clear()
 
 
+def test_produce_requires_brief_approval_before_tool_chain(client):
+    """Gobernanza 0009/0010: el gate NUNCA auto-aprueba un proyecto
+    (nueva_solucion + complete siempre exigen revisión humana). El primer
+    /produce devuelve 409 con el brief_id; la cadena NO corre."""
+    fake = _FakeSession()
+    fake.add(_adapter(name="elevenlabs"))
+    fake.add(_template())
+    fake.add(_spec())
+    fake.flush()
+    app.dependency_overrides[get_session] = lambda: fake
+    try:
+        body = _new_project(
+            client, brand_objective="ESCAPE_SOCIAL", artifact_type="video_corto"
+        )
+        project_id = body["project"]["id"]
+        _approve(client, project_id, fake)
+
+        resp = client.post(f"/projects/{project_id}/produce")
+        assert resp.status_code == 409
+        detail = resp.json()["detail"]
+        assert "brief" in detail
+        assert "approve" in detail
+
+        # el brief compañero existe pero NO se produjo nada
+        assert len(fake._rows("ContentBrief")) == 1
+        assert len(fake._rows("ContentArtifact")) == 0
+        assert len(fake._rows("AssetJob")) == 0
+        brief = next(iter(fake._rows("ContentBrief").values()))
+        assert brief.status == "revision"
+        assert brief.requires_user_acceptance is True
+        # el segmento/riesgo reales del proyecto, no S1/bajo hardcodeados
+        assert brief.segment_client == "S1"
+        assert brief.risk_level == "bajo"
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_produce_409_on_orchestration_error(client):
     fake = _FakeSession()  # sin format_spec -> OrchestrationError
     app.dependency_overrides[get_session] = lambda: fake
@@ -544,11 +667,11 @@ def test_produce_409_on_orchestration_error(client):
             client, brand_objective="ESCAPE_SOCIAL", artifact_type="video_corto"
         )
         project_id = body["project"]["id"]
-        _approve(client, project_id)
+        _approve(client, project_id, fake)
 
         resp = client.post(f"/projects/{project_id}/produce")
         assert resp.status_code == 409
-        assert "format_spec" in resp.json()["detail"]
+        assert "brief" in resp.json()["detail"]  # pausa por gobernanza, no por spec
     finally:
         app.dependency_overrides.clear()
 
@@ -565,11 +688,10 @@ def test_produce_commits(client):
             client, brand_objective="ESCAPE_SOCIAL", artifact_type="video_corto"
         )
         project_id = body["project"]["id"]
-        _approve(client, project_id)
+        _approve(client, project_id, fake)
 
         before = fake.commits
-        resp = client.post(f"/projects/{project_id}/produce")
-        assert resp.status_code == 200
+        result = _produce_and_approve_brief(client, project_id, fake)
         assert fake.commits > before  # el endpoint commitea
 
         # estado persistido
@@ -619,7 +741,7 @@ def test_postproduction_recommendations(client):
     try:
         body = _new_project(client)
         project_id = body["project"]["id"]
-        _approve(client, project_id)
+        _approve(client, project_id, fake)
 
         resp = client.get(f"/projects/{project_id}/postproduction")
         assert resp.status_code == 200
@@ -650,7 +772,7 @@ def test_postproduction_empty_when_no_templates(client):
     try:
         body = _new_project(client)
         project_id = body["project"]["id"]
-        _approve(client, project_id)
+        _approve(client, project_id, fake)
 
         resp = client.get(f"/projects/{project_id}/postproduction")
         assert resp.status_code == 200

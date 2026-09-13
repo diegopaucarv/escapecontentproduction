@@ -11,7 +11,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src.api.main import app, get_session
-from src.db.models import ProductionTemplate, Project, ProjectVersion
+from src.auth import hash_password
+from src.db.models import AppUser, ProductionTemplate, Project, ProjectVersion
 
 
 class _Result:
@@ -38,6 +39,7 @@ class _FakeSession:
         self.projects = {}  # id -> Project
         self.versions = {}  # id -> ProjectVersion
         self.templates = {}  # id -> ProductionTemplate
+        self.users = {}  # id -> AppUser
         self._added = []
 
     # ------------------------------------------------------------------
@@ -51,7 +53,22 @@ class _FakeSession:
             return self.versions.get(ident)
         if model is ProductionTemplate:
             return self.templates.get(ident)
+        if model is AppUser:
+            return self.users.get(ident)
         return None
+
+    def scalar(self, stmt):
+        # select(AppUser).where(AppUser.email == email, AppUser.is_active.is_(True))
+        email = None
+        for crit in getattr(stmt, "_where_criteria", []):
+            if getattr(crit.left, "name", None) == "email":
+                email = crit.right.value
+        if email is None:
+            return None
+        return next(
+            (u for u in self.users.values() if u.email == email and u.is_active),
+            None,
+        )
 
     def execute(self, stmt):
         entity = stmt.column_descriptions[0]["entity"]
@@ -110,6 +127,8 @@ class _FakeSession:
                 self.versions[obj.id] = obj
             elif cls == "ProductionTemplate":
                 self.templates[obj.id] = obj
+            elif cls == "AppUser":
+                self.users[obj.id] = obj
         self._added = []
 
     def commit(self):
@@ -162,10 +181,46 @@ def client():
 
 def _new_project(client, **overrides) -> dict:
     """Crea un proyecto vía API y devuelve el body de la respuesta."""
-    payload = dict(name="Corto Escape", topic="IA local vs nube")
+    payload = dict(
+        name="Corto Escape",
+        topic="IA local vs nube",
+        segment_client="S1",
+        risk_level="bajo",
+    )
     payload.update(overrides)
     resp = client.post("/project/new", json=payload)
     assert resp.status_code == 201
+    return resp.json()
+
+
+def _leader_token(client, fake) -> str:
+    """Crea un 🟨 líder en la sesión fake y devuelve su token JWT."""
+    lider = AppUser(
+        id=uuid.uuid4(),
+        full_name="Líder de Prueba",
+        email="lider@ergalia.com",
+        role="lider",
+        hashed_password=hash_password("clave-segura"),
+        is_active=True,
+    )
+    fake.add(lider)
+    fake.flush()
+    resp = client.post(
+        "/auth/token",
+        data={"username": "lider@ergalia.com", "password": "clave-segura"},
+    )
+    assert resp.status_code == 200
+    return resp.json()["access_token"]
+
+
+def _approve(client, project_id: str, token: str) -> dict:
+    """Aprueba un proyecto con el token del líder."""
+    resp = client.post(
+        f"/projects/{project_id}/approve",
+        json={"json_editado": {"guion_vocal": "hola", "prompts_img": []}},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
     return resp.json()
 
 
@@ -229,6 +284,57 @@ def test_project_new_with_template(client):
         fake.flush()
         body = _new_project(client, template_id=str(tpl.id))
         assert body["project"]["template_id"] == str(tpl.id)
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_project_new_requires_segment_and_risk(client):
+    fake = _FakeSession()
+    app.dependency_overrides[get_session] = lambda: fake
+    try:
+        # sin segment_client -> 422
+        resp = client.post(
+            "/project/new",
+            json={"name": "X", "topic": "Y", "risk_level": "bajo"},
+        )
+        assert resp.status_code == 422
+        assert fake.projects == {}
+
+        # sin risk_level -> 422
+        resp = client.post(
+            "/project/new",
+            json={"name": "X", "topic": "Y", "segment_client": "S1"},
+        )
+        assert resp.status_code == 422
+        assert fake.projects == {}
+
+        # segmento inválido -> 422 (pattern S1-S6)
+        resp = client.post(
+            "/project/new",
+            json={
+                "name": "X",
+                "topic": "Y",
+                "segment_client": "S9",
+                "risk_level": "bajo",
+            },
+        )
+        assert resp.status_code == 422
+        assert fake.projects == {}
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_project_new_persists_segment_and_risk(client):
+    fake = _FakeSession()
+    app.dependency_overrides[get_session] = lambda: fake
+    try:
+        body = _new_project(client, segment_client="S5", risk_level="alto")
+        project = body["project"]
+        assert project["segment_client"] == "S5"
+        assert project["risk_level"] == "alto"
+        stored = fake.get(Project, uuid.UUID(project["id"]))
+        assert stored.segment_client == "S5"
+        assert stored.risk_level == "alto"
     finally:
         app.dependency_overrides.clear()
 
@@ -358,10 +464,19 @@ def test_project_versions_list_desc(client):
     try:
         body = _new_project(client)
         project_id = body["project"]["id"]
+        token = _leader_token(client, fake)
 
         # approve dos veces -> versiones 2 y 3
-        client.post(f"/projects/{project_id}/approve", json={"json_editado": {"a": 1}})
-        client.post(f"/projects/{project_id}/approve", json={"json_editado": {"b": 2}})
+        client.post(
+            f"/projects/{project_id}/approve",
+            json={"json_editado": {"a": 1}},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        client.post(
+            f"/projects/{project_id}/approve",
+            json={"json_editado": {"b": 2}},
+            headers={"Authorization": f"Bearer {token}"},
+        )
 
         resp = client.get(f"/projects/{project_id}/versions")
         assert resp.status_code == 200
@@ -411,13 +526,9 @@ def test_project_approve_creates_version_and_marks_aprobado(client):
     try:
         body = _new_project(client)
         project_id = body["project"]["id"]
+        token = _leader_token(client, fake)
 
-        resp = client.post(
-            f"/projects/{project_id}/approve",
-            json={"json_editado": {"guion_vocal": "hola", "prompts_img": []}},
-        )
-        assert resp.status_code == 200
-        result = resp.json()
+        result = _approve(client, project_id, token)
         project = result["project"]
         version = result["version"]
 
@@ -438,10 +549,60 @@ def test_project_approve_creates_version_and_marks_aprobado(client):
         missing = str(uuid.uuid4())
         assert (
             client.post(
-                f"/projects/{missing}/approve", json={"json_editado": {}}
+                f"/projects/{missing}/approve",
+                json={"json_editado": {}},
+                headers={"Authorization": f"Bearer {token}"},
             ).status_code
             == 404
         )
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_project_approve_requires_token_401(client):
+    fake = _FakeSession()
+    app.dependency_overrides[get_session] = lambda: fake
+    try:
+        body = _new_project(client)
+        project_id = body["project"]["id"]
+
+        resp = client.post(f"/projects/{project_id}/approve", json={"json_editado": {}})
+        assert resp.status_code == 401
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_project_approve_equipo_role_403(client):
+    fake = _FakeSession()
+    app.dependency_overrides[get_session] = lambda: fake
+    try:
+        body = _new_project(client)
+        project_id = body["project"]["id"]
+        # líder para poder loguear al equipo (el login no exige rol)
+        _leader_token(client, fake)
+        equipo = AppUser(
+            id=uuid.uuid4(),
+            full_name="Equipo de Prueba",
+            email="equipo@ergalia.com",
+            role="equipo",
+            hashed_password=hash_password("clave-segura"),
+            is_active=True,
+        )
+        fake.add(equipo)
+        fake.flush()
+        resp = client.post(
+            "/auth/token",
+            data={"username": "equipo@ergalia.com", "password": "clave-segura"},
+        )
+        assert resp.status_code == 200
+        token = resp.json()["access_token"]
+
+        resp = client.post(
+            f"/projects/{project_id}/approve",
+            json={"json_editado": {}},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 403
     finally:
         app.dependency_overrides.clear()
 
@@ -452,12 +613,17 @@ def test_project_approve_twice_is_idempotent(client):
     try:
         body = _new_project(client)
         project_id = body["project"]["id"]
+        token = _leader_token(client, fake)
 
         r1 = client.post(
-            f"/projects/{project_id}/approve", json={"json_editado": {"v": 1}}
+            f"/projects/{project_id}/approve",
+            json={"json_editado": {"v": 1}},
+            headers={"Authorization": f"Bearer {token}"},
         )
         r2 = client.post(
-            f"/projects/{project_id}/approve", json={"json_editado": {"v": 2}}
+            f"/projects/{project_id}/approve",
+            json={"json_editado": {"v": 2}},
+            headers={"Authorization": f"Bearer {token}"},
         )
         assert r1.status_code == 200
         assert r2.status_code == 200
@@ -485,11 +651,13 @@ def test_project_rollback_restores_as_new_version(client):
     try:
         body = _new_project(client)
         project_id = body["project"]["id"]
+        token = _leader_token(client, fake)
 
         # v2 aprobada con contenido
         client.post(
             f"/projects/{project_id}/approve",
             json={"json_editado": {"guion_vocal": "aprobado"}},
+            headers={"Authorization": f"Bearer {token}"},
         )
 
         # rollback a la v1 (snapshot {}) -> v3 nueva

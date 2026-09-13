@@ -229,7 +229,10 @@ def test_reinforce_uses_fallback_after_retries(monkeypatch):
     assert result["status"] == "ok"
     assert result["fallback_used"] is True
     assert result["model_used"] == "deepseek-ai/DeepSeek-V4-Flash-0731"
-    assert calls.count("small") == 3  # reintentos agotados
+    # 0009: los reintentos del primario los hace tenacity DENTRO de
+    # complete() (src/llm/together.py::_post_with_retry); call_with_retries
+    # ya NO repite el bucle externo (antes: retries × retries = 9 llamadas).
+    assert calls.count("small") == 1
     assert calls.count("deepseek-ai/DeepSeek-V4-Flash-0731") == 1
     assert result["decision_source"] == "llm"
     assert result["requires_user_acceptance"] is False

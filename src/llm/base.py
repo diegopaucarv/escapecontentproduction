@@ -60,27 +60,32 @@ def call_with_retries(
     retries: int,
     fallback_model: str | None = None,
 ) -> tuple[str, str, bool]:
-    """Llama a complete() con reintentos y fallback. Devuelve
+    """Llama a complete() con fallback. Devuelve
     (texto, modelo_usado, usó_fallback). Lanza la última excepción si todo
-    falla (el caller decide cómo degradar)."""
+    falla (el caller decide cómo degradar).
+
+    Los reintentos del modelo primario los hace tenacity DENTRO de
+    complete() (src/llm/together.py::_post_with_retry) según
+    session_settings.llm_retries — este wrapper NO repite el bucle
+    (antes: retries × retries = 9 llamadas con el default 3).
+    """
     from src.llm.together import complete
 
     last_error: Exception | None = None
-    for attempt in range(max(1, retries)):
-        try:
-            return (
-                complete(
-                    session,
-                    prompt,
-                    model_size=model_size,
-                    system=system,
-                    response_format=response_format,
-                ),
-                model_size,
-                False,
-            )
-        except Exception as exc:  # noqa: BLE001 — cualquier error de red/API
-            last_error = exc
+    try:
+        return (
+            complete(
+                session,
+                prompt,
+                model_size=model_size,
+                system=system,
+                response_format=response_format,
+            ),
+            model_size,
+            False,
+        )
+    except Exception as exc:  # noqa: BLE001 — cualquier error de red/API
+        last_error = exc
 
     if fallback_model and fallback_model != model_size:
         try:

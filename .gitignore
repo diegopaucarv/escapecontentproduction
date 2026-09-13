@@ -4,3 +4,5 @@ __pycache__/
 .pytest_cache/
 pgdata/
 data/secrets/
+# Basura de sesiones de prueba manual (tmp_e2e_*.json, tmp_gen_prompt.txt, ...)
+tmp_*

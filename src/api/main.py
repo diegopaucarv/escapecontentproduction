@@ -9,6 +9,7 @@ vacío concreto.
 from __future__ import annotations
 
 import uuid
+from datetime import date
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import OAuth2PasswordRequestForm
@@ -27,12 +28,15 @@ from src.db.models import (
     ApiKey,
     AppUser,
     AssetJob,
+    CalendarSlot,
     ContentArtifact,
     ContentBrief,
     EmbeddingSetting,
+    KaizenCycle,
     LlmModel,
     PipelineTemplate,
     ProductionManifest,
+    ProductionOrder,
     ProductionTemplate,
     Project,
     ProjectVersion,
@@ -43,6 +47,19 @@ from src.db.models import (
     ToolAdapter,
 )
 from src.db.session import get_session
+from src.orders.flow import (
+    create_order as kaizen_create_order,
+)
+from src.orders.flow import (
+    kaizen_decision,
+    order_note,
+    publish_order,
+    record_kpis,
+    record_micro_kaizen,
+)
+from src.orders.flow import (
+    produce_order as kaizen_produce_order,
+)
 from src.production.flow import produce_project
 from src.production.generator import generate_snapshot
 from src.production.postproduction import postproduction_recommendations
@@ -1630,6 +1647,15 @@ class ProjectCreate(BaseModel):
     template_id: uuid.UUID | None = None
     brand_objective: str | None = None
     artifact_type: str | None = None
+    # Gobernanza real (0009/0010): el proyecto declara el segmento y el
+    # riesgo de su caso real; produce_project los usa para el brief
+    # compañero y el Gatekeeper — nunca S1/bajo hardcodeados.
+    segment_client: str | None = Field(
+        default=None, pattern="^S[1-6]$", examples=["S1"]
+    )
+    risk_level: str | None = Field(
+        default=None, pattern="^(bajo|medio|alto)$", examples=["bajo"]
+    )
 
 
 class ProjectUpdate(BaseModel):
@@ -1639,6 +1665,12 @@ class ProjectUpdate(BaseModel):
     brand_objective: str | None = None
     artifact_type: str | None = None
     status: str | None = None
+    segment_client: str | None = Field(
+        default=None, pattern="^S[1-6]$", examples=["S1"]
+    )
+    risk_level: str | None = Field(
+        default=None, pattern="^(bajo|medio|alto)$", examples=["bajo"]
+    )
 
 
 class ProjectApprove(BaseModel):
@@ -1657,6 +1689,8 @@ def _project_to_dict(p: Project) -> dict:
         "template_id": str(p.template_id) if p.template_id else None,
         "brand_objective": _val(p.brand_objective),
         "artifact_type": p.artifact_type,
+        "segment_client": _val(p.segment_client),
+        "risk_level": _val(p.risk_level),
         "status": p.status,
         "current_version": p.current_version,
         "storage_path": p.storage_path,
@@ -1719,7 +1753,12 @@ def create_project(
     body: ProjectCreate, session: Session = Depends(get_session)
 ) -> dict:
     """Crea un proyecto en estado 'borrador' con su versión 1 de snapshot
-    (esqueleto vacío {}; el flujo de generación lo llena después)."""
+    (esqueleto vacío {}; el flujo de generación lo llena después).
+
+    Gobernanza (0009/0010): segment_client y risk_level son obligatorios
+    — el proyecto declara el caso real desde el inicio; produce_project
+    los usa para el brief compañero y el Gatekeeper.
+    """
     if body.template_id is not None:
         template = session.get(ProductionTemplate, body.template_id)
         if template is None:
@@ -1727,12 +1766,24 @@ def create_project(
                 status_code=404,
                 detail=f"production_template {body.template_id} no encontrado.",
             )
+    if not body.segment_client:
+        raise HTTPException(
+            status_code=422,
+            detail="Todo proyecto requiere segment_client (S1-S6) — canon §9.2.",
+        )
+    if not body.risk_level:
+        raise HTTPException(
+            status_code=422,
+            detail="Todo proyecto requiere risk_level (bajo|medio|alto).",
+        )
     project = Project(
         name=body.name,
         topic=body.topic,
         template_id=body.template_id,
         brand_objective=body.brand_objective,
         artifact_type=body.artifact_type,
+        segment_client=body.segment_client,
+        risk_level=body.risk_level,
         status="borrador",
         current_version=1,
     )
@@ -1827,10 +1878,16 @@ def approve_project(
     project_id: uuid.UUID,
     body: ProjectApprove,
     session: Session = Depends(get_session),
+    user: AppUser = Depends(require_role("lider")),
 ) -> dict:
     """Aprueba el JSON editado: lo guarda como versión nueva (max+1),
     actualiza current_version y marca el proyecto 'aprobado' con su
-    storage_path resuelto contra ASSET_STORAGE_PATH (§20.8)."""
+    storage_path resuelto contra ASSET_STORAGE_PATH (§20.8).
+
+    OWNER_APPROVAL del Pre-Deploy Gate (0009): solo un 🟨 líder puede
+    aprobar — igual que POST /briefs/{id}/approve. Sin esto, cualquiera
+    (o nadie autenticado) podía empujar un proyecto a producción.
+    """
     project = _get_project_or_404(session, project_id)
     new_version = _next_project_version(session, project_id)
     version = ProjectVersion(
@@ -1846,6 +1903,7 @@ def approve_project(
     return {
         "project": _project_to_dict(project),
         "version": _project_version_to_dict(version),
+        "approved_by": str(user.id),
     }
 
 
@@ -1994,9 +2052,16 @@ def produce_project_endpoint(
 ) -> dict:
     """Dispara la cadena de herramientas del proyecto (§20.3).
 
-    Solo proyectos 'aprobado'. El orquestador no commitea a propósito
-    (Fase 2): este endpoint commitea después de produce_project. Los
-    errores de orquestación se mapean a 409; cualquier otro error a 500.
+    Solo proyectos 'aprobado'. Gobernanza (0009/0010): produce_project
+    crea el brief compañero con el segmento/riesgo reales del proyecto y
+    lo pasa por el Gatekeeper. Si el gate exige revisión humana, el
+    pipeline se pausa (requires_user_acceptance=True): se devuelve 409
+    con el brief_id para que un 🟨 líder lo apruebe vía
+    POST /briefs/{id}/approve y luego re-dispare /produce.
+
+    El orquestador no commitea a propósito (Fase 2): este endpoint
+    commitea después de produce_project. Los errores de orquestación se
+    mapean a 409; cualquier otro error a 500.
     """
     project = _get_project_or_404(session, project_id)
     if project.status != "aprobado":
@@ -2007,6 +2072,18 @@ def produce_project_endpoint(
     current = _get_project_version_or_404(session, project_id, project.current_version)
     try:
         result = produce_project(session, project, current.snapshot)
+        if result.get("requires_user_acceptance"):
+            # 0007: el pipeline se pausa — el brief compañero exige
+            # aprobación de un 🟨 líder antes de tocar herramientas.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"El brief compañero {result['brief_id']} exige revisión "
+                    f"humana (verdict={result['verdict']}): {result['reason']} "
+                    "Aprueba el brief vía POST /briefs/{id}/approve y "
+                    "re-dispara /produce."
+                ),
+            )
         session.commit()  # el orquestador no commitea a propósito (Fase 2)
         return {
             "project": _project_to_dict(project),
@@ -2016,6 +2093,8 @@ def produce_project_endpoint(
         }
     except OrchestrationError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except HTTPException:
+        raise
     except Exception as exc:  # noqa: BLE001 — error inesperado del orquestador
         raise HTTPException(
             status_code=500, detail=f"Error al producir el proyecto: {exc}"
@@ -2034,3 +2113,253 @@ def project_postproduction(
     project = _get_project_or_404(session, project_id)
     current = _get_project_version_or_404(session, project_id, project.current_version)
     return postproduction_recommendations(session, project, current.snapshot)
+
+
+# ---------------------------------------------------------------------
+# Ruta A — Kaizen/Repetitivo (§5 del pipeline unificado)
+# ---------------------------------------------------------------------
+# La ruta de MAYOR volumen real: el contenido recurrente de calendario
+# (dato incómodo semanal de Ergalia, shorts Lun/Mié/Vie de ESCAPE).
+# Secuencia: ORDER → ORDER_NOTE → EXECUTE_KAIZEN → MEASURE_KPI →
+# MICRO_KAIZEN/MICRO_RITUAL → KAIZEN_DECISION → PRE_DEPLOY_ENTRY.
+# Publicación manual por ahora (la capa DEPLOY automática no existe aún).
+
+
+class OrderCreate(BaseModel):
+    slot_code: str
+    scheduled_date: date
+    insight_core: str
+    owner_id: uuid.UUID | None = None
+    segment_client: str | None = None
+    risk_level: str | None = None
+    evidence_source: str | None = None
+
+
+class KpisPayload(BaseModel):
+    kpis: dict = Field(default_factory=dict)
+
+
+class MicroKaizenPayload(BaseModel):
+    experiment: dict = Field(default_factory=dict)
+    ritual: dict = Field(default_factory=dict)
+
+
+class KaizenDecisionPayload(BaseModel):
+    decision: str = Field(..., pattern="^(update_registry|archive)$")
+    improvement_summary: str = ""
+
+
+def _slot_to_dict(slot: CalendarSlot) -> dict:
+    return {
+        "id": str(slot.id),
+        "slot_code": slot.slot_code,
+        "brand_objective": _val(slot.brand_objective),
+        "content_bucket": _val(slot.content_bucket),
+        "artifact_type": slot.artifact_type,
+        "channel": slot.channel,
+        "default_owner_role": slot.default_owner_role,
+        "cadence": slot.cadence,
+        "weekday": slot.weekday,
+        "is_active": slot.is_active,
+    }
+
+
+def _order_to_dict(order: ProductionOrder) -> dict:
+    return {
+        "id": str(order.id),
+        "calendar_slot": order.calendar_slot,
+        "brand_objective": _val(order.brand_objective),
+        "content_bucket": _val(order.content_bucket),
+        "artifact_type": order.artifact_type,
+        "channel": order.channel,
+        "owner_id": str(order.owner_id) if order.owner_id else None,
+        "scheduled_date": order.scheduled_date.isoformat()
+        if order.scheduled_date
+        else None,
+        "insight_core": order.insight_core,
+        "status": _val(order.status),
+        "brief_id": str(order.brief_id) if order.brief_id else None,
+        "artifact_id": str(order.artifact_id) if order.artifact_id else None,
+        "template_id": str(order.template_id) if order.template_id else None,
+        "kpis": order.kpis or {},
+        "kaizen_decision": order.kaizen_decision,
+        "created_at": order.created_at.isoformat() if order.created_at else None,
+        "updated_at": order.updated_at.isoformat() if order.updated_at else None,
+    }
+
+
+def _kaizen_cycle_to_dict(cycle: KaizenCycle) -> dict:
+    return {
+        "id": str(cycle.id),
+        "order_id": str(cycle.order_id),
+        "decision": cycle.decision,
+        "improvement_summary": cycle.improvement_summary,
+        "metrics": cycle.metrics or {},
+        "created_at": cycle.created_at.isoformat() if cycle.created_at else None,
+    }
+
+
+def _get_order_or_404(session: Session, order_id: uuid.UUID) -> ProductionOrder:
+    order = session.get(ProductionOrder, order_id)
+    if order is None:
+        raise HTTPException(status_code=404, detail=f"Orden {order_id} no encontrada.")
+    return order
+
+
+@app.get("/calendar-slots", response_model=list[dict])
+def list_calendar_slots(session: Session = Depends(get_session)) -> list[dict]:
+    """Lista las filas del calendario editorial recurrente (Ruta A)."""
+    rows = (
+        session.execute(select(CalendarSlot).order_by(CalendarSlot.slot_code))
+        .scalars()
+        .all()
+    )
+    return [_slot_to_dict(s) for s in rows]
+
+
+@app.post("/orders", status_code=201)
+def create_order(body: OrderCreate, session: Session = Depends(get_session)) -> dict:
+    """ORDER (§5.1) — crea una Orden de Producción desde la fila del calendario.
+
+    Hereda brand_objective, content_bucket, artifact_type, channel y owner
+    de la fila de calendario (ORDER_NOTE, §5.2); solo se completa
+    insight_core y el dato/gancho de esa semana.
+    """
+    try:
+        order = kaizen_create_order(
+            session,
+            slot_code=body.slot_code,
+            scheduled_date=body.scheduled_date,
+            insight_core=body.insight_core,
+            owner_id=body.owner_id,
+            evidence_source=body.evidence_source,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    session.commit()
+    session.refresh(order)
+    return _order_to_dict(order)
+
+
+@app.get("/orders", response_model=list[dict])
+def list_orders(session: Session = Depends(get_session)) -> list[dict]:
+    """Lista las órdenes de producción (más recientes primero)."""
+    rows = (
+        session.execute(
+            select(ProductionOrder).order_by(ProductionOrder.created_at.desc())
+        )
+        .scalars()
+        .all()
+    )
+    return [_order_to_dict(o) for o in rows]
+
+
+@app.get("/orders/{order_id}", response_model=dict)
+def get_order(order_id: uuid.UUID, session: Session = Depends(get_session)) -> dict:
+    """Lee una Orden de Producción completa por id."""
+    return _order_to_dict(_get_order_or_404(session, order_id))
+
+
+@app.get("/orders/{order_id}/note", response_model=dict)
+def get_order_note(
+    order_id: uuid.UUID, session: Session = Depends(get_session)
+) -> dict:
+    """ORDER_NOTE (§5.2) — el markdown de /orders/order_<id>.md."""
+    order = _get_order_or_404(session, order_id)
+    return {"order_id": str(order.id), "note": order_note(order)}
+
+
+@app.post("/orders/{order_id}/produce", response_model=dict)
+def produce_order(order_id: uuid.UUID, session: Session = Depends(get_session)) -> dict:
+    """EXECUTE_KAIZEN (§5.3) — producción single-pass con plantilla existente.
+
+    Producer genera → critic evalúa el checklist → Gatekeeper decide. Sin el
+    grafo Producer-Critic completo (a propósito). En auto_pass la pieza se
+    materializa como ContentArtifact y la orden pasa a 'aprobada'.
+    """
+    order = _get_order_or_404(session, order_id)
+    try:
+        return kaizen_produce_order(session, order)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/orders/{order_id}/publish", response_model=dict)
+def publish_order_endpoint(
+    order_id: uuid.UUID, session: Session = Depends(get_session)
+) -> dict:
+    """Publicación MANUAL por ahora: marca la orden como 'publicada'.
+
+    La capa DEPLOY automática (docs/diseno_sistema_publicacion.md) aún no
+    está construida; este paso es el puente manual hasta que exista.
+    """
+    order = _get_order_or_404(session, order_id)
+    try:
+        publish_order(session, order)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    session.refresh(order)
+    return _order_to_dict(order)
+
+
+@app.post("/orders/{order_id}/kpis", response_model=dict)
+def record_kpis_endpoint(
+    order_id: uuid.UUID, body: KpisPayload, session: Session = Depends(get_session)
+) -> dict:
+    """MEASURE_KPI (§5.4) — LeadTime, CycleTime, Time-in-Stage, FPQ, Rework Rate.
+
+    Las métricas de proceso se calculan automáticamente; las de contenido
+    (guardados, respuestas, retención) se pasan en el body.
+    """
+    order = _get_order_or_404(session, order_id)
+    merged = record_kpis(session, order, body.kpis)
+    return {"order_id": str(order.id), "kpis": merged}
+
+
+@app.post("/orders/{order_id}/kaizen", response_model=dict)
+def record_micro_kaizen_endpoint(
+    order_id: uuid.UUID,
+    body: MicroKaizenPayload,
+    session: Session = Depends(get_session),
+) -> dict:
+    """MICRO_KAIZEN (§5.5) + MICRO_RITUAL (§5.6).
+
+    MICRO_KAIZEN: ajuste incremental (otro horario, otro hook, formato de
+    apoyo). MICRO_RITUAL (5–10 min): chequeo exprés de riesgos.
+    """
+    order = _get_order_or_404(session, order_id)
+    kpis = record_micro_kaizen(session, order, body.experiment, body.ritual)
+    return {"order_id": str(order.id), "kpis": kpis}
+
+
+@app.post("/orders/{order_id}/kaizen-decision", response_model=dict)
+def kaizen_decision_endpoint(
+    order_id: uuid.UUID,
+    body: KaizenDecisionPayload,
+    session: Session = Depends(get_session),
+) -> dict:
+    """KAIZEN_DECISION (§5.7) → UPDATE_REGISTRY | ARCHIVE_KAIZEN.
+
+    update_registry: la plantilla mejora para todo el equipo (se actualiza
+    /components/manifest.md y /kb/kaizen_<id>.md). archive: se documenta
+    igual, sin cambiar la plantilla base. Ambas convergen en PRE_DEPLOY_ENTRY.
+    """
+    order = _get_order_or_404(session, order_id)
+    try:
+        return kaizen_decision(session, order, body.decision, body.improvement_summary)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/orders/{order_id}/kaizen-cycles", response_model=list[dict])
+def list_order_kaizen_cycles(
+    order_id: uuid.UUID, session: Session = Depends(get_session)
+) -> list[dict]:
+    """Lista los ciclos Kaizen de una orden (KAIZEN_DECISION, §5.7)."""
+    _get_order_or_404(session, order_id)
+    rows = (
+        session.execute(select(KaizenCycle).where(KaizenCycle.order_id == order_id))
+        .scalars()
+        .all()
+    )
+    return [_kaizen_cycle_to_dict(c) for c in rows]

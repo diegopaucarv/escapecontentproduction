@@ -19,7 +19,11 @@ from src.production.produce_brief import build_state, resume_produce, run_produc
 class _FakeSession:
     """Sesión mínima: responde a session.execute(select(SessionSettings)...)
     con vacío para que load_settings -> None y el productor/crítico degraden
-    a skipped (decisión determinista)."""
+    a skipped (decisión determinista). También responde a
+    select(BrandKnowledge) con las filas de canon configuradas."""
+
+    def __init__(self, brand_knowledge=None):
+        self._brand_knowledge = brand_knowledge or []
 
     def execute(self, stmt):
         class _Result:
@@ -35,11 +39,16 @@ class _FakeSession:
             def first(self):
                 return self._rows[0] if self._rows else None
 
+            def all(self):
+                return self._rows
+
         # select(SessionSettings) — sin settings -> skipped (determinista).
         if hasattr(stmt, "_raw_columns") and stmt._raw_columns:
             table = getattr(stmt._raw_columns[0], "name", "")
             if table == "session_settings":
                 return _Result([])
+            if table == "brand_knowledge":
+                return _Result(self._brand_knowledge)
         return _Result([])
 
 
@@ -78,7 +87,8 @@ def _make_template(**overrides) -> PipelineTemplate:
 def test_build_state_maps_brief_fields():
     brief = _make_brief()
     template = _make_template()
-    state = build_state(brief, template)
+    session = _FakeSession()
+    state = build_state(session, brief, template)
 
     assert state["brand_objective"] == "ESCAPE_SOCIAL"
     assert state["checklist_template"] == ["fuente_verificable", "cta_unico"]

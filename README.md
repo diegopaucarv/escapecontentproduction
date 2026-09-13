@@ -16,6 +16,9 @@ docker compose up -d --build
 docker compose run --rm -e TOGETHER_API_KEY=tgp_v1_... api python -m src.db.seed_llm
 docker compose run --rm api python -m src.db.seed_ai
 docker compose run --rm api python -m src.llm.compile_prompts
+# Canon de marca como Context Pack (0012) — mockups hasta que existan los
+documentos reales (ver src/db/seed_brand_knowledge.py)
+docker compose run --rm api python -m src.db.seed_brand_knowledge
 curl localhost:8000/health
 ```
 
@@ -206,6 +209,18 @@ el camino feliz:
   usa el borrador determinista y `requires_user_acceptance=True` — el
   pipeline se pausa para que el humano decida. `make_producer_fn`
   vincula la sesión para inyectarla en el grafo.
+- **Canon de marca como Context Pack** (migración 0012,
+  `src/db/seed_brand_knowledge.py`) — el canon (guías de marca,
+  `_lenguaje_visual.md`, `arquitectura_comercial_y_contenidos_escape_ergalia.md`)
+  vivía como archivos estáticos que `build_context_pack()` nunca
+  consultaba. Ahora vive en la tabla `brand_knowledge`: filas etiquetadas
+  por `brand_objective` + `content_bucket` (tono, lenguaje visual, reglas
+  editoriales, objetivo de bucket) que `build_context_pack()` consulta y
+  entrega al Producer en su Context Pack — el LLM ya no "adivina" el tono
+  por el nombre del bucket. Los documentos reales NO existen aún en el
+  repo, así que el seed inserta mockups marcados `is_mock=True` con
+  `source_doc` apuntando al documento real que debe reemplazarlos
+  (instrucción: editar las constantes del seed y correrlo de nuevo).
 - **Enrutamiento por novedad y Gatekeeper** — lógica pura con tests
   unitarios (`tests/test_novelty_router.py`, `tests/test_gatekeeper.py`).
 - **Bucle Producer-Critic** (`src/agents/producer_critic.py`,
@@ -440,14 +455,14 @@ Este checklist es el **esquema a seguir**: cada fase del doc, con su estado.
 - [ ] `LAUNCH_DOC` — Documento de Lanzamiento como artefacto persistido
       (hoy el endpoint devuelve el análisis pero no guarda el documento)
 
-### Ruta A — Repetitivo → Kaizen (§5) ❌
+### Ruta A — Repetitivo → Kaizen (§5) ✅
 
-- [ ] `ORDER` — órdenes de producción desde el calendario editorial
-- [ ] `ORDER_NOTE` — herencia de campos de la fila de calendario
-- [ ] `EXECUTE_KAIZEN` — producción con plantilla existente
-- [ ] `MEASURE_KPI` — LeadTime, CycleTime, Time-in-Stage, FPQ, Rework Rate
-- [ ] `MICRO_KAIZEN` / `MICRO_RITUAL` — micro-experimentos y chequeo exprés
-- [ ] `KAIZEN_DECISION` → `UPDATE_REGISTRY` / `ARCHIVE_KAIZEN`
+- [x] `ORDER` — órdenes de producción desde el calendario editorial
+- [x] `ORDER_NOTE` — herencia de campos de la fila de calendario
+- [x] `EXECUTE_KAIZEN` — producción con plantilla existente
+- [x] `MEASURE_KPI` — LeadTime, CycleTime, Time-in-Stage, FPQ, Rework Rate
+- [x] `MICRO_KAIZEN` / `MICRO_RITUAL` — micro-experimentos y chequeo exprés
+- [x] `KAIZEN_DECISION` → `UPDATE_REGISTRY` / `ARCHIVE_KAIZEN`
 
 ### Ruta B — Solución previa → OBSOLETE_CHECK (§6) ❌
 
@@ -505,7 +520,7 @@ Este checklist es el **esquema a seguir**: cada fase del doc, con su estado.
 - [ ] `DATA_KPIS` / `MATERIALS` / `LOGISTICS`
 - [ ] `READINESS` — checklist de publicación + visual + OpSec
 
-### Kaizen (§5) ❌ — ver Ruta A
+### Kaizen (§5) ✅ — ver Ruta A
 
 ### Deploy (§12) ❌
 
