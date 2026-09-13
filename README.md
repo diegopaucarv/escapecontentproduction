@@ -252,28 +252,90 @@ de agentes está separada de la capa de datos a propósito).
 
 El mapa completo del pipeline (rutas A/B/C, Fast/Complete, Kaizen,
 Deploy, Learning) está en `docs/pipeline_unificado_produccion_contenidos(1).md`.
-Lo implementado cubre la **Fase 0** (brief + alineamiento + enrutamiento)
-y el esqueleto del bucle Producer-Critic. Las fases siguientes siguen
-sin implementar:
+Este checklist es el **esquema a seguir**: cada fase del doc, con su estado.
 
-- **Ruta B — Solución previa detectada** — `OBSOLETE_CHECK` (¿evidencia/ángulo
-  obsoleto?) y `RESEARCH_UPDATE` (verificación de evidencia) del §6 del doc.
-- **Ruta C — Nueva solución** — Discovery editorial (el "Chispazo"), test de
-  gancho 15s (n=5) y decisión Fast/Complete del §7.
-- **Sub-ruta Fast** — Sprint de Diseño y Prueba (2d) + Fast-Probe (7d):
-  MVP, setup de piloto, instrumentación, publicación piloto, evaluación
-  de KPIs, iteración (máx. 3) y kill con postmortem (§8).
-- **Sub-ruta Complete** — SPEC/repurpose_plan, plan técnico, handoff,
-  ritual de riesgos, integración y components manifest (§9.1). El bucle
-  Producer-Critic (§9.2) es el esqueleto probado; el resto de la secuencia no.
-- **Pre-Deploy Gate** — readiness check, materiales y logística (§11).
-  Solo existe `OWNER_APPROVAL` (`POST /briefs/{id}/approve`, rol `lider`).
-- **Kaizen** — órdenes de producción desde calendario, KPIs de proceso
-  (LeadTime, CycleTime, FPQ, Rework Rate), micro-experimentos y micro-rituales (§5).
-- **Deploy** — rollout por secuencia de canales, monitoreo 24–72h/7d/30d/90d,
-  protocolo de crisis/retiro (§12).
-- **Learning & Automation** — postmortem automatizado y prefill de templates
-  (§13). El cierre del bucle RAG (telemetría → `artifact_library`) ya existe.
+### Fase 0 — Recepción, Brief y Enrutamiento ✅
+
+- [x] `ContentBrief` unificado (bloques A–H, §3)
+- [x] `ALIGNMENT` — semáforo 🟢🟡🔴 + refuerzo LLM conservador (§4.2)
+- [x] `NOVELTY` — búsqueda vectorial + scoring + zona gris LLM (§4.4)
+- [ ] `LAUNCH_DOC` — Documento de Lanzamiento como artefacto persistido
+      (hoy el endpoint devuelve el análisis pero no guarda el documento)
+
+### Ruta A — Repetitivo → Kaizen (§5) ❌
+
+- [ ] `ORDER` — órdenes de producción desde el calendario editorial
+- [ ] `ORDER_NOTE` — herencia de campos de la fila de calendario
+- [ ] `EXECUTE_KAIZEN` — producción con plantilla existente
+- [ ] `MEASURE_KPI` — LeadTime, CycleTime, Time-in-Stage, FPQ, Rework Rate
+- [ ] `MICRO_KAIZEN` / `MICRO_RITUAL` — micro-experimentos y chequeo exprés
+- [ ] `KAIZEN_DECISION` → `UPDATE_REGISTRY` / `ARCHIVE_KAIZEN`
+
+### Ruta B — Solución previa → OBSOLETE_CHECK (§6) ❌
+
+- [ ] `OBSOLETE_CHECK` — ¿evidencia/ángulo obsoleto?
+- [ ] `RESEARCH_UPDATE` — verificación de evidencia (estándar Debate
+      Informado / anonimización Ergalia)
+- [ ] `RESEARCH_NOTE` / `UPDATE_BRIEF`
+
+### Ruta C — Nueva solución → Discovery (§7) ❌
+
+- [ ] Aprendizaje Express — IA synth con Context Packs (canon + guía +
+      Artifact Library)
+- [ ] `DISCOVERY_NODE` / `DISCOVERY_NOTE` — el "Chispazo" → `insight_core`
+- [ ] `TEAM_INPUTS` / `LEADER_REFINE`
+- [ ] Test de gancho 15s (n=5, comprensión ≥80%)
+- [ ] `DECIDE_ROUTE` (Fast/Complete) / `ATLAS_NOTE`
+
+### Sub-ruta Fast — Sprint 2D + Fast-Probe (§8) ❌
+
+- [ ] `SPRINT2D` — prototipo + prueba con 5 lectores
+- [ ] `MVP` / `SETUP_EXP` / `INSTRUMENTATION` (UTMs, tracking)
+- [ ] `AUTO_DEPLOY` — publicación piloto programada
+- [ ] `FEEDBACK` (24–72h) / `PROBE_EVAL` (árbol de decisión de marca)
+- [ ] `PROBE_ITER` (máx 3) / `PROBE_KILL` → postmortem
+
+### Sub-ruta Complete — Full Development (§9) 🔶 (esqueleto Producer-Critic ✅)
+
+- [ ] `SPEC` / `repurpose_plan` — variantes de formato/canal
+- [ ] `PLAN_TECNICO` / `HANDOFF_NOTE` / `RITUAL_DEV`
+- [ ] `UX_DESIGN` — lenguaje visual de marca + patrones reutilizables
+      → **en diseño** (`docs/diseno_produccion_multiformato.md`)
+- [ ] `PROD_DEV` — producción modular por formato (derivación de la pieza
+      madre) → **en diseño** (mismo doc)
+- [ ] `QA_VALID` — checklist + evidencia + anonimización → **en diseño**
+      (mismo doc)
+- [ ] `INTEGRATION` / `COMPONENTS_NOTE` (components manifest)
+- [x] Bucle Producer-Critic (grafo LangGraph con `interrupt()` real)
+
+### Pre-Deploy Gate (§11) 🔶
+
+- [x] `OWNER_APPROVAL` — `POST /briefs/{id}/approve` (rol `lider`)
+- [ ] `DATA_KPIS` / `MATERIALS` / `LOGISTICS`
+- [ ] `READINESS` — checklist de publicación + visual + OpSec
+
+### Kaizen (§5) ❌ — ver Ruta A
+
+### Deploy (§12) ❌
+
+- [ ] `DEPLOY_FINAL` / `ROLLOUT` (canal ancla → variantes → amplificación)
+- [ ] `MONITOR` (24–72h / 7d / 30d / 90d)
+- [ ] `RELEASE_NOTE` / `ROLLBACK_PLAN` (crisis) / `LIGHT_DELIVERY`
+
+### Learning & Automation (§13) 🔶
+
+- [x] `FEED_RAG` — telemetría → `artifact_library` (cierre del bucle RAG)
+- [ ] `AUTO_POSTMORTEM` / `KB_POST` / `TEMPL_PREFILL`
+
+### Deudas técnicas transversales
+
+- [ ] Nodo `producer` real (hoy stub) — consumir `producer_draft` con el
+      modelo grande
+- [ ] Checklist automático real en el Critic (hoy simulado) — verificación
+      mecánica por regex/NER
+- [ ] Checkpointer persistente (`langgraph-checkpoint-postgres`)
+- [ ] Media móvil ponderada por recencia en `retention_24h`/`conversion_30d`
+- [ ] Endpoint de registro de usuarios (hoy manual, a propósito)
 
 ### Deudas técnicas puntuales
 
