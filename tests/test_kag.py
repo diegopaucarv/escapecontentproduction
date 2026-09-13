@@ -22,7 +22,12 @@ from src.kag_query import (
     assemble_context,
     build_adjacency,
     classify_query,
+    disambiguate_by_cooccurrence,
+    grounded_entity_linking,
+    hybrid_search,
+    match_entities_candidates,
     personalized_pagerank,
+    rrf_merge,
 )
 
 # ---------------------------------------------------------------------
@@ -106,15 +111,27 @@ def test_chunk_markdown_short_splits_by_headers():
     seg = _FakeSegmenter()
     chunks = chunk_markdown(md, "short", seg, max_tokens=800)
 
-    assert len(chunks) == 6  # 3 secciones × 2 segmentos
+    # 3 secciones × 2 segmentos, pero los segmentos son diminutos y se
+    # fusionan hasta max_tokens → 1 chunk por sección.
+    assert len(chunks) == 3
     assert chunks[0]["section_path"] == "# Introducción"
-    assert chunks[1]["section_path"] == "# Introducción"
-    assert chunks[2]["section_path"] == "# Introducción > ## Métodos"
-    assert chunks[4]["section_path"] == "# Introducción > ## Métodos > ### Sub"
+    assert chunks[1]["section_path"] == "# Introducción > ## Métodos"
+    assert chunks[2]["section_path"] == "# Introducción > ## Métodos > ### Sub"
     assert chunks[0]["token_estimate"] == estimate_tokens(chunks[0]["content"])
     assert "seg0:" in chunks[0]["content"]
+    assert "seg1:" in chunks[0]["content"]  # fusionado
     # max_tokens se propaga al segmenter
     assert all(call[1] == 800 for call in seg.calls)
+
+
+def test_chunk_markdown_short_respects_max_tokens_merge():
+    # Segmentos grandes no se fusionan si exceden max_tokens.
+    class _BigSegments:
+        def segment_text(self, text, max_tokens=800):
+            return ["a" * 2000, "b" * 2000]  # ~500 tokens cada uno
+
+    chunks = chunk_markdown("# T\n\ncontenido", "short", _BigSegments(), max_tokens=800)
+    assert len(chunks) == 2  # no caben juntos en 800 tokens
 
 
 def test_chunk_markdown_long_presegments_h1_h2():
@@ -127,18 +144,42 @@ def test_chunk_markdown_long_presegments_h1_h2():
     chunks = chunk_markdown(md, "long", seg, max_tokens=800)
 
     # long: solo H1/H2 parten; ### queda dentro del contenido de la sección.
-    assert len(chunks) == 4  # 2 secciones × 2 segmentos
+    # 2 secciones × 2 segmentos diminutos → 1 chunk por sección (fusionados).
+    assert len(chunks) == 2
     assert chunks[0]["section_path"] == "# Cap 1"
     # El texto pasado al segmenter para la sección 1 incluye el ### (no parte).
     assert "Sub detalle" in seg.calls[0][0]
-    assert chunks[2]["section_path"] == "# Cap 1 > ## Cap 2"
+    assert chunks[1]["section_path"] == "# Cap 1 > ## Cap 2"
 
 
 def test_chunk_markdown_without_headers_uses_whole_text():
     seg = _FakeSegmenter()
     chunks = chunk_markdown("Solo texto sin encabezados.", "short", seg)
-    assert len(chunks) == 2
+    assert len(chunks) == 1  # 2 segmentos diminutos fusionados
     assert chunks[0]["section_path"] == ""
+
+
+def test_chunk_markdown_use_coref_false_disables_coref():
+    class _SegWithCoref:
+        def __init__(self):
+            self.coref_called = False
+
+        def segment_text(self, text, max_tokens=800):
+            # Simula el segmentador real: segment_text llama a coref internamente.
+            segs = ["seg uno", "seg dos"]
+            return self.resolve_coreferences(segs)
+
+        def resolve_coreferences(self, segments):
+            self.coref_called = True
+            return segments
+
+    seg = _SegWithCoref()
+    chunk_markdown("texto", "short", seg, use_coref=False)
+    assert seg.coref_called is False  # no-op temporal
+
+    seg2 = _SegWithCoref()
+    chunk_markdown("texto", "short", seg2, use_coref=True)
+    assert seg2.coref_called is True  # comportamiento original preservado
 
 
 # ---------------------------------------------------------------------
@@ -354,3 +395,381 @@ def test_complete_local_retries_then_raises(monkeypatch):
     with pytest.raises(httpx.ConnectError):
         complete_local(_LocalSession(_local_model_row()), "prompt")
     assert len(calls) == 2  # retry simple de 2 intentos
+
+
+# ---------------------------------------------------------------------
+# rrf_merge (opt 4)
+# ---------------------------------------------------------------------
+
+
+def test_rrf_merge_combines_ranks_positionally():
+    dense = [(1, 0.9), (2, 0.8), (3, 0.7)]
+    sparse = [(3, 5.0), (1, 4.0)]
+    merged = rrf_merge(dense, sparse, k=60, top_k=10)
+    scores = dict(merged)
+    # Ambos en rank 1 → el que aparece en ambas listas arriba gana.
+    assert scores[1] == pytest.approx(1 / 61 + 1 / 62)
+    assert scores[3] == pytest.approx(1 / 63 + 1 / 61)
+    assert scores[2] == pytest.approx(1 / 62)
+    # Ordenado desc por score.
+    assert [cid for cid, _ in merged] == sorted(scores, key=lambda c: -scores[c])
+
+
+def test_rrf_merge_top_k_limits():
+    dense = [(i, 1.0) for i in range(1, 11)]
+    sparse = []
+    merged = rrf_merge(dense, sparse, k=60, top_k=3)
+    assert len(merged) == 3
+
+
+def test_rrf_merge_empty():
+    assert rrf_merge([], [], k=60, top_k=5) == []
+
+
+# ---------------------------------------------------------------------
+# disambiguate_by_cooccurrence (opt 2)
+# ---------------------------------------------------------------------
+
+
+def test_disambiguate_picks_candidate_sharing_neighbors():
+    # Entidad 1 confirmada (mención única). Mención ambigua: 2 o 3.
+    # 2 comparte vecino (4) con 1; 3 está aislada.
+    adj = {
+        1: {4: 1},
+        2: {4: 1},
+        3: {},
+        4: {1: 1, 2: 1},
+    }
+    groups = [[1], [2, 3]]
+    result = disambiguate_by_cooccurrence(None, groups, adjacency=adj)
+    assert result == [1, 2]
+
+
+def test_disambiguate_no_confirmed_keeps_first():
+    adj = {1: {2: 1}, 2: {1: 1}, 3: {}}
+    groups = [[1, 2], [3, 1]]
+    result = disambiguate_by_cooccurrence(None, groups, adjacency=adj)
+    assert result == [1, 3]
+
+
+def test_disambiguate_empty_groups():
+    assert disambiguate_by_cooccurrence(None, [], adjacency={}) == []
+
+
+# ---------------------------------------------------------------------
+# match_entities_candidates (opt 2)
+# ---------------------------------------------------------------------
+
+
+class _CandidatesSession:
+    """Sesión falsa: devuelve ids según name_norm exacto o patrón LIKE.
+
+    exact: {name_norm: [ids]}; like: {substring: [(id, name)]}.
+    Devuelve filas con .id y .name (lo que esperan los callers).
+    """
+
+    def __init__(self, exact=None, like=None):
+        self.exact = exact or {}  # name_norm -> [ids]
+        self.like = like or {}  # substring -> [(id, name)]
+
+    def execute(self, stmt, params=None):
+        sql = str(stmt)
+        if "name_norm = :nn" in sql:
+            ids = self.exact.get(params["nn"], [])
+            rows = [SimpleNamespace(id=i, name=f"entidad-{i}") for i in ids]
+        elif "name_norm LIKE :pat" in sql:
+            pat = params["pat"].strip("%")
+            rows = []
+            for key, vals in self.like.items():
+                if key in pat or pat in key:
+                    rows.extend(SimpleNamespace(id=i, name=n) for i, n in vals)
+        else:
+            rows = []
+
+        class _Result:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def fetchall(self):
+                return self._rows
+
+        return _Result(rows)
+
+
+def test_match_entities_candidates_exact_then_like():
+    session = _CandidatesSession(
+        exact={"red neuronal": [1]},
+        like={"red": [(2, "Red de Petri"), (3, "Red Social")]},
+    )
+    groups = match_entities_candidates(session, ["Red Neuronal", "red"])
+    assert groups == [[1], [2, 3]]
+
+
+def test_match_entities_candidates_no_match_skips():
+    session = _CandidatesSession(exact={}, like={})
+    assert match_entities_candidates(session, ["nada que ver"]) == []
+
+
+# ---------------------------------------------------------------------
+# grounded_entity_linking (opt 1)
+# ---------------------------------------------------------------------
+
+
+def test_grounded_entity_linking_llm_selects_from_pool(monkeypatch):
+    import src.kag_query as kq
+
+    # Pool determinista: "red neuronal" y "red de petri" (vía LIKE).
+    session = _CandidatesSession(
+        exact={},
+        like={
+            "red neuronal": [(1, "Red Neuronal")],
+            "red de petri": [(2, "Red de Petri")],
+        },
+    )
+
+    # spaCy no disponible → _noun_chunk_fallback degrada a determinista.
+    def fake_get_spacy(session, lang):
+        raise RuntimeError("no spacy")
+
+    monkeypatch.setattr(kq, "_get_spacy_nlp", fake_get_spacy)
+
+    monkeypatch.setattr(
+        kq,
+        "load_settings",
+        lambda session: SimpleNamespace(llm_retries=3, fallback_model=None),
+    )
+
+    captured = {}
+
+    def fake_call(
+        session,
+        *,
+        prompt,
+        system,
+        model_size,
+        response_format,
+        retries,
+        fallback_model=None,
+    ):
+        captured["prompt"] = prompt
+        return '{"entities": ["Red Neuronal"]}', "small", False
+
+    monkeypatch.setattr(kq, "call_with_retries", fake_call)
+
+    names = grounded_entity_linking(session, "¿Qué usa la red neuronal?")
+    assert names == ["Red Neuronal"]
+    # El prompt incluye el pool de candidatos.
+    assert "Red Neuronal" in captured["prompt"]
+    assert "Red de Petri" in captured["prompt"]
+
+
+def test_grounded_entity_linking_llm_fails_returns_pool(monkeypatch):
+    import src.kag_query as kq
+
+    session = _CandidatesSession(
+        exact={},
+        like={"red neuronal": [(1, "Red Neuronal")]},
+    )
+
+    def fake_get_spacy(session, lang):
+        raise RuntimeError("no spacy")
+
+    monkeypatch.setattr(kq, "_get_spacy_nlp", fake_get_spacy)
+
+    monkeypatch.setattr(
+        kq,
+        "load_settings",
+        lambda session: SimpleNamespace(llm_retries=3, fallback_model=None),
+    )
+
+    def fake_call(
+        session,
+        *,
+        prompt,
+        system,
+        model_size,
+        response_format,
+        retries,
+        fallback_model=None,
+    ):
+        raise RuntimeError("LLM caído")
+
+    monkeypatch.setattr(kq, "call_with_retries", fake_call)
+
+    names = grounded_entity_linking(session, "¿Qué usa la red neuronal?")
+    assert names == ["Red Neuronal"]  # pool determinista como degradación
+
+
+def test_grounded_entity_linking_empty_pool(monkeypatch):
+    import src.kag_query as kq
+
+    session = _CandidatesSession(exact={}, like={})
+
+    def fake_get_spacy(session, lang):
+        raise RuntimeError("no spacy")
+
+    monkeypatch.setattr(kq, "_get_spacy_nlp", fake_get_spacy)
+
+    assert grounded_entity_linking(session, "sin entidades aquí") == []
+
+
+def test_grounded_entity_linking_filters_out_of_pool(monkeypatch):
+    import src.kag_query as kq
+
+    # Pool: solo "Red Neuronal". El LLM alucina "Red de Petri" (fuera del pool).
+    session = _CandidatesSession(
+        exact={},
+        like={"red neuronal": [(1, "Red Neuronal")]},
+    )
+
+    def fake_get_spacy(session, lang):
+        raise RuntimeError("no spacy")
+
+    monkeypatch.setattr(kq, "_get_spacy_nlp", fake_get_spacy)
+    monkeypatch.setattr(
+        kq,
+        "load_settings",
+        lambda session: SimpleNamespace(llm_retries=3, fallback_model=None),
+    )
+
+    def fake_call(
+        session,
+        *,
+        prompt,
+        system,
+        model_size,
+        response_format,
+        retries,
+        fallback_model=None,
+    ):
+        return '{"entities": ["Red de Petri"]}', "small", False
+
+    monkeypatch.setattr(kq, "call_with_retries", fake_call)
+
+    # El nombre fuera del pool se descarta → cae al pool determinista.
+    names = grounded_entity_linking(session, "¿Qué usa la red neuronal?")
+    assert names == ["Red Neuronal"]
+
+
+def test_disambiguate_empty_adjacency_does_not_crash():
+    # C2: adjacency vacío + mención ambigua con confirmada → no ValueError.
+    groups = [[1], [2, 3]]
+    result = disambiguate_by_cooccurrence(None, groups, adjacency={})
+    assert result == [1, 2]  # default=g[0] para la ambigua
+
+
+def test_noun_chunk_fallback_no_phrases_degrades(monkeypatch):
+    import src.kag_query as kq
+
+    class _FakeNlp:
+        def __call__(self, text):
+            return _FakeDoc()
+
+    class _FakeDoc:
+        noun_chunks = []
+
+        def __iter__(self):
+            return iter([])
+
+    session = _CandidatesSession(
+        exact={},
+        like={"calcula": [(5, "Cálculo")]},
+    )
+
+    monkeypatch.setattr(kq, "_get_spacy_nlp", lambda session, lang: _FakeNlp())
+
+    # Sin noun chunks ni PROPN → degrada al fallback determinista por tokens.
+    found = kq._noun_chunk_fallback(session, "¿Cómo se calcula?")
+    assert found == ["Cálculo"]
+
+
+# ---------------------------------------------------------------------
+# hybrid_search (opt 4) — degradación sin FTS
+# ---------------------------------------------------------------------
+
+
+def test_hybrid_search_degrades_to_dense_when_fts_missing(monkeypatch):
+    from sqlalchemy.exc import ProgrammingError
+
+    import src.kag_query as kq
+
+    class _FakeSession:
+        def rollback(self):
+            pass
+
+    session = _FakeSession()
+
+    def fake_vector(session, q_emb, top_k):
+        return [(1, 0.9), (2, 0.8)]
+
+    def fake_fts(session, query_text, top_k):
+        raise ProgrammingError(
+            "stmt", {}, Exception("column content_tsv does not exist")
+        )
+
+    monkeypatch.setattr(kq, "vector_search", fake_vector)
+    monkeypatch.setattr(kq, "fts_search", fake_fts)
+
+    hits = hybrid_search(session, "pregunta", [0.1, 0.2], top_k=5)
+    assert hits == [(1, 0.9), (2, 0.8)]
+
+
+def test_hybrid_search_propagates_non_fts_errors(monkeypatch):
+    import src.kag_query as kq
+
+    class _FakeSession:
+        def rollback(self):
+            pass
+
+    session = _FakeSession()
+
+    def fake_vector(session, q_emb, top_k):
+        return [(1, 0.9)]
+
+    def fake_fts(session, query_text, top_k):
+        raise RuntimeError("otro error real")
+
+    monkeypatch.setattr(kq, "vector_search", fake_vector)
+    monkeypatch.setattr(kq, "fts_search", fake_fts)
+
+    with pytest.raises(RuntimeError, match="otro error real"):
+        hybrid_search(session, "pregunta", [0.1, 0.2], top_k=5)
+
+
+def test_fts_search_empty_query_returns_empty(monkeypatch):
+    import src.kag_query as kq
+
+    def fake_execute(stmt, params=None):
+        raise AssertionError("no debería ejecutar SQL con query vacía")
+
+    class _FakeSession:
+        def execute(self, stmt, params=None):
+            return fake_execute(stmt, params)
+
+    assert kq.fts_search(_FakeSession(), "", 5) == []
+    assert kq.fts_search(_FakeSession(), "   ", 5) == []
+
+
+def test_hybrid_search_merges_dense_and_sparse(monkeypatch):
+    import src.kag_query as kq
+
+    class _FakeSession:
+        def rollback(self):
+            pass
+
+    session = _FakeSession()
+
+    def fake_vector(session, q_emb, top_k):
+        return [(1, 0.9), (2, 0.8)]
+
+    def fake_fts(session, query_text, top_k):
+        return [(2, 5.0), (3, 4.0)]
+
+    monkeypatch.setattr(kq, "vector_search", fake_vector)
+    monkeypatch.setattr(kq, "fts_search", fake_fts)
+
+    hits = hybrid_search(session, "pregunta", [0.1, 0.2], top_k=5)
+    ids = [cid for cid, _ in hits]
+    assert 1 in ids and 2 in ids and 3 in ids
+    # El chunk 2 (rank 2 denso + rank 1 sparse) debe liderar.
+    assert hits[0][0] == 2

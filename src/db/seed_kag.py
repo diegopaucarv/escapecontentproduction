@@ -21,11 +21,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+from pathlib import Path
 
 from sqlalchemy import select, text
 
 from src.db.models import ApiKey, LlmModel
-from src.db.session import SessionLocal
 
 # ---------------------------------------------------------------------
 # Configuración del segmentador (tabla kag_segmenter_settings)
@@ -163,6 +164,25 @@ def _upsert_segmenter_settings(session, data: dict) -> int:
     return row.id
 
 
+def _fix_db_host() -> None:
+    """Reemplaza '@db:' por '@localhost:' en DATABASE_URL/DATABASE_URL_ASYNC.
+
+    El host 'db' es la red Docker y no resuelve desde el host; las credenciales
+    son las mismas. Debe llamarse ANTES de importar src.db.session.
+    """
+    env_path = Path(__file__).resolve().parent.parent.parent / ".env"
+    for var in ("DATABASE_URL", "DATABASE_URL_ASYNC"):
+        val = os.environ.get(var, "")
+        if not val and env_path.exists():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith(f"{var}="):
+                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
+        if "@db:" in val:
+            os.environ[var] = val.replace("@db:", "@localhost:")
+
+
 def seed(session=None) -> dict:
     """Inserta/actualiza la config del segmentador, el modelo local y la key.
 
@@ -170,6 +190,9 @@ def seed(session=None) -> dict:
     """
     own_session = session is None
     if own_session:
+        _fix_db_host()
+        from src.db.session import SessionLocal
+
         session = SessionLocal()
     try:
         settings_id = _upsert_segmenter_settings(session, SEGMENTER_SETTINGS)
@@ -192,6 +215,7 @@ def main() -> None:
         description="Seed del sistema KAG (segmentador + modelo local Qwen 2.5)."
     )
     parser.parse_args()
+    _fix_db_host()
     result = seed()
     print("Sistema KAG listo:")
     print(f"  Segmenter settings: {result['segmenter_settings_id']}")

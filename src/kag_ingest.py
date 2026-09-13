@@ -221,14 +221,25 @@ def detect_language(text: str) -> str:
 # ---------------------------------------------------------------------
 
 
-def chunk_markdown(md_text, doc_type, segmenter, max_tokens=CHUNK_MAX_TOKENS):
+def chunk_markdown(
+    md_text, doc_type, segmenter, max_tokens=CHUNK_MAX_TOKENS, use_coref=True
+):
     """Parte el markdown por encabezados y segmenta cada sección.
 
     - short: parte por `#`, `##`, `###` preservando section_path.
     - long:  pre-segmenta por `#`, `##` (acota cada llamada al segmentador).
 
-    Cada segmento del segmenter es un chunk. Devuelve lista de dicts
-    {"content", "section_path", "token_estimate"}.
+    El segmentador produce cortes semánticos (a veces muy pequeños, ~50-100
+    tokens). Para la ingesta KAG fusionamos segmentos adyacentes de la MISMA
+    sección hasta `max_tokens` (respetando los cortes del segmentador como
+    fronteras duras): reduce el número de chunks (y de llamadas LLM de
+    extracción) sin perder los límites semánticos.
+
+    `use_coref=False` omite la resolución de correferencias del segmentador
+    (monkeypatch temporal en la instancia): el coref Stanza cuesta ~11s por
+    segmento y es prohibitivo en book stacks; los docs cortos sí lo usan.
+
+    Devuelve lista de dicts {"content", "section_path", "token_estimate"}.
     """
     max_level = 2 if doc_type == "long" else 3
     sections = []  # (section_path, content)
@@ -255,21 +266,52 @@ def chunk_markdown(md_text, doc_type, segmenter, max_tokens=CHUNK_MAX_TOKENS):
     if not sections:
         sections = [("", md_text.strip())]
 
-    chunks = []
-    for section_path, content in sections:
-        segments = segmenter.segment_text(content, max_tokens=max_tokens)
-        for seg in segments:
-            seg = seg.strip()
-            if not seg:
-                continue
-            chunks.append(
-                {
-                    "content": seg,
-                    "section_path": section_path,
-                    "token_estimate": estimate_tokens(seg),
-                }
-            )
-    return chunks
+    # Coref opcional: no-op temporal en la instancia (no se modifica el
+    # segmentador; el método original se restaura al salir).
+    _orig_resolve = getattr(segmenter, "resolve_coreferences", None)
+    if not use_coref and _orig_resolve is not None:
+        segmenter.resolve_coreferences = lambda segments: segments  # noqa: E731
+    try:
+        chunks = []
+        for section_path, content in sections:
+            segments = segmenter.segment_text(content, max_tokens=max_tokens)
+            buffer = ""
+            buffer_tokens = 0
+            for seg in segments:
+                seg = seg.strip()
+                if not seg:
+                    continue
+                seg_tokens = estimate_tokens(seg)
+                # Fusiona hasta max_tokens; un segmento que ya excede se
+                # inserta solo (el segmentador ya lo cortó quirúrgicamente).
+                if buffer and buffer_tokens + seg_tokens > max_tokens:
+                    chunks.append(
+                        {
+                            "content": buffer,
+                            "section_path": section_path,
+                            "token_estimate": estimate_tokens(buffer),
+                        }
+                    )
+                    buffer = ""
+                    buffer_tokens = 0
+                if buffer:
+                    buffer += "\n\n" + seg
+                    buffer_tokens += seg_tokens
+                else:
+                    buffer = seg
+                    buffer_tokens = seg_tokens
+            if buffer:
+                chunks.append(
+                    {
+                        "content": buffer,
+                        "section_path": section_path,
+                        "token_estimate": estimate_tokens(buffer),
+                    }
+                )
+        return chunks
+    finally:
+        if _orig_resolve is not None:
+            segmenter.resolve_coreferences = _orig_resolve
 
 
 # ---------------------------------------------------------------------
@@ -385,7 +427,9 @@ def extract_entities_relations(session, chunk_text):
     settings = load_settings(session)
     retries = int(getattr(settings, "llm_retries", 3) or 3) if settings else 3
     fallback = getattr(settings, "fallback_model", None) if settings else None
-    prompt = EXTRACT_PROMPT.format(chunk=chunk_text[:8000])
+    # str.replace en vez de .format(): el prompt contiene llaves JSON literales
+    # que .format() interpretaría como placeholders (KeyError).
+    prompt = EXTRACT_PROMPT.replace("{chunk}", chunk_text[:8000])
     try:
         text_out, _model, _used_fallback = call_with_retries(
             session,
@@ -638,9 +682,12 @@ def index_document(session, md_path, force=False, no_summary=False, verbose=True
     if not md_path.exists():
         raise FileNotFoundError(f"No existe {md_path}")
     doc_path = str(md_path.relative_to(DOCS_DIR)).replace("\\", "/")
-    text = md_path.read_text(encoding="utf-8")
-    content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
-    token_estimate = estimate_tokens(text)
+    # OJO: la variable se llama md_text (NO text) para no sombrear la función
+    # text() de SQLAlchemy — un bug previo rompía la ingesta con
+    # "'str' object is not callable" en el primer SELECT.
+    md_text = md_path.read_text(encoding="utf-8")
+    content_hash = hashlib.sha256(md_text.encode("utf-8")).hexdigest()
+    token_estimate = estimate_tokens(md_text)
     doc_type = "long" if token_estimate >= LONG_DOC_THRESHOLD else "short"
 
     existing = session.execute(
@@ -658,35 +705,48 @@ def index_document(session, md_path, force=False, no_summary=False, verbose=True
         )
         session.commit()
 
-    title = _title_from_md(text, doc_path)
-    doc_id = session.execute(
-        text(
-            "INSERT INTO kag_documents "
-            "(doc_path, title, doc_type, status, content_hash, token_estimate) "
-            "VALUES (:doc_path, :title, :doc_type, 'pending', :content_hash, "
-            ":token_estimate) RETURNING id"
-        ),
-        {
-            "doc_path": doc_path,
-            "title": title,
-            "doc_type": doc_type,
-            "content_hash": content_hash,
-            "token_estimate": token_estimate,
-        },
-    ).scalar()
-    session.commit()
-
+    title = _title_from_md(md_text, doc_path)
+    doc_id = None
     try:
+        # El INSERT va DENTRO del try: si algo falla temprano (p. ej. descarga
+        # de modelos del segmentador), la fila queda con status='failed' y el
+        # error visible en la DB en lugar de desaparecer sin rastro.
+        doc_id = session.execute(
+            text(
+                "INSERT INTO kag_documents "
+                "(doc_path, title, doc_type, status, content_hash, token_estimate) "
+                "VALUES (:doc_path, :title, :doc_type, 'pending', :content_hash, "
+                ":token_estimate) RETURNING id"
+            ),
+            {
+                "doc_path": doc_path,
+                "title": title,
+                "doc_type": doc_type,
+                "content_hash": content_hash,
+                "token_estimate": token_estimate,
+            },
+        ).scalar()
+        session.commit()
+
         # Segmentación (import perezoso: el segmentador carga torch/spacy).
         from src.kag.segmentador import build_segmenter
 
-        lang = detect_language(text)
+        lang = detect_language(md_text)
         if verbose:
             print(
                 f"[KAG] 📄 {doc_path} | {doc_type} | ~{token_estimate} tokens | idioma {lang}"
             )
         segmenter = build_segmenter(session, lang=lang, verbose=verbose)
-        chunks = chunk_markdown(text, doc_type, segmenter, max_tokens=CHUNK_MAX_TOKENS)
+        # Coref Stanza: docs cortos lo usan (costo acotado); book stacks lo
+        # omiten (prohibitivo: ~11s por segmento).
+        use_coref = doc_type == "short"
+        chunks = chunk_markdown(
+            md_text,
+            doc_type,
+            segmenter,
+            max_tokens=CHUNK_MAX_TOKENS,
+            use_coref=use_coref,
+        )
 
         chunk_count = 0
         for i, chunk in enumerate(chunks):
@@ -731,12 +791,12 @@ def index_document(session, md_path, force=False, no_summary=False, verbose=True
             {"id": doc_id},
         ).scalar()
 
-        figure_count = _index_figures(session, doc_id, md_path, text, verbose)
+        figure_count = _index_figures(session, doc_id, md_path, md_text, verbose)
         session.commit()
 
         summary = ""
         if not no_summary:
-            summary = summarize_document(session, text, doc_type)
+            summary = summarize_document(session, md_text, doc_type)
 
         session.execute(
             text(
@@ -771,13 +831,27 @@ def index_document(session, md_path, force=False, no_summary=False, verbose=True
         }
     except Exception as exc:  # marcar failed y re-lanzar
         session.rollback()
+        # El rollback deshizo el INSERT: re-insertar (o actualizar) la fila
+        # con status='failed' para que el error quede visible en la DB.
         try:
             session.execute(
                 text(
-                    "UPDATE kag_documents SET status = 'failed', error = :err, "
-                    "updated_at = now() WHERE id = :id"
+                    "INSERT INTO kag_documents "
+                    "(doc_path, title, doc_type, status, content_hash, "
+                    "token_estimate, error) "
+                    "VALUES (:doc_path, :title, :doc_type, 'failed', "
+                    ":content_hash, :token_estimate, :err) "
+                    "ON CONFLICT (doc_path) DO UPDATE SET status = 'failed', "
+                    "error = :err, updated_at = now()"
                 ),
-                {"err": str(exc)[:500], "id": doc_id},
+                {
+                    "doc_path": doc_path,
+                    "title": title,
+                    "doc_type": doc_type,
+                    "content_hash": content_hash,
+                    "token_estimate": token_estimate,
+                    "err": str(exc)[:500],
+                },
             )
             session.commit()
         except Exception:  # noqa: BLE001 — no bloquea el re-lanzamiento

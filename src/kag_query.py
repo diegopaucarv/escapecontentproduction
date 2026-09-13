@@ -20,11 +20,17 @@ import argparse
 import os
 import re
 import sys
+import threading
 from pathlib import Path
 
 from sqlalchemy import bindparam, text
+from sqlalchemy.exc import ProgrammingError
 
-from src.kag_ingest import embedding_to_sql, normalize_entity_name
+from src.kag_ingest import (
+    detect_language,
+    embedding_to_sql,
+    normalize_entity_name,
+)
 from src.llm.base import call_with_retries, load_settings, parse_llm_output
 
 # ---------------------------------------------------------------------
@@ -89,16 +95,6 @@ def classify_query(query: str) -> str:
 # ---------------------------------------------------------------------
 # Entity linking
 # ---------------------------------------------------------------------
-
-QUERY_ENTITIES_PROMPT = """Extrae las entidades (conceptos, métodos, personas, organizaciones) mencionadas en la pregunta.
-
-Devuelve SOLO JSON:
-{"entities": ["Entidad 1", "Entidad 2"]}
-
-Si no hay entidades claras, devuelve {"entities": []}.
-
-Pregunta: {query}
-"""
 
 # Stopwords planas para el fallback determinista de entity linking.
 _QUERY_STOPWORDS = {
@@ -176,20 +172,131 @@ def _deterministic_entity_fallback(session, query: str) -> list:
     return found[:10]
 
 
-def extract_query_entities(session, query: str) -> list:
-    """Extrae las entidades de la pregunta con el modelo pequeño.
+# ---------------------------------------------------------------------
+# Fallback con noun chunks de spaCy (opt 3)
+# ---------------------------------------------------------------------
 
-    Si el LLM falla (o no devuelve entidades), fallback determinista por
-    substring contra name_norm. Devuelve lista de nombres.
+# Modelos spaCy por idioma (mismos defaults que src/kag/segmentador.py).
+# Se duplican aquí a propósito: importar el segmentador cargaría torch/spacy
+# a nivel de módulo, y kag_query.py es LIGERO a propósito.
+_SPACY_MODELS = {
+    "es": "es_core_news_md",
+    "en": "en_core_web_md",
+    "pt": "pt_core_news_md",
+    "de": "de_core_news_md",
+    "fr": "fr_core_news_md",
+}
+
+_spacy_nlp_cache: dict = {}
+_spacy_nlp_lock = threading.Lock()
+
+
+def _spacy_model_for(session, lang: str) -> str:
+    """Modelo spaCy del idioma desde kag_segmenter_settings (fallback local)."""
+    try:
+        row = session.execute(
+            text(
+                "SELECT spacy_models FROM kag_segmenter_settings "
+                "WHERE is_active = TRUE ORDER BY id DESC LIMIT 1"
+            )
+        ).first()
+        if row and row.spacy_models and lang in row.spacy_models:
+            return row.spacy_models[lang]
+    except Exception:  # noqa: BLE001 — sin config: defaults locales
+        pass
+    return _SPACY_MODELS.get(lang, "es_core_news_md")
+
+
+def _get_spacy_nlp(session, lang: str):
+    """Carga spaCy perezosamente (el módulo es ligero) y cachea por idioma."""
+    if lang in _spacy_nlp_cache:
+        return _spacy_nlp_cache[lang]
+    with _spacy_nlp_lock:
+        if lang in _spacy_nlp_cache:
+            return _spacy_nlp_cache[lang]
+        import spacy
+
+        model = _spacy_model_for(session, lang)
+        nlp = spacy.load(model)
+        _spacy_nlp_cache[lang] = nlp
+        return nlp
+
+
+def _noun_chunk_fallback(session, query: str) -> list:
+    """Fallback con noun chunks de spaCy: frases nominales completas.
+
+    Mejor granularidad que tokens sueltos para entidades multi-palabra
+    ("red neuronal" no se parte). Si spaCy no está disponible o no
+    encuentra frases, degrada al fallback determinista por tokens.
     """
+    lang = detect_language(query)
+    try:
+        nlp = _get_spacy_nlp(session, lang)
+    except Exception:  # noqa: BLE001 — spaCy no disponible: degradación
+        return _deterministic_entity_fallback(session, query)
+    doc = nlp(query)
+    phrases = [chunk.text for chunk in doc.noun_chunks]
+    phrases += [tok.text for tok in doc if tok.pos_ == "PROPN"]
+    if not phrases:
+        return _deterministic_entity_fallback(session, query)
+    found = []
+    for phrase in phrases:
+        nn = normalize_entity_name(phrase)
+        if len(nn) < 3:
+            continue
+        rows = session.execute(
+            text(
+                "SELECT DISTINCT name FROM kag_entities "
+                "WHERE name_norm LIKE :pat LIMIT 5"
+            ),
+            {"pat": f"%{nn}%"},
+        ).fetchall()
+        for r in rows:
+            if r.name not in found:
+                found.append(r.name)
+    return found[:10]
+
+
+# ---------------------------------------------------------------------
+# Entity linking anclado (opt 1)
+# ---------------------------------------------------------------------
+
+GROUNDED_ENTITIES_PROMPT = """Entidades candidatas del grafo de conocimiento:
+{candidates}
+
+Pregunta: {query}
+
+Devuelve SOLO JSON:
+{{"entities": ["Entidad 1", "Entidad 2"]}}
+
+Elige SOLO de la lista de candidatas. Si ninguna se menciona en la
+pregunta, devuelve {{"entities": []}}.
+"""
+
+
+def grounded_entity_linking(session, query: str) -> list:
+    """Entity linking anclado: el LLM selecciona entidades canónicas SOLO
+    entre los candidatos reales del grafo (pre-filtro determinista).
+
+    Elimina el LIKE de la vía principal: el LLM devuelve nombres que ya
+    existen en kag_entities → el match exacto basta. Los nombres que el
+    LLM devuelva FUERA del pool se descartan (anclaje real, no cosmético).
+    Si el LLM falla, devuelve el pool de candidatos (degradación natural).
+    """
+    candidates = _noun_chunk_fallback(session, query)
+    if not candidates:
+        return []
     settings = load_settings(session)
     retries = int(getattr(settings, "llm_retries", 3) or 3) if settings else 3
     fallback = getattr(settings, "fallback_model", None) if settings else None
     try:
         text_out, _model, _used_fallback = call_with_retries(
             session,
-            prompt=QUERY_ENTITIES_PROMPT.format(query=query),
-            system="Eres un extractor de entidades. Devuelve JSON válido.",
+            prompt=GROUNDED_ENTITIES_PROMPT.format(
+                candidates="\n".join(f"- {c}" for c in candidates),
+                query=query,
+            ),
+            system="Eres un selector de entidades. Devuelve JSON válido.",
             model_size="small",
             response_format={"type": "json_object"},
             retries=retries,
@@ -197,33 +304,76 @@ def extract_query_entities(session, query: str) -> list:
         )
         data = parse_llm_output(text_out)
         names = [str(e).strip() for e in (data.get("entities") or []) if str(e).strip()]
-        if names:
-            return names
-    except Exception:  # noqa: BLE001 — LLM no disponible: fallback determinista
+        # Anclaje real: solo nombres que están en el pool (normalizados).
+        pool_norm = {normalize_entity_name(c) for c in candidates}
+        anchored = [n for n in names if normalize_entity_name(n) in pool_norm]
+        if anchored:
+            return anchored
+    except Exception:  # noqa: BLE001 — LLM no disponible: pool determinista
         pass
-    return _deterministic_entity_fallback(session, query)
+    return candidates
 
 
-def match_entities(session, names: list) -> list:
-    """Match exacto por name_norm, luego LIKE. Devuelve lista de ids (dedup)."""
-    ids = []
+def match_entities_candidates(session, names: list) -> list:
+    """Candidatos por mención: lista de listas de ids.
+
+    Exacto por name_norm primero; si no hay, LIKE (hasta 5). Cada mención
+    puede tener 0..N candidatos — la desambiguación por copresencia decide.
+    """
+    groups = []
     for name in names:
         nn = normalize_entity_name(name)
-        row = session.execute(
-            text("SELECT id FROM kag_entities WHERE name_norm = :nn LIMIT 1"),
+        group = []
+        rows = session.execute(
+            text("SELECT id FROM kag_entities WHERE name_norm = :nn"),
             {"nn": nn},
-        ).first()
-        if row:
-            ids.append(row.id)
-            continue
-        row = session.execute(
-            text("SELECT id FROM kag_entities WHERE name_norm LIKE :pat LIMIT 1"),
-            {"pat": f"%{nn}%"},
-        ).first()
-        if row:
-            ids.append(row.id)
-    seen = set()
-    return [i for i in ids if not (i in seen or seen.add(i))]
+        ).fetchall()
+        group.extend(r.id for r in rows)
+        if not group:
+            rows = session.execute(
+                text("SELECT id FROM kag_entities WHERE name_norm LIKE :pat LIMIT 5"),
+                {"pat": f"%{nn}%"},
+            ).fetchall()
+            group.extend(r.id for r in rows)
+        # Dedup dentro del grupo (el LIKE puede solaparse con el exacto).
+        group = list(dict.fromkeys(group))
+        if group:
+            groups.append(group)
+    return groups
+
+
+def disambiguate_by_cooccurrence(session, groups: list, adjacency=None) -> list:
+    """Desambiguación por copresencia en el grafo.
+
+    Para cada mención con varios candidatos, elige el que comparte más
+    vecinos (a 1 salto) con las entidades confirmadas (menciones con un
+    solo candidato). Sin entidades confirmadas, conserva el primer
+    candidato de cada mención (no hay señal de copresencia).
+    """
+    if not groups:
+        return []
+    confirmed = {g[0] for g in groups if len(g) == 1}
+    if not confirmed:
+        return list(dict.fromkeys(g[0] for g in groups))
+    if adjacency is None:
+        adjacency = build_adjacency(session)
+    confirmed_neighbors = set()
+    for eid in confirmed:
+        confirmed_neighbors.update(adjacency.get(eid, {}).keys())
+    result = []
+    for g in groups:
+        if len(g) == 1:
+            result.append(g[0])
+        else:
+            best = max(
+                g,
+                key=lambda c: len(
+                    confirmed_neighbors & set(adjacency.get(c, {}).keys())
+                ),
+                default=g[0],  # sin vecinos compartidos: primer candidato
+            )
+            result.append(best)
+    return list(dict.fromkeys(result))
 
 
 # ---------------------------------------------------------------------
@@ -318,6 +468,66 @@ def vector_search(session, query_embedding, top_k):
         {"q": q, "top_k": top_k},
     ).fetchall()
     return [(r.id, float(r.score)) for r in rows]
+
+
+# ---------------------------------------------------------------------
+# Búsqueda híbrida: densa + léxica (FTS) + RRF (opt 4)
+# ---------------------------------------------------------------------
+
+
+def rrf_merge(dense_hits, sparse_hits, k=60, top_k=20):
+    """Fusión de rankings por Reciprocal Rank Fusion (RRF).
+
+    dense_hits/sparse_hits: listas de (id, score) ordenadas por relevancia
+    (la posición 1-based es el rank). Devuelve lista de (id, rrf_score)
+    ordenada desc, limitada a top_k.
+    """
+    scores = {}
+    for rank, (cid, _score) in enumerate(dense_hits, start=1):
+        scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank)
+    for rank, (cid, _score) in enumerate(sparse_hits, start=1):
+        scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank)
+    return sorted(scores.items(), key=lambda x: -x[1])[:top_k]
+
+
+def fts_search(session, query_text, top_k):
+    """Búsqueda léxica con FTS de Postgres (ts_rank_cd sobre content_tsv).
+
+    Requiere la migración 0014 (columna generada content_tsv + índice GIN).
+    Config 'simple' a propósito: agnóstica de idioma (el corpus es
+    multilingüe) y sin stemming (ideal para términos exactos: acrónimos,
+    códigos, nombres propios). Query vacía o sin tokens → [] (sin error).
+    """
+    if not query_text or not query_text.strip():
+        return []
+    rows = session.execute(
+        text(
+            "SELECT id, ts_rank_cd(content_tsv, plainto_tsquery('simple', :q)) "
+            "AS score FROM kag_chunks "
+            "WHERE content_tsv @@ plainto_tsquery('simple', :q) "
+            "ORDER BY score DESC LIMIT :top_k"
+        ),
+        {"q": query_text, "top_k": top_k},
+    ).fetchall()
+    return [(r.id, float(r.score)) for r in rows]
+
+
+def hybrid_search(session, query_text, query_embedding, top_k, rrf_k=60, verbose=False):
+    """Búsqueda híbrida: densa (pgvector) + léxica (FTS) + RRF.
+
+    Si la migración 0014 no está aplicada (columna content_tsv ausente,
+    ProgrammingError), degrada a solo búsqueda densa. Otros errores se
+    propagan al caller (ask() los degrada a vec_hits=[]).
+    """
+    dense_hits = vector_search(session, query_embedding, top_k)
+    try:
+        sparse_hits = fts_search(session, query_text, top_k)
+    except ProgrammingError as exc:  # migración 0014 sin aplicar
+        session.rollback()
+        if verbose:
+            print(f"[KAG] ⚠ FTS no disponible ({exc}); solo búsqueda densa.")
+        return dense_hits
+    return rrf_merge(dense_hits, sparse_hits, k=rrf_k, top_k=top_k)
 
 
 def chunks_for_entities(session, entity_ids, top_n):
@@ -507,37 +717,38 @@ def ask(session, query, top_k=8, global_top_k=20, verbose=True):
     if verbose:
         print(f"[KAG] Clasificación: {qtype} (top_k={k})")
 
-    # 2. Vector search
+    # 2. Búsqueda híbrida (densa + FTS + RRF)
     try:
         # Import perezoso: src.embeddings importa src.db.session (que lee .env
         # al importar) — debe ocurrir DESPUÉS de _fix_db_host().
         from src.embeddings import embed_text
 
         q_emb = embed_text(query, input_type="query")
-        vec_hits = vector_search(session, q_emb, k)
+        vec_hits = hybrid_search(session, query, q_emb, k, verbose=verbose)
     except Exception as exc:  # noqa: BLE001 — degradación natural
         session.rollback()  # la transacción queda abortada tras el error
         if verbose:
-            print(f"[KAG] ⚠ Vector search falló: {exc}")
+            print(f"[KAG] ⚠ Búsqueda híbrida falló: {exc}")
         vec_hits = []
     if verbose:
-        print(f"[KAG] Vector search: {len(vec_hits)} chunks")
+        print(f"[KAG] Búsqueda híbrida: {len(vec_hits)} chunks")
         for cid, score in vec_hits[:5]:
             print(f"    - chunk {cid}: score {score:.4f}")
 
-    # 3. Entity linking
-    names = extract_query_entities(session, query)
-    entity_ids = match_entities(session, names)
+    # 3. Entity linking (anclado + copresencia)
+    names = grounded_entity_linking(session, query)
+    groups = match_entities_candidates(session, names)
+    adj = build_adjacency(session) if groups else {}
+    entity_ids = disambiguate_by_cooccurrence(session, groups, adjacency=adj)
     if verbose:
         print(
             f"[KAG] Entity linking: {len(names)} nombres → "
-            f"{len(entity_ids)} entidades matcheadas"
+            f"{len(entity_ids)} entidades (tras copresencia)"
         )
 
     # 4. PPR (HippoRAG)
     ppr_scores = {}
     if entity_ids:
-        adj = build_adjacency(session)
         ppr_scores = personalized_pagerank(adj, entity_ids)
         if verbose:
             top_ppr = sorted(ppr_scores.items(), key=lambda x: -x[1])[:5]
