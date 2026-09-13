@@ -20,15 +20,28 @@ def _fix_db_host() -> None:
     """Reemplaza '@db:' por '@localhost:' en DATABASE_URL/DATABASE_URL_ASYNC.
 
     El host 'db' es la red Docker y no resuelve desde el host; las credenciales
-    son las mismas. Debe llamarse ANTES de importar src.db.session.
+    son las mismas. Debe llamarse ANTES de importar src.db.session. Si la
+    variable no está en el entorno, la lee del .env (pydantic-settings da
+    prioridad a las env vars reales sobre el archivo .env).
     """
+    env_path = Path(__file__).resolve().parent.parent / ".env"
     for var in ("DATABASE_URL", "DATABASE_URL_ASYNC"):
         val = os.environ.get(var, "")
+        if not val and env_path.exists():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith(f"{var}="):
+                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
         if "@db:" in val:
             os.environ[var] = val.replace("@db:", "@localhost:")
 
 
 def main() -> None:
+    # Windows: la consola usa cp1252 y no imprime emojis — forzar UTF-8.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(description="Demo del sistema KAG.")
     parser.add_argument(
         "query",

@@ -19,11 +19,12 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import sys
+from pathlib import Path
 
 from sqlalchemy import bindparam, text
 
-from src.embeddings import embed_text
-from src.kag_ingest import normalize_entity_name
+from src.kag_ingest import embedding_to_sql, normalize_entity_name
 from src.llm.base import call_with_retries, load_settings, parse_llm_output
 
 # ---------------------------------------------------------------------
@@ -35,10 +36,19 @@ def _fix_db_host() -> None:
     """Reemplaza '@db:' por '@localhost:' en DATABASE_URL/DATABASE_URL_ASYNC.
 
     El host 'db' es la red Docker y no resuelve desde el host; las credenciales
-    son las mismas. Debe llamarse ANTES de importar src.db.session.
+    son las mismas. Debe llamarse ANTES de importar src.db.session. Si la
+    variable no está en el entorno, la lee del .env (pydantic-settings da
+    prioridad a las env vars reales sobre el archivo .env).
     """
+    env_path = Path(__file__).resolve().parent.parent / ".env"
     for var in ("DATABASE_URL", "DATABASE_URL_ASYNC"):
         val = os.environ.get(var, "")
+        if not val and env_path.exists():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith(f"{var}="):
+                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
         if "@db:" in val:
             os.environ[var] = val.replace("@db:", "@localhost:")
 
@@ -298,13 +308,14 @@ def personalized_pagerank(adjacency, seed, alpha=0.15, max_iter=50, tol=1e-6):
 
 def vector_search(session, query_embedding, top_k):
     """pgvector <=> (coseno). Devuelve lista de (chunk_id, score)."""
+    q = embedding_to_sql(query_embedding)
     rows = session.execute(
         text(
-            "SELECT id, 1 - (embedding <=> :q) AS score "
+            "SELECT id, 1 - (embedding <=> CAST(:q AS vector)) AS score "
             "FROM kag_chunks WHERE embedding IS NOT NULL "
-            "ORDER BY embedding <=> :q LIMIT :top_k"
+            "ORDER BY embedding <=> CAST(:q AS vector) LIMIT :top_k"
         ),
-        {"q": query_embedding, "top_k": top_k},
+        {"q": q, "top_k": top_k},
     ).fetchall()
     return [(r.id, float(r.score)) for r in rows]
 
@@ -498,9 +509,14 @@ def ask(session, query, top_k=8, global_top_k=20, verbose=True):
 
     # 2. Vector search
     try:
+        # Import perezoso: src.embeddings importa src.db.session (que lee .env
+        # al importar) — debe ocurrir DESPUÉS de _fix_db_host().
+        from src.embeddings import embed_text
+
         q_emb = embed_text(query, input_type="query")
         vec_hits = vector_search(session, q_emb, k)
     except Exception as exc:  # noqa: BLE001 — degradación natural
+        session.rollback()  # la transacción queda abortada tras el error
         if verbose:
             print(f"[KAG] ⚠ Vector search falló: {exc}")
         vec_hits = []
@@ -608,6 +624,10 @@ def ask(session, query, top_k=8, global_top_k=20, verbose=True):
 
 
 def main() -> None:
+    # Windows: la consola usa cp1252 y no imprime emojis — forzar UTF-8.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(
         description="Consulta KAG del knowledge_repository."
     )

@@ -25,12 +25,12 @@ import base64
 import hashlib
 import os
 import re
+import sys
 from pathlib import Path
 
 import httpx
 from sqlalchemy import text
 
-from src.embeddings import embed_text
 from src.llm.base import call_with_retries, load_settings, parse_llm_output
 from src.llm.together import complete_vision
 
@@ -55,10 +55,19 @@ def _fix_db_host() -> None:
     """Reemplaza '@db:' por '@localhost:' en DATABASE_URL/DATABASE_URL_ASYNC.
 
     El host 'db' es la red Docker y no resuelve desde el host; las credenciales
-    son las mismas. Debe llamarse ANTES de importar src.db.session.
+    son las mismas. Debe llamarse ANTES de importar src.db.session. Si la
+    variable no está en el entorno, la lee del .env (pydantic-settings da
+    prioridad a las env vars reales sobre el archivo .env).
     """
+    env_path = Path(__file__).resolve().parent.parent / ".env"
     for var in ("DATABASE_URL", "DATABASE_URL_ASYNC"):
         val = os.environ.get(var, "")
+        if not val and env_path.exists():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith(f"{var}="):
+                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
         if "@db:" in val:
             os.environ[var] = val.replace("@db:", "@localhost:")
 
@@ -71,6 +80,17 @@ def estimate_tokens(text: str) -> int:
 def normalize_entity_name(name: str) -> str:
     """Minúsculas + strip + colapsar espacios (clave de dedup)."""
     return " ".join(name.lower().strip().split())
+
+
+def embedding_to_sql(emb):
+    """Convierte una lista de floats a la sintaxis literal de pgvector.
+
+    psycopg2 adapta las listas Python a numeric[], que pgvector no acepta;
+    el literal '[0.1,0.2,...]' con CAST AS vector sí funciona.
+    """
+    if emb is None:
+        return None
+    return "[" + ",".join(repr(float(x)) for x in emb) + "]"
 
 
 # Stopwords por idioma para detect_language (heurística determinista).
@@ -670,6 +690,10 @@ def index_document(session, md_path, force=False, no_summary=False, verbose=True
 
         chunk_count = 0
         for i, chunk in enumerate(chunks):
+            # Import perezoso: src.embeddings importa src.db.session (que lee
+            # .env al importar) — debe ocurrir DESPUÉS de _fix_db_host().
+            from src.embeddings import embed_text
+
             try:
                 emb = embed_text(chunk["content"], input_type="document")
             except Exception as exc:  # noqa: BLE001 — chunk sin embedding
@@ -681,7 +705,8 @@ def index_document(session, md_path, force=False, no_summary=False, verbose=True
                     "INSERT INTO kag_chunks "
                     "(doc_id, chunk_index, section_path, content, token_estimate, "
                     "embedding) VALUES (:doc_id, :chunk_index, :section_path, "
-                    ":content, :token_estimate, :embedding) RETURNING id"
+                    ":content, :token_estimate, CAST(:embedding AS vector)) "
+                    "RETURNING id"
                 ),
                 {
                     "doc_id": doc_id,
@@ -689,7 +714,7 @@ def index_document(session, md_path, force=False, no_summary=False, verbose=True
                     "section_path": chunk["section_path"],
                     "content": chunk["content"],
                     "token_estimate": chunk["token_estimate"],
-                    "embedding": emb,
+                    "embedding": embedding_to_sql(emb),
                 },
             ).scalar()
             chunk_count += 1
@@ -789,6 +814,10 @@ def index_all(session, force=False, no_summary=False, verbose=True):
 
 
 def main() -> None:
+    # Windows: la consola usa cp1252 y no imprime emojis — forzar UTF-8.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(
         description="Ingesta KAG del knowledge_repository."
     )

@@ -1,7 +1,7 @@
 # Diseño — Sistema KAG Pragmático (Vector + Grafo de Entidades + HippoRAG)
 
 **Tipo de documento:** diseño de implementación — capa de conocimiento del pipeline
-**Estado:** spec inicial — se actualizará al final de la implementación para reflejar lo construido
+**Estado:** implementado y verificado (2026-09-13) — 21/21 tests, migración `0013_kag` aplicada, seed aplicado
 **Función:** indexar el `knowledge_repository` (`.md` + imágenes) y responder consultas locales y globales (_multi-hop_) sobre ese conocimiento, con el stack existente (Postgres + pgvector + Together) y la filosofía 0007.
 
 ---
@@ -12,7 +12,7 @@ Construimos un **KAG pragmático**: nada de Neo4j, nada de Leiden/Louvain, nada 
 
 > **Por qué HippoRAG y no GraphRAG:** la activación asociativa en 1–2 saltos (PPR simple sobre el grafo de entidades) supera a GraphRAG en precisión multi-hop con **órdenes de magnitud menos costo computacional** — no hay detección de comunidades ni resúmenes sintéticos por cluster. Para consultas globales usamos **resúmenes por documento** generados con un **LLM local ultra pequeño (Qwen 2.5 quantizado)**, mucho más baratos que los community summaries.
 
-**Segmentación:** usamos el segmentador propio del proyecto (`src/kag/segmentador.py`, `ProgressiveSegmenter`), adaptado para leer su configuración de la base de datos y detectar el idioma del documento (es/en/pt/de/fr) para elegir el modelo spaCy correcto.
+**Segmentación:** usamos el segmentador propio del proyecto (`src/kag/segmentador.py`, `ProgressiveSegmenter`), adaptado para leer su configuración de la base de datos (`load_segmenter_config`) y elegir el modelo spaCy del idioma del documento (es/en/pt/de/fr). La detección de idioma (`detect_language`, heurística determinista por stopwords) vive en `src/kag_ingest.py` — módulo ligero, testable sin cargar torch/spacy — y `build_segmenter(session, lang, verbose)` la recibe como parámetro.
 
 **Resúmenes como fuente secundaria:** en la consulta, el orden de recuperación es: (1) keywords/búsqueda vectorial, (2) chunks vía PPR (HippoRAG), (3) **resúmenes de documento** (generados con Qwen 2.5 local) como referencia de segundo plano.
 
@@ -49,6 +49,10 @@ CREATE TABLE kag_documents (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE TRIGGER set_updated_at_kag_documents
+BEFORE UPDATE ON kag_documents
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 CREATE TABLE kag_chunks (
     id SERIAL PRIMARY KEY,
@@ -113,6 +117,10 @@ CREATE TABLE kag_segmenter_settings (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE TRIGGER set_updated_at_kag_segmenter_settings
+BEFORE UPDATE ON kag_segmenter_settings
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 ```
 
 Singleton (a lo sumo una fila activa), igual que `embedding_settings`. El seed (`src/db/seed_kag.py`) la puebla con los defaults. El segmentador lee de aquí — nunca de constantes hardcodeadas.
@@ -182,11 +190,13 @@ Las imágenes se leen **solo si existen** en `images/[docname]/`. Si la carpeta 
 
 El segmentador (`ProgressiveSegmenter`) se **adapta** (no se reescribe):
 
-1. **Eliminar la dependencia de `reii.config`** — los defaults pasan a constantes de módulo y la configuración real se lee de `kag_segmenter_settings` en la DB.
-2. **`detect_language(text)`** — heurística determinista por stopwords (es/en/pt/de/fr). Devuelve el código de idioma.
-3. **`build_segmenter(session, text, verbose)`** — factory: detecta idioma → lee `kag_segmenter_settings` → instancia `ProgressiveSegmenter` con el modelo spaCy del idioma detectado, el NLI model y el embedding model de la DB. Cachea por idioma en un dict de módulo (no recargar spaCy/SentenceTransformer/NLI por cada documento).
-4. **`chunk_markdown(md_text, doc_type, segmenter, max_tokens)`**:
-   - **Short (<20k tokens):** se parte por encabezados Markdown (`#`, `##`, `###`) preservando `section_path`; cada sección se pasa a `segmenter.segment_text(seccion, max_tokens=CHUNK_MAX_TOKENS)` y cada segmento resultante es un chunk.
+1. **Eliminar la dependencia de `reii.config`** — los defaults pasan a constantes de módulo (`DEFAULT_NLI_MODEL`, `DEFAULT_SEGMENTER_EMBEDDING_MODEL`, `DEFAULT_SPACY_MODEL`, `DEFAULT_SPACY_MODELS`) y la configuración real se lee de `kag_segmenter_settings` en la DB.
+2. **`load_segmenter_config(session)`** — lee la fila activa de `kag_segmenter_settings` (SQL crudo); si no hay fila (o la tabla no existe), devuelve los defaults de módulo. Devuelve dict con `nli_model`, `segmenter_embedding_model` y `spacy_models` (dict por idioma).
+3. **`build_segmenter(session, lang='es', verbose=False)`** — factory: lee la config, elige el modelo spaCy del idioma (`spacy_models[lang]`, fallback `DEFAULT_SPACY_MODEL`) e instancia `ProgressiveSegmenter` con el NLI model y el embedding model de la DB. Cachea por idioma en un dict de módulo (`_SEGMENTER_CACHE` — no recargar spaCy/SentenceTransformer/NLI por cada documento).
+4. **`detect_language(text)`** — heurística determinista por stopwords (es/en/pt/de/fr), default `'es'`. Vive en `src/kag_ingest.py` (módulo ligero, testable sin cargar torch/spacy), NO en el segmentador; `index_document` la llama y pasa el idioma a `build_segmenter`.
+5. **`chunk_markdown(md_text, doc_type, segmenter, max_tokens=CHUNK_MAX_TOKENS)`** (en `src/kag_ingest.py`):
+   - Recibe el segmenter como parámetro (duck-typed — los tests pasan un fake con `segment_text`).
+   - **Short (<20k tokens):** se parte por encabezados Markdown (`#`, `##`, `###`) preservando `section_path`; cada sección se pasa a `segmenter.segment_text(seccion, max_tokens=max_tokens)` y cada segmento resultante es un chunk.
    - **Long (≥20k tokens):** pre-segmentación por H1/H2 (para acotar cada llamada al segmentador — un book stack de 500k tokens no puede pasar entero por spaCy/coref), y cada sección se segmenta con el segmentador. `section_path` = ruta de encabezados.
    - Cada chunk lleva `section_path` y `token_estimate`.
 
@@ -196,7 +206,7 @@ El segmentador (`ProgressiveSegmenter`) se **adapta** (no se reescribe):
 2. **Idempotencia:** si `kag_documents` ya tiene una fila con ese `doc_path` y el mismo hash → skip (ya indexado). Si el hash cambió → re-indexar (borrar hijos con CASCADE y re-insertar). Flag `--force` para re-indexar a la fuerza.
 3. **Clasificar escala:** `token_estimate = len(text) // 4`. `doc_type = 'long'` si ≥ 20k tokens, si no `'short'`.
 4. **Chunking** con el segmentador (§2.2).
-5. **Embeddings:** `embed_text(chunk.content, input_type="document")` (local, Jina) → `kag_chunks.embedding`.
+5. **Embeddings:** `embed_text(chunk.content, input_type="document")` (local, Jina) → `kag_chunks.embedding`. El INSERT usa `embedding_to_sql(emb)` (helper de `src/kag_ingest.py`): convierte la lista de floats al literal pgvector `[0.1,...]` con `CAST(:embedding AS vector)` — psycopg2 adapta las listas Python a `numeric[]`, que pgvector no acepta. Si el embedding falla en un chunk → `emb = None` (chunk sin embedding, con log).
 6. **Extracción LLM** (`extract_entities_relations`): por chunk, el modelo pequeño (Together) extrae entidades y relaciones en JSON:
    ```json
    {
@@ -223,9 +233,9 @@ El segmentador (`ProgressiveSegmenter`) se **adapta** (no se reescribe):
    - Buscar la referencia `![alt](...)` en el markdown para obtener el caption y el chunk que la referencia.
    - `describe_figure`: VLM vía `complete_vision` con la imagen como **data URL base64** (`data:image/jpeg;base64,...`). Si falla → se guarda con `description = ''` y log.
 8. **Resumen jerárquico con Qwen 2.5 local** (`summarize_document`):
-   - **Short:** una llamada a `complete_local` con el texto completo (truncado a ~16k tokens).
-   - **Long:** map-reduce — una llamada por sección de nivel superior (H1/H2, concatenando sus chunks truncados a ~16k) + una llamada reduce que combina los resúmenes de sección en el resumen del documento.
-   - Prompt según las reglas de Qwen 2.5 (§1.3): system con constraints, user con `<text>...</text>`, one-shot, `max_tokens=60` por sección y ~200 para el reduce.
+   - **Short:** una llamada a `complete_local` con el texto completo (truncado a ~16k tokens), `max_tokens=200`.
+   - **Long:** map-reduce — una llamada por sección de nivel superior (H1/H2, concatenando sus chunks truncados a ~16k) con `max_tokens=60` + una llamada reduce que combina los resúmenes de sección en el resumen del documento (`max_tokens=200`).
+   - Prompt según las reglas de Qwen 2.5 (§1.3): system con constraints, user con `<text>...</text>`, one-shot.
    - Si el servidor local no está disponible → `summary = ''` con log (degradación, no bloqueante). Flag `--no-summary` para omitir.
 9. **Actualizar** `kag_documents` (status `ready`, counts) y **print** del resumen de ingesta.
 
@@ -247,7 +257,7 @@ python -m src.kag_ingest --no-summary
 1. **Clasificar** (`classify_query`): heurística determinista de keywords.
    - **Global:** "resumen", "conclusiones", "principales", "temas", "overview", "summary", "main topics", "libro", "book", "¿de qué trata?"...
    - **Local:** todo lo demás (preguntas específicas sobre datos, fórmulas, conceptos).
-2. **Vector search (keywords):** `embed_text(query, input_type="query")` → top-K chunks por similitud coseno (pgvector `<=>`). K = `top_k` (8) local, `global_top_k` (20) global.
+2. **Vector search (keywords):** `embed_text(query, input_type="query")` → top-K chunks por similitud coseno (pgvector `<=>`). K = `top_k` (8) local, `global_top_k` (20) global. Usa `embedding_to_sql` para el literal pgvector. Si falla → `session.rollback()` (la transacción queda abortada tras el error) y `vec_hits = []` (degradación natural).
 3. **Entity linking:**
    - `extract_query_entities`: LLM (modelo pequeño) extrae las entidades de la pregunta. Si falla → fallback determinista: tokenizar y buscar coincidencias por substring contra `name_norm`.
    - `match_entities`: match exacto por `name_norm`, luego `LIKE '%name%'`.
@@ -287,38 +297,38 @@ python -m src.kag_query --top-k 12 "pregunta"
 
 ## 4. Resiliencia
 
-| Riesgo                                | Mitigación                                                         |
-| ------------------------------------- | ------------------------------------------------------------------ |
-| LLM extractor falla en un chunk       | Skip del chunk con log; el resto del doc se indexa igual           |
-| VLM no disponible / imagen corrupta   | `description = ''`, log; la figura se indexa igual                 |
-| Servidor local Qwen 2.5 no disponible | `summary = ''`, log; el doc se indexa igual                        |
-| Modelo spaCy del idioma no descargado | Intento de descarga; si falla, fallback al modelo por defecto      |
-| Embeddings sin config                 | Falla ruidosa (mismo comportamiento que `src/embeddings.py`)       |
-| LLM de respuesta falla                | Devuelve el contexto crudo + nota de degradación                   |
-| Re-indexar el mismo doc               | Idempotente por `content_hash`; `--force` para forzar              |
-| Consulta sin entidades matcheadas     | PPR con semilla vacía → solo vector search (degradación natural)   |
-| `images/[docname]/` no existe         | Se omite la ingesta de figuras silenciosamente                     |
-| Documento en idioma no soportado      | `detect_language` devuelve 'es' por defecto (fallback conservador) |
+| Riesgo                                | Mitigación                                                                                                                                     |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| LLM extractor falla en un chunk       | Skip del chunk con log; el resto del doc se indexa igual                                                                                       |
+| VLM no disponible / imagen corrupta   | `description = ''`, log; la figura se indexa igual                                                                                             |
+| Servidor local Qwen 2.5 no disponible | `summary = ''`, log; el doc se indexa igual                                                                                                    |
+| Modelo spaCy del idioma no disponible | Fallback a `DEFAULT_SPACY_MODEL` (`es_core_news_md`) si el idioma no está en `spacy_models`; `spacy.load` falla si el modelo no está instalado |
+| Embeddings sin config                 | Falla ruidosa (mismo comportamiento que `src/embeddings.py`)                                                                                   |
+| LLM de respuesta falla                | Devuelve el contexto crudo + nota de degradación                                                                                               |
+| Re-indexar el mismo doc               | Idempotente por `content_hash`; `--force` para forzar                                                                                          |
+| Consulta sin entidades matcheadas     | PPR con semilla vacía → solo vector search (degradación natural)                                                                               |
+| `images/[docname]/` no existe         | Se omite la ingesta de figuras silenciosamente                                                                                                 |
+| Documento en idioma no soportado      | `detect_language` devuelve 'es' por defecto (fallback conservador)                                                                             |
 
-**Reintentos:** todas las llamadas LLM usan `call_with_retries` (tenacity + `fallback_model` de `session_settings`). La visión usa `complete_vision` que ya tiene su propio retry. `complete_local` tiene su propio retry simple (2 intentos) y degrada a `summary=''`.
+**Reintentos:** todas las llamadas LLM usan `call_with_retries` (tenacity + `fallback_model` de `session_settings`). La visión usa `complete_vision` que ya tiene su propio retry. `complete_local` tiene su propio retry simple (2 intentos) y lanza excepción si no hay modelo local activo o el servidor no responde — el caller degrada (p. ej. `summary=''`).
 
 ---
 
 ## 5. Archivos y funciones
 
-| Archivo                        | Contenido                                                                                                                                                                                                                                                         |
-| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `alembic/versions/0013_kag.py` | Migración (tablas de §1.1 y §1.2)                                                                                                                                                                                                                                 |
-| `src/db/seed_kag.py`           | Seed: `kag_segmenter_settings` + modelo local Qwen 2.5 en `llm_models` + api_key local                                                                                                                                                                            |
-| `src/kag/segmentador.py`       | **Adaptado:** sin `reii.config`; `detect_language`, `build_segmenter`, `load_segmenter_config`; `ProgressiveSegmenter`/`ClassicSegmenter` aceptan `nli_model`                                                                                                     |
-| `src/kag_ingest.py`            | `estimate_tokens`, `normalize_entity_name`, `chunk_markdown`, `complete_local`, `extract_entities_relations`, `summarize_document`, `describe_figure`, `index_document`, `index_all`, `main`                                                                      |
-| `src/kag_query.py`             | `classify_query`, `extract_query_entities`, `match_entities`, `build_adjacency`, `personalized_pagerank`, `vector_search`, `chunks_for_entities`, `subgraph_triples`, `figures_for_chunks`, `doc_summaries`, `assemble_context`, `generate_answer`, `ask`, `main` |
-| `tests/test_kag.py`            | Tests de lógica pura (sin DB): chunking, PPR, clasificación, ensamblado, normalización, detección de idioma                                                                                                                                                       |
-| `scripts/kag_demo.py`          | CLI de demo: indexa (opcional) + responde una pregunta con prints detallados                                                                                                                                                                                      |
+| Archivo                        | Contenido                                                                                                                                                                                                                                                                                                                        |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `alembic/versions/0013_kag.py` | Migración (tablas de §1.1 y §1.2 + triggers `set_updated_at` en `kag_documents` y `kag_segmenter_settings`)                                                                                                                                                                                                                      |
+| `src/db/seed_kag.py`           | Seed: `kag_segmenter_settings` + modelo local Qwen 2.5 en `llm_models` + api_key local (`provider='local'`, `key_name='local-qwen'`, `api_key=''`)                                                                                                                                                                               |
+| `src/kag/segmentador.py`       | **Adaptado:** sin `reii.config`; constantes de módulo `DEFAULT_NLI_MODEL`/`DEFAULT_SEGMENTER_EMBEDDING_MODEL`/`DEFAULT_SPACY_MODEL`/`DEFAULT_SPACY_MODELS`; NLI perezoso; `load_segmenter_config`, `build_segmenter(session, lang, verbose)` con caché por idioma; `ProgressiveSegmenter`/`ClassicSegmenter` aceptan `nli_model` |
+| `src/kag_ingest.py`            | `_fix_db_host`, `estimate_tokens`, `normalize_entity_name`, `embedding_to_sql`, `detect_language`, `chunk_markdown`, `complete_local`, `extract_entities_relations`, `_store_entities_relations`, `summarize_document`, `describe_figure`, `_index_figures`, `index_document`, `index_all`, `main`                               |
+| `src/kag_query.py`             | `_fix_db_host`, `classify_query`, `extract_query_entities`, `_deterministic_entity_fallback`, `match_entities`, `build_adjacency`, `personalized_pagerank`, `vector_search`, `chunks_for_entities`, `subgraph_triples`, `figures_for_chunks`, `doc_summaries`, `assemble_context`, `generate_answer`, `ask`, `main`              |
+| `tests/test_kag.py`            | 21 tests de lógica pura (sin DB, sin torch/spacy): chunking con segmenter fake, PPR, clasificación, ensamblado, normalización, detección de idioma, `complete_local` (monkeypatch httpx)                                                                                                                                         |
+| `scripts/kag_demo.py`          | CLI de demo: `--index 'pregunta'` (indexa todo + responde) o modo pregunta directa, con prints detallados                                                                                                                                                                                                                        |
 
 **Estilo deliberado:** código simple y directo, sin dataclasses ni abstracciones innecesarias — fácil de cambiar luego. SQL crudo vía `session.execute(text(...))` (no se toca `src/db/models.py`). Prompts como constantes en los archivos (se pueden migrar a `prompt_templates` después si se quiere prompt-as-code estricto). Prints descriptivos en cada paso (`verbose=True`).
 
-**Conexión a DB desde el host:** el `.env` apunta a host `db` (red Docker). Los scripts que corren en el host (CLIs, demo) deben reemplazar `@db:` por `@localhost:` en `DATABASE_URL`/`DATABASE_URL_ASYNC` **antes** de importar `src.db.session` (mismas credenciales, solo cambia el host). Helper `_fix_db_host()` en cada CLI.
+**Conexión a DB desde el host:** el `.env` apunta a host `db` (red Docker). Los scripts que corren en el host (CLIs, demo) deben reemplazar `@db:` por `@localhost:` en `DATABASE_URL`/`DATABASE_URL_ASYNC` **antes** de importar `src.db.session` (mismas credenciales, solo cambia el host). Helper `_fix_db_host()` en cada CLI (`src/kag_ingest.py`, `src/kag_query.py`, `scripts/kag_demo.py`): si la variable no está en el entorno, la lee del `.env` (pydantic-settings da prioridad a las env vars reales sobre el archivo `.env`).
 
 ---
 

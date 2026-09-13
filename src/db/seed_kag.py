@@ -20,6 +20,7 @@ Uso:
 from __future__ import annotations
 
 import argparse
+import json
 
 from sqlalchemy import select, text
 
@@ -125,6 +126,7 @@ def _upsert_model(session, data: dict) -> LlmModel:
 
 def _upsert_segmenter_settings(session, data: dict) -> int:
     """Upsert del singleton activo de kag_segmenter_settings (SQL crudo)."""
+    spacy_json = json.dumps(data["spacy_models"], ensure_ascii=False)
     row = session.execute(
         text(
             "SELECT id FROM kag_segmenter_settings "
@@ -141,7 +143,7 @@ def _upsert_segmenter_settings(session, data: dict) -> int:
             {
                 "nli": data["nli_model"],
                 "emb": data["segmenter_embedding_model"],
-                "spacy": data["spacy_models"],
+                "spacy": spacy_json,
             },
         )
         return result.scalar()
@@ -154,7 +156,7 @@ def _upsert_segmenter_settings(session, data: dict) -> int:
         {
             "nli": data["nli_model"],
             "emb": data["segmenter_embedding_model"],
-            "spacy": data["spacy_models"],
+            "spacy": spacy_json,
             "id": row.id,
         },
     )
