@@ -1,6 +1,12 @@
+x-torch-build: &torch-build
+  context: .
+  args:
+    TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+    TORCH_PACKAGE: ${TORCH_PACKAGE:-torch==2.12.0+cpu}
+
 services:
   db:
-    image: pgvector/pgvector:pg17   # antes: ankane/pgvector:latest (sin mantenimiento activo, tag flotante)
+    image: pgvector/pgvector:pg17 # antes: ankane/pgvector:latest (sin mantenimiento activo, tag flotante)
     container_name: pipeline_db
     restart: unless-stopped
     env_file: .env
@@ -19,7 +25,8 @@ services:
       retries: 10
 
   migrate:
-    build: .
+    build:
+      <<: *torch-build
     container_name: pipeline_migrate
     command: ["alembic", "upgrade", "head"]
     restart: "no"
@@ -29,21 +36,27 @@ services:
     env_file: .env
 
   api:
-    build: .
+    build:
+      <<: *torch-build
     container_name: pipeline_api
-    command: ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    command:
+      ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
     restart: unless-stopped
     depends_on:
       migrate:
         condition: service_completed_successfully
     env_file: .env
+    environment:
+      HF_HOME: /app/hf_cache # caché de HuggingFace (modelo de embeddings) persistente
     ports:
       - "8000:8000"
     volumes:
       - ./data:/app/data
+      - ${HF_HOME:-./data/hf_cache}:/app/hf_cache # cache HF montado desde la variable de entorno del sistema
 
   agent_worker:
-    build: .
+    build:
+      <<: *torch-build
     container_name: pipeline_agents
     command: ["python", "-m", "src.events.listener"]
     restart: unless-stopped
@@ -51,8 +64,11 @@ services:
       migrate:
         condition: service_completed_successfully
     env_file: .env
+    environment:
+      HF_HOME: /app/hf_cache # caché de HuggingFace (modelo de embeddings) persistente
     volumes:
       - ./data:/app/data
+      - ${HF_HOME:-./data/hf_cache}:/app/hf_cache # cache HF montado desde la variable de entorno del sistema
 
 volumes:
   pgdata:

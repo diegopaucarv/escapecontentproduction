@@ -58,12 +58,12 @@ def test_seed_data_has_3_models():
     assert names == [
         "meta-models/Muse-Glimmer-30B",
         "deepseek-ai/DeepSeek-V4-Flash-0731",
-        "voyage-3-large",
+        "jinaai/jina-embeddings-v5-text-nano",
     ]
     sizes = {m["model_name"]: m["model_size"] for m in MODELS}
     assert sizes["meta-models/Muse-Glimmer-30B"] == "small"
     assert sizes["deepseek-ai/DeepSeek-V4-Flash-0731"] == "large"
-    assert sizes["voyage-3-large"] == "embedding"
+    assert sizes["jinaai/jina-embeddings-v5-text-nano"] == "embedding"
 
 
 def test_seed_data_has_4_templates():

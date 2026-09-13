@@ -12,8 +12,9 @@ Diseño deliberado:
   y solo puntúa si no encontró nada comparable.
 
 Implementación concreta de `EmbedFn`: src/embeddings.py::embed_text
-(Voyage AI). Se pasa por parámetro para no acoplar esta lógica de
-enrutamiento a un proveedor específico ni a la disponibilidad de red.
+(Jina jina-embeddings-v5-text-nano, inferencia local). Se pasa por
+parámetro para no acoplar esta lógica de enrutamiento a un proveedor
+específico ni a la disponibilidad de red.
 """
 
 from __future__ import annotations
@@ -114,6 +115,16 @@ def score_novelty(inputs: NoveltyInputs) -> int:
     return score
 
 
+def _artifact_to_dict(row: ArtifactLibraryRow) -> dict:
+    """Serializa la fila previa para pasarla al refinador LLM (JSON-safe)."""
+    return {
+        "id": str(row.id),
+        "content_summary": row.content_summary,
+        "retention_24h": row.retention_24h,
+        "conversion_30d": row.conversion_30d,
+    }
+
+
 def route_brief(
     session: Session,
     embed_fn: EmbedFn,
@@ -126,7 +137,9 @@ def route_brief(
     calculado a ciegas: primero busca duplicado, luego decide.
 
     `refine_angle` (0004, opt-in): callable que juzga si el ángulo está
-    cubierto por piezas previas (zona gris). Si se omite, se usa el
+    cubierto por piezas previas. SOLO se consulta en la zona gris
+    (GRAY_ZONE_LOW_THRESHOLD <= similitud < DUPLICATE_SIMILARITY_THRESHOLD):
+    ni duplicado claro ni claramente nuevo. Si se omite, se usa el
     comportamiento determinista actual (ángulo nuevo por definición).
     El callable recibe (brief_data, prior_artifacts) y devuelve un dict
     con `angulo_nuevo`; si falla o no está disponible, se degrada al
@@ -158,9 +171,13 @@ def route_brief(
 
     # Zona gris (0004): sin duplicado claro, el ángulo es el único
     # componente que el código asume fijo. Si hay un refinador LLM
-    # inyectado, se le consulta SOLO el ángulo; si falla, se degrada
+    # inyectado, se le consulta SOLO el ángulo y SOLO en la banda gris
+    # (ni duplicado claro ni claramente nuevo); si falla, se degrada
     # al default determinista (ángulo nuevo).
-    if refine_angle is not None and similarity < DUPLICATE_SIMILARITY_THRESHOLD:
+    if (
+        refine_angle is not None
+        and GRAY_ZONE_LOW_THRESHOLD <= similarity < DUPLICATE_SIMILARITY_THRESHOLD
+    ):
         try:
             brief_data = {
                 "insight_core": inputs.insight_core,
@@ -168,7 +185,8 @@ def route_brief(
                 "artifact_type": inputs.artifact_type,
                 "channel": inputs.channel,
             }
-            refinement = refine_angle(brief_data, [])
+            prior_artifacts = [_artifact_to_dict(match)] if match is not None else []
+            refinement = refine_angle(brief_data, prior_artifacts)
             if (
                 refinement.get("status") == "ok"
                 and refinement.get("angulo_nuevo") is False
@@ -181,6 +199,35 @@ def route_brief(
     decision = "nueva_solucion" if score >= score_threshold else "repetitivo"
     reasoning = f"Sin duplicado (mejor similitud={similarity:.2f}); score={score} -> {decision}."
     return NoveltyResult(decision, score, None, reasoning)
+
+
+def route_brief_with_refinement(
+    session: Session,
+    embed_fn: EmbedFn,
+    inputs: NoveltyInputs,
+    evidence_is_current: Callable[[ArtifactLibraryRow], bool] | None = None,
+    score_threshold: int = 4,
+) -> NoveltyResult:
+    """Coordinador (0004): enruta con refinamiento LLM de la zona gris.
+
+    Vincula la sesión a refine_angle_novelty (el hook de route_brief
+    espera Callable[[dict, list], dict]) y la pasa como `refine_angle`.
+    Si el LLM no está disponible, refine_angle_novelty degrada al default
+    determinista (ángulo nuevo) y el enrutamiento no cambia.
+    """
+    from src.llm.novelty_refinement import refine_angle_novelty
+
+    def _refine(brief_data: dict, prior_artifacts: list) -> dict:
+        return refine_angle_novelty(session, brief_data, prior_artifacts)
+
+    return route_brief(
+        session,
+        embed_fn,
+        inputs,
+        evidence_is_current=evidence_is_current,
+        score_threshold=score_threshold,
+        refine_angle=_refine,
+    )
 
 
 # NOTA DE INTEGRACIÓN: este módulo referencia `ArtifactLibraryRow`, un

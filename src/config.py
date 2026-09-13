@@ -2,12 +2,10 @@
 Configuración centralizada. Nada de credenciales embebidas en el código:
 todo se lee de variables de entorno (ver .env.example).
 
-Decisión explícita que la propuesta original dejaba abierta: proveedor
-de embeddings. Anthropic no ofrece un modelo de embeddings propio y
-recomienda Voyage AI como partner (ver docs.claude.com); ese es el
-default aquí. Si el equipo prefiere OpenAI, basta con cambiar
-EMBEDDING_PROVIDER y EMBEDDING_DIM — el resto del código no asume
-ningún proveedor específico.
+Los embeddings (jina-embeddings-v5-text-nano) se ejecutan LOCALMENTE vía
+transformers (ver src/embeddings.py): la clave y el modelo se leen de la
+base (embedding_settings -> api_keys + llm_models), no de .env. Estos
+defaults solo existen para entornos sin DB configurada.
 """
 
 from functools import lru_cache
@@ -28,10 +26,12 @@ class Settings(BaseSettings):
         "postgresql://ergalia_user:changeme@localhost:5432/escape_ergalia_os"
     )
 
-    # Embeddings — ver docstring del módulo
-    embedding_provider: str = "voyage"  # "voyage" | "openai"
-    embedding_model: str = "voyage-3-large"
-    embedding_dim: int = 1024  # 1024 para voyage-3-large; 1536 si se cambia a OpenAI text-embedding-3-small
+    # Embeddings — ver docstring del módulo. Desde 0004 la fuente de
+    # verdad es la base (embedding_settings -> api_keys + llm_models);
+    # estos defaults solo existen para entornos sin DB configurada.
+    embedding_provider: str = "jina"  # "jina" | "openai"
+    embedding_model: str = "jinaai/jina-embeddings-v5-text-nano"
+    embedding_dim: int = 768  # 768 para jina-embeddings-v5-text-nano
     voyage_api_key: str = ""
     openai_api_key: str = ""
 

@@ -95,14 +95,18 @@ MODELS = [
         "syntax_profile": TOGETHER_CHAT_PROFILE,
     },
     {
-        "model_name": "voyage-3-large",
-        "provider": "voyage",
+        "model_name": "jinaai/jina-embeddings-v5-text-nano",
+        "provider": "huggingface",
         "model_size": "embedding",
-        "context_window": 0,
+        "context_window": 8192,
         "max_output_tokens": 0,
         "temperature_default": 0.0,
-        "strengths": ["alta calidad de recuperacion semantica"],
-        "weaknesses": [],
+        "strengths": [
+            "multilingue",
+            "nano: rapido y economico",
+            "adapters por tarea (retrieval, text-matching, clustering)",
+        ],
+        "weaknesses": ["dimension 768 (menor que modelos grandes)"],
         "prompt_style": "",
         "syntax_profile": {},
     },
@@ -155,7 +159,14 @@ TEMPLATES = [
         "rules": [
             "fuente_verificable: el claim principal cita una fuente verificable",
             "cta_unico: exactamente un CTA, una sola accion",
-            "anonimizacion: sin datos personales identificables",
+            (
+                "anonimizacion_no_aplica: la pieza no maneja datos personales; "
+                "no requiere anonimizacion"
+            ),
+            (
+                "anonimizacion_verificada: si la pieza maneja datos personales, "
+                "estan anonimizados o seudonimizados"
+            ),
             "revision_legal: sin afirmaciones legales riesgosas sin respaldo",
             "gancho_15s_ok: el primer parrafo comunica la promesa en 15 segundos",
             "longitud: dentro del rango del formato",

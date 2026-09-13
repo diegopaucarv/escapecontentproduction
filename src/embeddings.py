@@ -1,28 +1,40 @@
 """
 Cliente de embeddings. Único punto del sistema que sabe que el
-proveedor es Voyage AI — novelty_router.py y todo lo demás reciben un
-`EmbedFn` (str -> list[float]) inyectado, así que cambiar de proveedor
-en el futuro no toca lógica de negocio, solo este archivo.
+proveedor es Jina (jina-embeddings-v5-text-nano) — novelty_router.py
+y todo lo demás reciben un `EmbedFn` (str -> list[float]) inyectado, así
+que cambiar de proveedor en el futuro no toca lógica de negocio, solo
+este archivo.
 
 Desde 0004, la configuración (clave + modelo + dimensión) NO vive en
 .env: se lee de la base (embedding_settings -> api_keys + llm_models).
-La clave de Voyage aún no la ha provisto el usuario; la infraestructura
-existe y falla ruidosamente (no silenciosamente) si no hay settings.
+La clave se guarda en `api_keys` (provider 'huggingface') y la
+embedding_settings activa la referencia. Si no hay settings, falla
+ruidosamente (no silenciosamente).
 
-Firma verificada contra voyageai==0.5.0 instalado en el entorno de
-prueba (voyageai.Client.embed real, no supuesta de memoria):
-embed(texts: list[str], model=..., input_type=..., output_dimension=...)
--> EmbeddingsObject con atributo `.embeddings: list[list[float]]`.
+Inferencia LOCAL: el modelo se descarga desde HuggingFace Hub (la
+api_key de huggingface se usa como token de autenticación para la
+descarga) y se ejecuta con transformers.AutoModel + trust_remote_code
+(la clase custom jina_embeddings_v5 expone `.encode()`). No hay
+llamadas HTTP a ningún proveedor en el hot-path.
+
+El `input_type` de Voyage se mapea al `prompt_name` de Jina:
+  - 'query'    -> prompt_name='query'    (embebe el texto de búsqueda)
+  - 'document' -> prompt_name='document' (indexa una pieza publicada)
+Ambos con task='retrieval'.
 """
 
 from __future__ import annotations
 
-import voyageai
+import threading
+
 from sqlalchemy import select
-from tenacity import retry, stop_after_attempt, wait_exponential
 
 from src.db.models import ApiKey, EmbeddingSetting, LlmModel
 from src.db.session import SessionLocal
+
+# Singleton del modelo en memoria (carga perezosa, una sola vez por proceso).
+_model = None
+_model_lock = threading.Lock()
 
 
 def _active_embedding_config(session=None) -> tuple[str, str, int]:
@@ -45,8 +57,7 @@ def _active_embedding_config(session=None) -> tuple[str, str, int]:
         if setting is None:
             raise RuntimeError(
                 "No hay embedding_settings activa. Créala vía POST /embedding-settings "
-                "(referenciando una api_key de Voyage y un llm_model con "
-                "model_size='embedding')."
+                "(referenciando una api_key y un llm_model con model_size='embedding')."
             )
         key = session.get(ApiKey, setting.api_key_id)
         if key is None or not key.is_active:
@@ -64,22 +75,64 @@ def _active_embedding_config(session=None) -> tuple[str, str, int]:
             session.close()
 
 
-def _client(api_key: str) -> voyageai.Client:
-    return voyageai.Client(api_key=api_key)
+def _prompt_name(input_type: str) -> str:
+    """Mapea el input_type de Voyage al prompt_name de Jina."""
+    if input_type == "query":
+        return "query"
+    return "document"
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
+def _get_model(api_key: str, model_name: str):
+    """Carga (una sola vez) el modelo con transformers.AutoModel.
+
+    El modelo requiere trust_remote_code=True (clase custom
+    jina_embeddings_v5 que expone `.encode()`). La api_key de
+    HuggingFace se pasa como token para autenticar la descarga desde el
+    Hub. En CPU se usa float32; en GPU, bfloat16 (recomendado por la
+    model card). Falla ruidosamente si la descarga/carga falla.
+    """
+    global _model
+    if _model is not None:
+        return _model
+    with _model_lock:
+        if _model is not None:
+            return _model
+        import torch
+        from transformers import AutoModel
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # bfloat16 solo si la GPU lo soporta; si no, float32 (funciona en todas).
+        dtype = (
+            torch.bfloat16
+            if device.type == "cuda" and torch.cuda.is_bf16_supported()
+            else torch.float32
+        )
+        _model = AutoModel.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            token=api_key or None,
+            dtype=dtype,
+        ).to(device)
+    return _model
+
+
 def embed_text(text: str, input_type: str = "document") -> list[float]:
     """Implementa el `EmbedFn` que espera src/agents/novelty_router.py.
+
     `input_type='query'` cuando se embebe el texto de búsqueda de un
     brief nuevo; `'document'` cuando se indexa una pieza ya publicada
-    en artifact_library — Voyage distingue ambos casos para mejor
-    calidad de recuperación, no es un detalle cosmético."""
-    api_key, model_name, dimension = _active_embedding_config()
-    result = _client(api_key).embed(
+    en artifact_library — Jina distingue ambos casos con `prompt_name`
+    (query / document) para mejor calidad de recuperación, no es un
+    detalle cosmético.
+    """
+    api_key, model_name, _dimension = _active_embedding_config()
+    model = _get_model(api_key, model_name)
+    emb = model.encode(
         texts=[text],
-        model=model_name,
-        input_type=input_type,
-        output_dimension=dimension,
+        task="retrieval",
+        prompt_name=_prompt_name(input_type),
     )
-    return result.embeddings[0]
+    vec = emb[0]
+    if hasattr(vec, "detach"):  # torch.Tensor -> numpy
+        vec = vec.detach().cpu().numpy()
+    return vec.tolist() if hasattr(vec, "tolist") else list(vec)

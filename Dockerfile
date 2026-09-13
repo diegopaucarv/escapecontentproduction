@@ -5,6 +5,14 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends libpq-dev gcc \
     && rm -rf /var/lib/apt/lists/*
 
+# torch se instala aparte: el wheel depende del hardware (CPU vs CUDA).
+# Default: CPU (~200MB). Para GPU, pasar build args, p.ej.:
+#   docker compose build --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126 \
+#                        --build-arg TORCH_PACKAGE=torch==2.12.0+cu126
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+ARG TORCH_PACKAGE=torch==2.12.0+cpu
+RUN pip install --no-cache-dir --extra-index-url ${TORCH_INDEX_URL} ${TORCH_PACKAGE}
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

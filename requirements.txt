@@ -40,8 +40,14 @@ langchain-anthropic==1.7.2
 # langgraph-checkpoint-postgres  # activar cuando el checkpointer pase
 # de InMemorySaver (esqueleto) a persistencia real entre reinicios.
 
-# Embeddings (Voyage AI, recomendado por Anthropic — ver src/config.py)
-voyageai==0.5.0
+# Embeddings locales (jina-embeddings-v5-text-nano vía transformers.AutoModel).
+# Inferencia LOCAL: el modelo se descarga desde HuggingFace Hub y se ejecuta
+# en el contenedor — no hay API externa.
+# torch NO va aquí: el wheel depende del hardware (CPU vs CUDA). Se instala
+# en el Dockerfile (ARGs TORCH_INDEX_URL/TORCH_PACKAGE, default CPU) o con
+# scripts/install_torch.py (auto-detección) en instalaciones fuera de Docker.
+transformers==5.1.0
+peft==0.20.0   # jina-embeddings-v5 usa adapters LoRA (PEFT)
 
 # Testing
 pytest==9.1.1

@@ -21,9 +21,10 @@ add_conditional_edges, compile(checkpointer=...), interrupt(), Command) —
 no se asumió nada de memoria del entrenamiento, que corresponde a
 versiones 0.0.x/0.1.x ya incompatibles.
 """
+
 from __future__ import annotations
 
-from typing import Literal, TypedDict
+from typing import Callable, Literal, TypedDict
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -42,12 +43,12 @@ class ProducerCriticState(TypedDict):
     route_decision: str
     production_route: str | None
     segment_client: str | None
-    checklist_template: list[str]     # de pipeline_templates.checklist
+    checklist_template: list[str]  # de pipeline_templates.checklist
     draft: str
     iteration: int
     checklist_results: dict[str, bool]
     verdict: str | None
-    human_decision: str | None        # "approve" | "reject" | None
+    human_decision: str | None  # "approve" | "reject" | None
 
 
 def producer_node(state: ProducerCriticState) -> dict:
@@ -60,12 +61,37 @@ def producer_node(state: ProducerCriticState) -> dict:
     return {"draft": draft, "iteration": iteration}
 
 
-def critic_node(state: ProducerCriticState) -> dict:
-    """Real: reutiliza el Gatekeeper ya validado. La única parte
-    simulada aquí es `checklist_results` (en producción vendría de
-    verificaciones automáticas reales: longitud de CTA, presencia de
-    fuente citada, anonimización vía regex/NER, etc. — no de un LLM)."""
-    checklist_results = {item: True for item in state["checklist_template"]}
+def critic_node(
+    state: ProducerCriticState,
+    critic_checklist_fn: Callable[[str, list, str], dict] | None = None,
+) -> dict:
+    """Real: reutiliza el Gatekeeper ya validado.
+
+    `critic_checklist_fn` (0004, opt-in): callable que ejecuta el crítico
+    LLM del checklist (src/llm/critic.py::run_critic_checklist con la
+    sesión ya vinculada). Recibe (draft, checklist, brand_objective) y
+    devuelve {"checklist_results": {item: "ok"|"fail"|"no_evaluado"}}.
+    Si se omite o falla, se simula el checklist (comportamiento actual).
+    Conservador: solo "ok" pasa; "fail"/"no_evaluado" bloquean la pieza.
+    """
+    checklist_template = state["checklist_template"]
+    checklist_results: dict[str, bool] = {}
+    if critic_checklist_fn is not None:
+        try:
+            llm_result = critic_checklist_fn(
+                state["draft"], checklist_template, state["brand_objective"]
+            )
+            if llm_result.get("status") == "ok":
+                llm_map = llm_result.get("checklist_results", {}) or {}
+                for item in checklist_template:
+                    checklist_results[item] = llm_map.get(item) == "ok"
+            else:
+                # Degradación elegante: comportamiento actual (simulado).
+                checklist_results = {item: True for item in checklist_template}
+        except Exception:  # noqa: BLE001 — el crítico LLM nunca rompe el grafo
+            checklist_results = {item: True for item in checklist_template}
+    else:
+        checklist_results = {item: True for item in checklist_template}
 
     gate_result = evaluate_gate(
         GateInput(
@@ -76,7 +102,10 @@ def critic_node(state: ProducerCriticState) -> dict:
             checklist_items=checklist_results,
         )
     )
-    return {"checklist_results": checklist_results, "verdict": gate_result.verdict.value}
+    return {
+        "checklist_results": checklist_results,
+        "verdict": gate_result.verdict.value,
+    }
 
 
 def human_review_node(state: ProducerCriticState) -> dict:
@@ -94,7 +123,9 @@ def human_review_node(state: ProducerCriticState) -> dict:
     return {"human_decision": decision.get("decision")}
 
 
-def route_after_critic(state: ProducerCriticState) -> Literal["producer_node", "human_review_node", "__end__"]:
+def route_after_critic(
+    state: ProducerCriticState,
+) -> Literal["producer_node", "human_review_node", "__end__"]:
     verdict = state["verdict"]
     if verdict == GateVerdict.fail.value:
         if state["iteration"] >= MAX_ITERATIONS:
@@ -105,10 +136,17 @@ def route_after_critic(state: ProducerCriticState) -> Literal["producer_node", "
     return END  # auto_pass
 
 
-def build_graph(checkpointer=None):
+def build_graph(
+    checkpointer=None,
+    critic_checklist_fn: Callable[[str, list, str], dict] | None = None,
+):
     graph = StateGraph(ProducerCriticState)
+
+    def _critic_node(state: ProducerCriticState) -> dict:
+        return critic_node(state, critic_checklist_fn=critic_checklist_fn)
+
     graph.add_node("producer_node", producer_node)
-    graph.add_node("critic_node", critic_node)
+    graph.add_node("critic_node", _critic_node)
     graph.add_node("human_review_node", human_review_node)
 
     graph.add_edge(START, "producer_node")

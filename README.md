@@ -35,6 +35,46 @@ termine con éxito). El esquema ya NO se bootstrapea desde
 `sql/001_init.sql` — ese archivo quedó como copia de referencia legible,
 la fuente de verdad ejecutable es `alembic/versions/`.
 
+### Hardware: CPU vs GPU
+
+El wheel de `torch` depende del hardware. El Dockerfile lo instala aparte
+con ARGs adaptables (default CPU, ~200MB):
+
+```bash
+# CPU (default) — sin GPU o no especificado
+docker compose up -d --build
+
+# GPU NVIDIA (CUDA 12.6) — setear en .env y rebuild
+TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126
+TORCH_PACKAGE=torch==2.12.0+cu126
+docker compose up -d --build
+```
+
+Fuera de Docker, `python scripts/install_torch.py` detecta `nvidia-smi`
+y elige el wheel correcto (`--gpu` / `--cpu` para forzar). El runtime se
+adapta solo: `torch.cuda.is_available()` decide device y dtype
+(`bfloat16` solo si la GPU lo soporta, si no `float32`).
+
+### Caché de HuggingFace (`HF_HOME`)
+
+El caché de modelos de HuggingFace (el de embeddings, ~480MB) vive en la
+variable de entorno estándar `HF_HOME` del sistema — funciona igual en
+Linux, Windows y macOS. Docker Compose la lee y monta esa carpeta dentro
+del contenedor en `/app/hf_cache` (servicios `api` y `agent_worker`):
+
+```bash
+# Linux / macOS
+export HF_HOME=/mnt/big_disk/hf_cache
+
+# Windows (PowerShell, persistente a nivel de usuario)
+[Environment]::SetEnvironmentVariable('HF_HOME', 'D:\Python\HF_Cache', 'User')
+# reiniciar la terminal/editor para que los procesos nuevos la hereden
+```
+
+Si `HF_HOME` no está definida, Compose usa `./data/hf_cache` como fallback.
+Así el modelo se descarga una sola vez y se reutiliza entre rebuilds, sin
+llenar el disco del sistema.
+
 ### Cambios de esquema futuros
 
 ```bash
@@ -89,11 +129,20 @@ el camino feliz:
   correctamente (no sobreescriben). En el camino se encontró y corrigió
   un bug real: asyncpg entrega JSONB como string crudo si no se registra
   un codec — ya está registrado.
-- **Embeddings** (`src/embeddings.py`) — envuelve Voyage AI con la firma
-  real del SDK instalado (`voyageai==0.5.0`), no una supuesta de memoria.
-  No probado con una llamada de red real (sin API key en este entorno);
-  la lógica y el manejo de errores (`VOYAGE_API_KEY` ausente → falla
-  ruidosa, no silenciosa) sí están.
+- **Embeddings** (`src/embeddings.py`) — inferencia LOCAL de
+  `jinaai/jina-embeddings-v5-text-nano` (dim 768) vía
+  `transformers.AutoModel` + `trust_remote_code` (la clase custom
+  `jina_embeddings_v5` expone `.encode()`). El modelo se descarga desde
+  HuggingFace Hub usando el token de HuggingFace del usuario (guardado
+  en `api_keys`, provider `huggingface`) y se ejecuta en el contenedor:
+  no hay API externa en el hot-path. El `input_type` de Voyage se mapea
+  al `prompt_name` de Jina (`query` / `document`, ambos con
+  `task='retrieval'`). La clave, el modelo y la dimensión se leen de la
+  base (`embedding_settings` -> `api_keys` + `llm_models`); sin config
+  falla ruidosa, no silenciosa. El modelo se carga una sola vez por
+  proceso (singleton) y el caché de HuggingFace persiste en la carpeta
+  de `HF_HOME` del sistema (montada en `/app/hf_cache`; ver "Caché de
+  HuggingFace" arriba), no en el disco del sistema.
 - **Infraestructura LLM** (`src/llm/together.py`, tablas `api_keys` +
   `session_settings` en `alembic/versions/0003_llm_infra.py`) — la clave
   de Together y los modelos pequeño/grande viven en la base de datos, no
@@ -123,7 +172,16 @@ el camino feliz:
   SOLO se consulta en la zona gris del enrutamiento (búsqueda vectorial
   inconclusa) y SOLO para juzgar `ángulo no cubierto`. El scoring
   determinista (`score_novelty`) sigue siendo el default; si el LLM no
-  está disponible, se degrada al comportamiento actual.
+  está disponible, se degrada al comportamiento actual. El coordinador
+  `route_brief_with_refinement` vincula la sesión y pasa el artefacto
+  previo encontrado como `prior_artifacts` al refinador.
+- **Crítico LLM del checklist** (`src/llm/critic.py`) — consume el spec
+  `critic_checklist` para evaluar el borrador contra el checklist de
+  publicación (data-driven, variable por bucket). Regla defensiva EN
+  CÓDIGO: ítem sin interpretación en `rules` → `no_evaluado`, nunca
+  `ok`. Se inyecta en el nodo `critic` del grafo Producer-Critic vía
+  `make_critic_checklist_fn(session)`; si el LLM no está disponible,
+  degrada al comportamiento actual (checklist simulado).
 - **Enrutamiento por novedad y Gatekeeper** — lógica pura con tests
   unitarios (`tests/test_novelty_router.py`, `tests/test_gatekeeper.py`).
 - **Esqueleto Producer-Critic** (`src/agents/producer_critic.py`,
@@ -132,7 +190,7 @@ el camino feliz:
   **reanuda** correctamente con `Command(resume=...)`. El nodo `critic`
   llama al Gatekeeper real; el nodo `producer` es un stub explícito.
 
-`pytest tests/ -v` → 91/91 pasan, sin necesitar Postgres (toda la lógica
+`pytest tests/ -v` → 116/116 pasan, sin necesitar Postgres (toda la lógica
 de agentes está separada de la capa de datos a propósito).
 
 ## Infraestructura de IA modular (0004)
@@ -163,9 +221,9 @@ de agentes está separada de la capa de datos a propósito).
    `python -m src.llm.compile_prompts`). Si el contenido cambió, se
    INSERTA una versión nueva y se desactiva la anterior — nunca UPDATE.
 3. **Ejecutar** — el runtime (`src/llm/reinforcement.py`,
-   `src/llm/novelty_refinement.py`) lee el artefacto activo y lo usa
-   tal cual. Prompt caching de prefijo intacto: el bloque estático no
-   cambia a mitad de sesión.
+   `src/llm/novelty_refinement.py`, `src/llm/critic.py`) lee el artefacto
+   activo y lo usa tal cual. Prompt caching de prefijo intacto: el bloque
+   estático no cambia a mitad de sesión.
 
 ### Reglas de diseño (aprobadas)
 
@@ -181,10 +239,12 @@ de agentes está separada de la capa de datos a propósito).
 - **`critic_checklist`**: data-driven (checklist como dato). Todo ítem de
   `pipeline_templates.checklist` debe tener su interpretación en `rules`
   (validado en el CRUD con 422 y en el compilador con warning). Ítem sin
-  interpretación → `no_evaluado`, nunca `ok`.
+  interpretación → `no_evaluado`, nunca `ok` — garantizado en código por
+  `src/llm/critic.py::_normalize`, no solo por el prompt.
 - **`novelty_scoring`**: el scoring determinista sigue siendo el default.
-  El LLM solo se consulta en la zona gris y solo para juzgar `ángulo no
-cubierto`.
+  El LLM solo se consulta en la zona gris (0.70 ≤ similitud < 0.86) y
+  solo para juzgar `ángulo no cubierto`. Fuera de la banda gris no se
+  consulta al LLM.
 - **`prompt_artifacts` es inmutable** — recompilar = INSERT + desactivar
   la anterior.
 
@@ -223,10 +283,13 @@ sin implementar:
   el nodo que la consuma. No se implementó porque no hay forma de probarlo
   sin un ciclo real de contenido por el pipeline — ver la evaluación
   crítica original sobre secuenciación.
-- **Clave de Voyage** — la infraestructura de embeddings
-  (`embedding_settings` + `llm_models` con `voyage-3-large`) existe y
-  falla ruidosamente si no hay config; falta que el usuario provea la
-  clave y cree la `embedding_settings` activa vía `POST /embedding-settings`.
+- **Primera llamada de embeddings lenta** — la primera vez que se
+  ejecuta `embed_text` en un contenedor nuevo, el modelo
+  (`jinaai/jina-embeddings-v5-text-nano`, ~480MB) se descarga desde
+  HuggingFace Hub y se carga en RAM (~10s en CPU). Después queda
+  cacheado en la carpeta de `HF_HOME` (montada en `/app/hf_cache`) y en
+  memoria (singleton). Si el contenedor no tiene red al arrancar, la
+  primera llamada falla ruidosamente — por diseño.
 - **Checklist automático real en el Critic** — hoy `critic_node` marca
   todos los ítems del checklist como `True` (simulado). Antes de
   producción, cada ítem de `pipeline_templates.checklist` necesita una
