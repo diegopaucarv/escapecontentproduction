@@ -18,7 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from src.db.models import ApiKey, SessionSettings
+from src.db.models import ApiKey, LlmModel, SessionSettings
 
 TOGETHER_CHAT_URL = "https://api.together.xyz/v1/chat/completions"
 
@@ -69,6 +69,30 @@ def get_active_llm_config(session: Session) -> LLMConfig:
         max_tokens_small=int(settings.max_tokens_small),
         max_tokens_large=int(settings.max_tokens_large),
     )
+
+
+def get_vision_model(session: Session) -> str | None:
+    """Devuelve el model_name del modelo de visión activo (is_vision=True).
+
+    Consulta `llm_models` filtrando por is_vision=True e is_active=True,
+    ordenado por model_size (prefiere 'large' sobre 'small' si hay varios).
+    Devuelve None si no hay ningún modelo de visión registrado o si la
+    sesión no soporta la consulta (tests con sesiones falsas) — el caller
+    degrada a cfg.large_model.
+    """
+    try:
+        row = (
+            session.execute(
+                select(LlmModel)
+                .where(LlmModel.is_vision.is_(True), LlmModel.is_active.is_(True))
+                .order_by(LlmModel.model_size)
+            )
+            .scalars()
+            .first()
+        )
+        return row.model_name if row is not None else None
+    except Exception:  # noqa: BLE001 — degradación natural
+        return None
 
 
 def _llm_retries(session: Session) -> int:
@@ -189,8 +213,9 @@ def complete_vision(
 
     Igual que `complete`, pero el mensaje de usuario es una lista de
     contenido multimodal estilo OpenAI: texto + image_url. El modelo se
-    resuelve con cfg.large_model (el usuario puede setear el modelo de
-    visión como large_model en session_settings).
+    resuelve desde `llm_models` con is_vision=True (e is_active=True),
+    priorizando 'large' sobre 'small' si hay varios; si no hay ninguno,
+    degrada a cfg.large_model (comportamiento histórico).
     """
     if model_size not in ("small", "large", "vision"):
         raise ValueError(
@@ -198,7 +223,18 @@ def complete_vision(
         )
 
     cfg = get_active_llm_config(session)
-    model = cfg.small_model if model_size == "small" else cfg.large_model
+    if model_size == "small":
+        model = cfg.small_model
+    else:
+        vision_model = get_vision_model(session)
+        if vision_model is not None:
+            model = vision_model
+        else:
+            print(
+                "[LLM] ⚠️ Sin modelo is_vision=True en llm_models; "
+                "usando large_model como fallback"
+            )
+            model = cfg.large_model
     temp = (
         temperature
         if temperature is not None

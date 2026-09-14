@@ -1,5 +1,6 @@
 """Tests del seed de IA modular (src/db/seed_ai.py) — sin base real."""
 
+import os
 import uuid
 
 from src.db.seed_ai import MODELS, TEMPLATES, seed
@@ -105,3 +106,18 @@ def test_seed_returns_summary_with_ids():
         uuid.UUID(mid)  # no lanza
     for tid in result["templates"]:
         uuid.UUID(tid)
+
+
+def test_fix_db_host_replaces_docker_host(monkeypatch):
+    from src.db.seed_ai import _fix_db_host
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@db:5432/kag")
+    monkeypatch.setenv(
+        "DATABASE_URL_ASYNC", "postgresql+asyncpg://user:pass@db:5432/kag"
+    )
+    _fix_db_host()
+    assert os.environ["DATABASE_URL"] == "postgresql://user:pass@localhost:5432/kag"
+    assert (
+        os.environ["DATABASE_URL_ASYNC"]
+        == "postgresql+asyncpg://user:pass@localhost:5432/kag"
+    )

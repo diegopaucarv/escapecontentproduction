@@ -29,10 +29,39 @@ import sys
 from pathlib import Path
 
 import httpx
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from src.llm.base import call_with_retries, load_settings, parse_llm_output
 from src.llm.together import complete_vision
+
+# ---------------------------------------------------------------------
+# Prompt-as-code: task keys (specs en src/db/seed_kag_prompts.py)
+# ---------------------------------------------------------------------
+
+TASK_EXTRACT_ENTITIES = "kag_extract_entities"
+TASK_QWEN_SUMMARY = "kag_qwen_summary"
+
+# System prompts cortos actuales — fallback EXACTO de hoy cuando no hay
+# artefacto compilado (tests sin DB: get_active_prompt devuelve None).
+EXTRACT_SYSTEM_SHORT = "Eres un extractor de conocimiento. Devuelve JSON válido."
+
+
+def _get_system_prompt(session, model_name, task_key, fallback: str) -> str:
+    """System prompt desde el artefacto compilado, o el fallback actual.
+
+    Import perezoso + try/except: si no hay DB/artefacto (tests con sesiones
+    falsas), degrada a la constante de hoy sin romper nada.
+    """
+    try:
+        from src.llm.compiler import get_active_prompt
+
+        artifact = get_active_prompt(session, model_name, task_key)
+        if artifact is not None and artifact.prompt_text:
+            return artifact.prompt_text
+    except Exception:  # noqa: BLE001 — degradación natural
+        pass
+    return fallback
+
 
 # Raíces del repositorio de conocimiento (relativas a la raíz del proyecto).
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -427,6 +456,7 @@ def extract_entities_relations(session, chunk_text):
     settings = load_settings(session)
     retries = int(getattr(settings, "llm_retries", 3) or 3) if settings else 3
     fallback = getattr(settings, "fallback_model", None) if settings else None
+    small_model = getattr(settings, "small_model", None) if settings else None
     # str.replace en vez de .format(): el prompt contiene llaves JSON literales
     # que .format() interpretaría como placeholders (KeyError).
     prompt = EXTRACT_PROMPT.replace("{chunk}", chunk_text[:8000])
@@ -434,7 +464,9 @@ def extract_entities_relations(session, chunk_text):
         text_out, _model, _used_fallback = call_with_retries(
             session,
             prompt=prompt,
-            system="Eres un extractor de conocimiento. Devuelve JSON válido.",
+            system=_get_system_prompt(
+                session, small_model, TASK_EXTRACT_ENTITIES, EXTRACT_SYSTEM_SHORT
+            ),
             model_size="small",
             response_format={"type": "json_object"},
             retries=retries,
@@ -446,10 +478,36 @@ def extract_entities_relations(session, chunk_text):
 
 
 def _store_entities_relations(session, doc_id, chunk_id, data):
-    """Guarda entidades y relaciones de un chunk con dedup por name_norm (por doc)."""
+    """Guarda entidades y relaciones de un chunk con dedup por name_norm (por doc).
+
+    Batch: una sola consulta de existentes por doc + un solo INSERT multi-VALUES
+    por lote de entidades y otro por lote de relaciones (en vez de N+1
+    SELECT/INSERT por entidad). El grafo es incremental a nivel de documento:
+    solo se tocan las filas de este doc_id (el trigger de versión 0016
+    invalida la caché de adyacencia una vez por statement).
+    """
     entities = data.get("entities") or []
     relations = data.get("relations") or []
-    entity_ids = {}
+    if not entities and not relations:
+        return
+
+    # 1. Existentes del doc en UNA consulta (name_norm -> id).
+    norms = [normalize_entity_name(str(e.get("name", "")).strip()) for e in entities]
+    norms = [n for n in norms if n]
+    existing = {}
+    if norms:
+        rows = session.execute(
+            text(
+                "SELECT name_norm, id FROM kag_entities "
+                "WHERE doc_id = :doc_id AND name_norm = ANY(:norms)"
+            ).bindparams(bindparam("norms", expanding=True)),
+            {"doc_id": doc_id, "norms": list(dict.fromkeys(norms))},
+        ).fetchall()
+        existing = {r.name_norm: r.id for r in rows}
+
+    # 2. Insertar solo las entidades nuevas (multi-VALUES, un statement).
+    entity_ids = dict(existing)
+    new_entities = []
     for ent in entities:
         name = str(ent.get("name", "")).strip()
         if not name:
@@ -457,37 +515,61 @@ def _store_entities_relations(session, doc_id, chunk_id, data):
         name_norm = normalize_entity_name(name)
         if name_norm in entity_ids:
             continue
-        existing = session.execute(
-            text(
-                "SELECT id FROM kag_entities WHERE doc_id = :doc_id AND name_norm = :nn"
-            ),
-            {"doc_id": doc_id, "nn": name_norm},
-        ).first()
-        if existing:
-            entity_ids[name_norm] = existing.id
-            continue
-        eid = session.execute(
+        entity_ids[name_norm] = None  # placeholder: se rellena con RETURNING
+        new_entities.append(
+            (
+                doc_id,
+                chunk_id,
+                name,
+                name_norm,
+                str(ent.get("type", "concept"))[:100],
+                str(ent.get("description", "")),
+            )
+        )
+    if new_entities:
+        rows = session.execute(
             text(
                 "INSERT INTO kag_entities "
                 "(doc_id, chunk_id, name, name_norm, entity_type, description) "
                 "VALUES (:doc_id, :chunk_id, :name, :nn, :etype, :desc) "
-                "RETURNING id"
+                "RETURNING id, name_norm"
             ),
-            {
-                "doc_id": doc_id,
-                "chunk_id": chunk_id,
-                "name": name,
-                "nn": name_norm,
-                "etype": str(ent.get("type", "concept"))[:100],
-                "desc": str(ent.get("description", "")),
-            },
-        ).scalar()
-        entity_ids[name_norm] = eid
+            [
+                {
+                    "doc_id": d,
+                    "chunk_id": c,
+                    "name": n,
+                    "nn": nn,
+                    "etype": et,
+                    "desc": de,
+                }
+                for d, c, n, nn, et, de in new_entities
+            ],
+        ).fetchall()
+        for r in rows:
+            entity_ids[r.name_norm] = r.id
+
+    # 3. Relaciones (multi-VALUES, un statement). Solo las que referencian
+    #    entidades ya insertadas/existentes de este chunk.
+    new_relations = []
     for rel in relations:
         src = normalize_entity_name(str(rel.get("source", "")))
         tgt = normalize_entity_name(str(rel.get("target", "")))
         if src not in entity_ids or tgt not in entity_ids:
             continue
+        if entity_ids[src] is None or entity_ids[tgt] is None:
+            continue
+        new_relations.append(
+            (
+                doc_id,
+                chunk_id,
+                entity_ids[src],
+                entity_ids[tgt],
+                str(rel.get("type", "RELACIONA"))[:200],
+                str(rel.get("description", "")),
+            )
+        )
+    if new_relations:
         session.execute(
             text(
                 "INSERT INTO kag_relations "
@@ -495,14 +577,17 @@ def _store_entities_relations(session, doc_id, chunk_id, data):
                 "relation_type, description) "
                 "VALUES (:doc_id, :chunk_id, :src, :tgt, :rtype, :desc)"
             ),
-            {
-                "doc_id": doc_id,
-                "chunk_id": chunk_id,
-                "src": entity_ids[src],
-                "tgt": entity_ids[tgt],
-                "rtype": str(rel.get("type", "RELACIONA"))[:200],
-                "desc": str(rel.get("description", "")),
-            },
+            [
+                {
+                    "doc_id": d,
+                    "chunk_id": c,
+                    "src": s,
+                    "tgt": t,
+                    "rtype": rt,
+                    "desc": de,
+                }
+                for d, c, s, t, rt, de in new_relations
+            ],
         )
 
 
@@ -551,12 +636,17 @@ def summarize_document(session, text, doc_type):
     long:  map-reduce por secciones H1/H2 + llamada reduce.
     """
     try:
+        settings = load_settings(session)
+        small_model = getattr(settings, "small_model", None) if settings else None
+        summary_system = _get_system_prompt(
+            session, small_model, TASK_QWEN_SUMMARY, QWEN_SUMMARY_SYSTEM
+        )
         if doc_type == "short":
             truncated = text[:SUMMARY_MAX_CHARS]
             return complete_local(
                 session,
                 QWEN_SUMMARY_USER.format(text=truncated),
-                system=QWEN_SUMMARY_SYSTEM,
+                system=summary_system,
                 max_tokens=200,
             ).strip()
         section_summaries = []
@@ -565,7 +655,7 @@ def summarize_document(session, text, doc_type):
             s = complete_local(
                 session,
                 QWEN_SUMMARY_USER.format(text=truncated),
-                system=QWEN_SUMMARY_SYSTEM,
+                system=summary_system,
                 max_tokens=60,
             ).strip()
             if s:
@@ -576,7 +666,7 @@ def summarize_document(session, text, doc_type):
         return complete_local(
             session,
             QWEN_SUMMARY_USER.format(text=combined),
-            system=QWEN_SUMMARY_SYSTEM,
+            system=summary_system,
             max_tokens=200,
         ).strip()
     except Exception as exc:  # noqa: BLE001 — degradación no bloqueante
@@ -804,50 +894,57 @@ def index_document(
         )
 
         chunk_count = 0
-        for i, chunk in enumerate(chunks):
-            # Import perezoso: src.embeddings importa src.db.session (que lee
-            # .env al importar) — debe ocurrir DESPUÉS de _fix_db_host().
-            from src.embeddings import embed_text, embed_texts
+        # Import perezoso: src.embeddings importa src.db.session (que lee .env
+        # al importar) — debe ocurrir DESPUÉS de _fix_db_host().
+        from src.embeddings import embed_texts
 
+        # Batch de embeddings: una sola llamada al modelo por lote de chunks
+        # (en vez de N llamadas individuales — el cuello de botella real de la
+        # ingesta). El lote se parte en bloques de EMBED_BATCH_SIZE para no
+        # reventar la memoria del modelo.
+        EMBED_BATCH_SIZE = 32
+        for start in range(0, len(chunks), EMBED_BATCH_SIZE):
+            batch = chunks[start : start + EMBED_BATCH_SIZE]
             try:
-                emb = embed_text(chunk["content"], input_type="document")
+                embs = embed_texts([c["content"] for c in batch], input_type="document")
             except Exception as exc:  # noqa: BLE001 — chunk sin embedding
                 if verbose:
-                    print(f"[KAG] ⚠ Embedding falló (chunk {i}): {exc}")
-                emb = None
-            chunk_id = session.execute(
-                text(
-                    "INSERT INTO kag_chunks "
-                    "(doc_id, chunk_index, section_path, content, token_estimate, "
-                    "embedding) VALUES (:doc_id, :chunk_index, :section_path, "
-                    ":content, :token_estimate, CAST(:embedding AS vector)) "
-                    "RETURNING id"
-                ),
-                {
-                    "doc_id": doc_id,
-                    "chunk_index": i,
-                    "section_path": chunk["section_path"],
-                    "content": chunk["content"],
-                    "token_estimate": chunk["token_estimate"],
-                    "embedding": embedding_to_sql(emb),
-                },
-            ).scalar()
-            chunk_count += 1
-            if llm_entities:
-                data = extract_entities_relations(session, chunk["content"])
-            else:
-                # Extracción determinista con spaCy (gratis): reutiliza el nlp
-                # del segmentador (ya cargado) y canonicaliza con el modelo de
-                # embeddings de la DB (embed_texts, batch).
-                from src.kag.entities import extract_entities_deterministic
+                    print(f"[KAG] ⚠ Embedding falló (lote {start}): {exc}")
+                embs = [None] * len(batch)
+            for i, chunk in enumerate(batch):
+                chunk_id = session.execute(
+                    text(
+                        "INSERT INTO kag_chunks "
+                        "(doc_id, chunk_index, section_path, content, token_estimate, "
+                        "embedding) VALUES (:doc_id, :chunk_index, :section_path, "
+                        ":content, :token_estimate, CAST(:embedding AS vector)) "
+                        "RETURNING id"
+                    ),
+                    {
+                        "doc_id": doc_id,
+                        "chunk_index": start + i,
+                        "section_path": chunk["section_path"],
+                        "content": chunk["content"],
+                        "token_estimate": chunk["token_estimate"],
+                        "embedding": embedding_to_sql(embs[i]),
+                    },
+                ).scalar()
+                chunk_count += 1
+                if llm_entities:
+                    data = extract_entities_relations(session, chunk["content"])
+                else:
+                    # Extracción determinista con spaCy (gratis): reutiliza el nlp
+                    # del segmentador (ya cargado) y canonicaliza con el modelo de
+                    # embeddings de la DB (embed_texts, batch).
+                    from src.kag.entities import extract_entities_deterministic
 
-                data = extract_entities_deterministic(
-                    segmenter.nlp,
-                    chunk["content"],
-                    embed_fn=embed_texts,
-                    lang=lang,
-                )
-            _store_entities_relations(session, doc_id, chunk_id, data)
+                    data = extract_entities_deterministic(
+                        segmenter.nlp,
+                        chunk["content"],
+                        embed_fn=embed_texts,
+                        lang=lang,
+                    )
+                _store_entities_relations(session, doc_id, chunk_id, data)
         session.commit()
 
         entity_count = session.execute(

@@ -6,6 +6,7 @@ y src/kag_query.py con sesiones falsas y monkeypatch (patrón de
 tests/test_embeddings.py).
 """
 
+import re
 from types import SimpleNamespace
 
 import httpx
@@ -22,6 +23,7 @@ from src.kag_query import (
     apply_relevance_threshold,
     assemble_context,
     build_adjacency,
+    chunks_by_ids,
     classify_query,
     disambiguate_by_cooccurrence,
     grounded_entity_linking,
@@ -246,6 +248,65 @@ def test_personalized_pagerank_empty_seed_returns_empty():
     assert personalized_pagerank({1: {2: 1}, 2: {1: 1}}, seed=[]) == {}
 
 
+def test_ego_network_2hop_subgraph():
+    """ego_network extrae solo la vecindad de 2 saltos de la semilla."""
+    import src.kag_query as kq
+
+    # Cadena 1-2-3-4-5: desde 1, 2 saltos llegan a {1,2,3}; 4 y 5 quedan fuera.
+    adj = {
+        1: {2: 1},
+        2: {1: 1, 3: 1},
+        3: {2: 1, 4: 1},
+        4: {3: 1, 5: 1},
+        5: {4: 1},
+    }
+    sub = kq.ego_network(adj, seed=[1], hops=2)
+    assert set(sub.keys()) == {1, 2, 3}
+    assert sub[1] == {2: 1}
+    assert sub[2] == {1: 1, 3: 1}
+    assert sub[3] == {2: 1}  # la arista 3-4 se poda (4 fuera del subgrafo)
+
+
+def test_ego_network_empty_seed_returns_empty():
+    import src.kag_query as kq
+
+    assert kq.ego_network({1: {2: 1}}, seed=[]) == {}
+
+
+def test_ego_network_isolated_seed():
+    """Semilla sin vecinos → subgrafo con solo la semilla (sin aristas)."""
+    import src.kag_query as kq
+
+    adj = {1: {}, 2: {3: 1}, 3: {2: 1}}
+    sub = kq.ego_network(adj, seed=[1], hops=2)
+    assert sub == {}  # nodo 1 sin vecinos: no hay aristas en el subgrafo
+
+
+def test_ego_network_ppr_equivalent_on_subgraph():
+    """PPR sobre el ego-network da los mismos scores que sobre el grafo
+    completo cuando la semilla está aislada del resto (nada se pierde)."""
+    import src.kag_query as kq
+
+    adj = {
+        1: {2: 1, 3: 1},
+        2: {1: 1, 3: 1},
+        3: {1: 1, 2: 1},
+        99: {100: 1},  # componente desconectada
+        100: {99: 1},
+    }
+    sub = kq.ego_network(adj, seed=[1], hops=2)
+    full = personalized_pagerank(adj, seed=[1])
+    local = personalized_pagerank(sub, seed=[1])
+    # Los scores de los nodos del subgrafo coinciden (la componente
+    # desconectada no aporta masa al PPR de la semilla). La diferencia es
+    # ~1e-8: el vector inicial uniforme del grafo completo reparte una masa
+    # minúscula en la componente desconectada que el subgrafo no ve.
+    for node in sub:
+        assert abs(full[node] - local[node]) < 1e-6
+    assert 99 not in local
+    assert 100 not in local
+
+
 # ---------------------------------------------------------------------
 # build_adjacency
 # ---------------------------------------------------------------------
@@ -413,6 +474,150 @@ def test_build_adjacency_degrades_without_version_table():
     assert session.relation_queries == 2  # relee cada vez
     assert adj2 is not adj1  # no cachea
     assert adj2[1][2] == 1
+
+
+# ---------------------------------------------------------------------
+# chunks_by_ids (N+1 → una consulta con array_position)
+# ---------------------------------------------------------------------
+
+
+def test_chunks_by_ids_single_query_preserves_order():
+    """Una sola consulta por todos los ids, ordenada por array_position."""
+    import src.kag_query as kq
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    class _FakeSession:
+        def __init__(self, rows_by_id):
+            self.rows_by_id = rows_by_id
+            self.queries = 0
+
+        def execute(self, stmt, params=None):
+            self.queries += 1
+            ids = params["ids"]
+            rows = [self.rows_by_id[i] for i in ids if i in self.rows_by_id]
+            return _Result(rows=rows)
+
+    rows_by_id = {
+        10: SimpleNamespace(
+            id=10,
+            doc_id=1,
+            section_path="## A",
+            content="diez",
+            chunk_index=0,
+            doc_path="a.md",
+        ),
+        20: SimpleNamespace(
+            id=20,
+            doc_id=1,
+            section_path="## B",
+            content="veinte",
+            chunk_index=1,
+            doc_path="a.md",
+        ),
+        30: SimpleNamespace(
+            id=30,
+            doc_id=2,
+            section_path="## C",
+            content="treinta",
+            chunk_index=0,
+            doc_path="b.md",
+        ),
+    }
+    session = _FakeSession(rows_by_id)
+
+    # Orden de entrada desordenado (como el RRF): 30, 10, 20.
+    out = chunks_by_ids(session, [30, 10, 20])
+    assert session.queries == 1  # una sola consulta, no N
+    assert [c["chunk_id"] for c in out] == [30, 10, 20]  # orden preservado
+    assert out[0]["content"] == "treinta"
+    assert out[1]["content"] == "diez"
+    assert out[2]["content"] == "veinte"
+
+
+def test_chunks_by_ids_empty_and_missing():
+    """Sin ids → [] sin consulta; ids inexistentes se omiten."""
+    import src.kag_query as kq
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    class _FakeSession:
+        def __init__(self, rows_by_id):
+            self.rows_by_id = rows_by_id
+            self.queries = 0
+
+        def execute(self, stmt, params=None):
+            self.queries += 1
+            ids = params["ids"]
+            rows = [self.rows_by_id[i] for i in ids if i in self.rows_by_id]
+            return _Result(rows=rows)
+
+    session = _FakeSession(
+        {
+            1: SimpleNamespace(
+                id=1,
+                doc_id=1,
+                section_path="",
+                content="uno",
+                chunk_index=0,
+                doc_path="a.md",
+            )
+        }
+    )
+    assert chunks_by_ids(session, []) == []
+    assert session.queries == 0
+    out = chunks_by_ids(session, [1, 999])  # 999 no existe
+    assert [c["chunk_id"] for c in out] == [1]
+    assert session.queries == 1
+
+
+def test_chunks_by_ids_dedups_input():
+    """Ids duplicados en la entrada se consultan una vez y salen una vez."""
+    import src.kag_query as kq
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    class _FakeSession:
+        def __init__(self, rows_by_id):
+            self.rows_by_id = rows_by_id
+            self.queries = 0
+
+        def execute(self, stmt, params=None):
+            self.queries += 1
+            ids = params["ids"]
+            rows = [self.rows_by_id[i] for i in ids if i in self.rows_by_id]
+            return _Result(rows=rows)
+
+    session = _FakeSession(
+        {
+            5: SimpleNamespace(
+                id=5,
+                doc_id=1,
+                section_path="",
+                content="cinco",
+                chunk_index=0,
+                doc_path="a.md",
+            )
+        }
+    )
+    out = chunks_by_ids(session, [5, 5, 5])
+    assert session.queries == 1
+    assert [c["chunk_id"] for c in out] == [5]
 
 
 # ---------------------------------------------------------------------
@@ -1064,17 +1269,26 @@ def test_noun_chunk_fallback_no_phrases_degrades(monkeypatch):
 
 
 class _RegexSession:
-    """Sesión falsa: responde a la query FTS por término."""
+    """Sesión falsa: responde a la query FTS combinada (tsq) por término.
+
+    El crítico ahora hace UNA consulta con to_tsquery OR ("t1" | "t2").
+    La sesión parsea el tsq, extrae los términos entre comillas dobles y
+    devuelve los hits de cada uno (dedup por id, orden de aparición).
+    """
 
     def __init__(self, hits_by_term):
         self.hits_by_term = hits_by_term  # {term: [(id, score)]}
 
     def execute(self, stmt, params=None):
-        term = params["q"]
-        rows = [
-            SimpleNamespace(id=cid, score=s)
-            for cid, s in self.hits_by_term.get(term, [])
-        ]
+        tsq = params.get("tsq", "")
+        terms = re.findall(r'"([^"]*)"', tsq)
+        rows = []
+        seen = set()
+        for t in terms:
+            for cid, s in self.hits_by_term.get(t, []):
+                if cid not in seen:
+                    seen.add(cid)
+                    rows.append(SimpleNamespace(id=cid, score=s))
 
         class _Result:
             def __init__(self, rows):
@@ -1179,6 +1393,312 @@ def test_critic_regex_search_llm_fails_uses_heuristic(monkeypatch):
     hits, terms = kq.critic_regex_search(session, "¿Qué es CVE-2024-3094?", top_k=5)
     assert terms == ["CVE-2024-3094"]  # heurística determinista
     assert hits == [(7, 3.0)]
+
+
+def test_critic_regex_search_batches_terms_in_one_query(monkeypatch):
+    """Varios términos → UNA consulta FTS con tsquery OR (no N consultas)."""
+    import src.kag_query as kq
+
+    class _CountingSession:
+        def __init__(self):
+            self.queries = 0
+
+        def execute(self, stmt, params=None):
+            # El SELECT de get_active_prompt (prompt-as-code) llega sin params;
+            # se ignora para no contar como consulta FTS (el fallback a la
+            # constante cubre el system prompt en tests sin DB).
+            if params is None:
+
+                class _Empty:
+                    def scalars(self):
+                        return self
+
+                    def first(self):
+                        return None
+
+                return _Empty()
+            self.queries += 1
+            tsq = params.get("tsq", "")
+            assert '"CVE-2024-3094"' in tsq
+            assert '"Bourdieu"' in tsq
+            assert " | " in tsq  # OR booleano
+            rows = [
+                SimpleNamespace(id=7, score=3.0),
+                SimpleNamespace(id=9, score=2.5),
+            ]
+
+            class _Result:
+                def __init__(self, rows):
+                    self._rows = rows
+
+                def fetchall(self):
+                    return self._rows
+
+            return _Result(rows)
+
+    session = _CountingSession()
+
+    def fake_call(
+        session,
+        *,
+        prompt,
+        system,
+        model_size,
+        response_format,
+        retries,
+        fallback_model=None,
+    ):
+        return (
+            '{"needs_regex": true, "terms": ["CVE-2024-3094", "Bourdieu"]}',
+            "small",
+            False,
+        )
+
+    monkeypatch.setattr(kq, "call_with_retries", fake_call)
+    monkeypatch.setattr(
+        kq,
+        "load_settings",
+        lambda session: SimpleNamespace(llm_retries=3, fallback_model=None),
+    )
+
+    hits, terms = kq.critic_regex_search(
+        session, "¿Qué es CVE-2024-3094 y Bourdieu?", top_k=5
+    )
+    assert terms == ["CVE-2024-3094", "Bourdieu"]
+    assert hits == [(7, 3.0), (9, 2.5)]
+    assert session.queries == 1  # una sola consulta, no N
+
+
+def test_critic_regex_search_escapes_quotes_in_terms(monkeypatch):
+    """Términos con comillas dobles se escapan (no rompen el tsquery)."""
+    import src.kag_query as kq
+
+    class _CaptureSession:
+        def __init__(self):
+            self.tsq = None
+
+        def execute(self, stmt, params=None):
+            self.tsq = params.get("tsq", "")
+
+            class _Result:
+                def fetchall(self):
+                    return []
+
+            return _Result()
+
+    session = _CaptureSession()
+
+    def fake_call(
+        session,
+        *,
+        prompt,
+        system,
+        model_size,
+        response_format,
+        retries,
+        fallback_model=None,
+    ):
+        return '{"needs_regex": true, "terms": ["a\\"b"]}', "small", False
+
+    monkeypatch.setattr(kq, "call_with_retries", fake_call)
+    monkeypatch.setattr(
+        kq,
+        "load_settings",
+        lambda session: SimpleNamespace(llm_retries=3, fallback_model=None),
+    )
+
+    hits, terms = kq.critic_regex_search(session, 'a"b', top_k=5)
+    assert terms == ['a"b']
+    assert '"a""b"' in session.tsq  # comilla doble escapada duplicándola
+
+
+# ---------------------------------------------------------------------
+# critic_and_linking — CRIT + EL fusionados en UNA llamada LLM
+# ---------------------------------------------------------------------
+
+
+class _CombinedSession:
+    """Sesión falsa para critic_and_linking: responde al pool (LIKE) y al FTS (tsq)."""
+
+    def __init__(self, like=None, hits_by_term=None):
+        self.like = like or {}  # substring -> [(id, name)]
+        self.hits_by_term = hits_by_term or {}  # term -> [(id, score)]
+
+    def execute(self, stmt, params=None):
+        sql = str(stmt)
+        if "name_norm LIKE :pat" in sql:
+            pat = params["pat"].strip("%")
+            rows = []
+            for key, vals in self.like.items():
+                if key in pat or pat in key:
+                    rows.extend(SimpleNamespace(id=i, name=n) for i, n in vals)
+            # Dedup por name (el fallback determinista espera nombres únicos).
+            seen = set()
+            deduped = []
+            for r in rows:
+                if r.name not in seen:
+                    seen.add(r.name)
+                    deduped.append(r)
+            rows = deduped
+        elif "to_tsquery" in sql:
+            tsq = params.get("tsq", "")
+            terms = re.findall(r'"([^"]*)"', tsq)
+            rows = []
+            seen = set()
+            for t in terms:
+                for cid, s in self.hits_by_term.get(t, []):
+                    if cid not in seen:
+                        seen.add(cid)
+                        rows.append(SimpleNamespace(id=cid, score=s))
+        else:
+            rows = []
+
+        class _Result:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def fetchall(self):
+                return self._rows
+
+        return _Result(rows)
+
+
+def test_critic_and_linking_llm_anchors_entities_and_fts(monkeypatch):
+    import src.kag_query as kq
+
+    # Pool determinista: "Red Neuronal" (vía LIKE desde el fallback).
+    session = _CombinedSession(
+        like={"red": [(1, "Red Neuronal")], "neuronal": [(1, "Red Neuronal")]},
+        hits_by_term={"CVE-2024-3094": [(7, 3.0), (8, 2.0)]},
+    )
+
+    def fake_get_spacy(session, lang):
+        raise RuntimeError("no spacy")
+
+    monkeypatch.setattr(kq, "_get_spacy_nlp", fake_get_spacy)
+    monkeypatch.setattr(
+        kq,
+        "load_settings",
+        lambda session: SimpleNamespace(llm_retries=3, fallback_model=None),
+    )
+
+    captured = {}
+
+    def fake_call(
+        session,
+        *,
+        prompt,
+        system,
+        model_size,
+        response_format,
+        retries,
+        fallback_model=None,
+    ):
+        captured["prompt"] = prompt
+        return (
+            '{"needs_regex": true, "terms": ["CVE-2024-3094"], "entities": ["Red Neuronal"]}',
+            "small",
+            False,
+        )
+
+    monkeypatch.setattr(kq, "call_with_retries", fake_call)
+
+    hits, terms, names = kq.critic_and_linking(
+        session, "¿Qué es CVE-2024-3094 y Red Neuronal?", top_k=5
+    )
+    assert terms == ["CVE-2024-3094"]
+    assert names == ["Red Neuronal"]  # anclado al pool
+    assert hits == [(7, 3.0), (8, 2.0)]
+    # El prompt incluye el pool de candidatos del grafo.
+    assert "Red Neuronal" in captured["prompt"]
+
+
+def test_critic_and_linking_llm_fails_degrades(monkeypatch):
+    import src.kag_query as kq
+
+    session = _CombinedSession(
+        like={"red": [(1, "Red Neuronal")], "neuronal": [(1, "Red Neuronal")]},
+        hits_by_term={"CVE-2024-3094": [(7, 3.0)]},
+    )
+
+    def fake_get_spacy(session, lang):
+        raise RuntimeError("no spacy")
+
+    monkeypatch.setattr(kq, "_get_spacy_nlp", fake_get_spacy)
+    monkeypatch.setattr(
+        kq,
+        "load_settings",
+        lambda session: SimpleNamespace(llm_retries=3, fallback_model=None),
+    )
+
+    def fake_call(
+        session,
+        *,
+        prompt,
+        system,
+        model_size,
+        response_format,
+        retries,
+        fallback_model=None,
+    ):
+        raise RuntimeError("LLM caído")
+
+    monkeypatch.setattr(kq, "call_with_retries", fake_call)
+
+    hits, terms, names = kq.critic_and_linking(
+        session, "¿Qué es CVE-2024-3094 y Red Neuronal?", top_k=5
+    )
+    # Heurística determinista: captura el código alfanumérico Y la frase
+    # capitalizada "Red Neuronal" (ambos son términos exactos).
+    assert terms == ["CVE-2024-3094", "Red Neuronal"]
+    assert names == ["Red Neuronal"]  # pool determinista como degradación
+    assert hits == [(7, 3.0)]
+
+
+def test_critic_and_linking_discards_out_of_pool_entities(monkeypatch):
+    import src.kag_query as kq
+
+    # Pool: solo "Red Neuronal". El LLM alucina "Red de Petri" (fuera del pool).
+    session = _CombinedSession(
+        like={"red": [(1, "Red Neuronal")], "neuronal": [(1, "Red Neuronal")]},
+        hits_by_term={},
+    )
+
+    def fake_get_spacy(session, lang):
+        raise RuntimeError("no spacy")
+
+    monkeypatch.setattr(kq, "_get_spacy_nlp", fake_get_spacy)
+    monkeypatch.setattr(
+        kq,
+        "load_settings",
+        lambda session: SimpleNamespace(llm_retries=3, fallback_model=None),
+    )
+
+    def fake_call(
+        session,
+        *,
+        prompt,
+        system,
+        model_size,
+        response_format,
+        retries,
+        fallback_model=None,
+    ):
+        return (
+            '{"needs_regex": false, "terms": [], "entities": ["Red de Petri"]}',
+            "small",
+            False,
+        )
+
+    monkeypatch.setattr(kq, "call_with_retries", fake_call)
+
+    hits, terms, names = kq.critic_and_linking(
+        session, "¿Qué es la red neuronal?", top_k=5
+    )
+    # "Red de Petri" no está en el pool → se descarta → cae al pool determinista.
+    assert names == ["Red Neuronal"]
+    assert terms == []  # needs_regex false y sin términos exactos
+    assert hits == []
 
 
 # ---------------------------------------------------------------------
@@ -1322,3 +1842,91 @@ def test_hybrid_search_none_embedding_and_no_fts_returns_empty(monkeypatch):
 
     hits = hybrid_search(session, "pregunta", None, top_k=5)
     assert hits == []
+
+
+# ---------------------------------------------------------------------
+# assemble_context — orden determinista para prompt caching (Fase 6)
+# ---------------------------------------------------------------------
+
+
+def test_assemble_context_deterministic_order_for_caching():
+    # Subgrafo y resúmenes van ANTES de los fragmentos (prefijo cacheable)
+    # y ordenados de forma determinista (alfabético por doc).
+    chunks = [
+        {
+            "doc_path": "b.md",
+            "section_path": "",
+            "chunk_index": 0,
+            "content": "chunk b",
+        },
+        {
+            "doc_path": "a.md",
+            "section_path": "",
+            "chunk_index": 0,
+            "content": "chunk a",
+        },
+    ]
+    triples = [
+        {"source": "Z", "type": "USA", "target": "A", "doc": "b.md"},
+        {"source": "A", "type": "USA", "target": "B", "doc": "a.md"},
+    ]
+    summaries = [
+        {"doc_path": "b.md", "summary": "resumen b"},
+        {"doc_path": "a.md", "summary": "resumen a"},
+    ]
+    ctx = assemble_context(chunks, triples, [], summaries, "pregunta")
+    # El subgrafo ordena por (doc, source, target): a.md antes que b.md.
+    assert ctx.index("(A) -[USA]-> (B)") < ctx.index("(Z) -[USA]-> (A)")
+    # Los resúmenes ordenan por doc_path: a.md antes que b.md.
+    assert ctx.index("resumen a") < ctx.index("resumen b")
+    # Subgrafo y resúmenes van antes de los fragmentos (prefijo cacheable).
+    assert ctx.index("SUBGRAFO DE ENTIDADES") < ctx.index("FRAGMENTOS RECUPERADOS")
+    assert ctx.index("RESUMENES DE DOCUMENTO") < ctx.index("FRAGMENTOS RECUPERADOS")
+
+
+# ---------------------------------------------------------------------
+# rerank_chunks — cross-encoder opcional (default OFF, Fase 3)
+# ---------------------------------------------------------------------
+
+
+def test_rerank_chunks_disabled_returns_same_order(monkeypatch):
+    import src.kag_query as kq
+
+    monkeypatch.setattr(kq, "RERANK_ENABLED", False)
+    chunks = [{"chunk_id": 1, "content": "a"}, {"chunk_id": 2, "content": "b"}]
+    assert kq.rerank_chunks("query", chunks) is chunks
+
+
+def test_rerank_chunks_reorders_by_score(monkeypatch):
+    import src.kag_query as kq
+
+    monkeypatch.setattr(kq, "RERANK_ENABLED", True)
+
+    class _FakeModel:
+        def predict(self, pairs):
+            # El segundo par (chunk 2) es más relevante para la query.
+            return [0.1, 0.9]
+
+    monkeypatch.setattr(kq, "_get_reranker", lambda: _FakeModel())
+
+    chunks = [
+        {"chunk_id": 1, "content": "a", "score": 0.5},
+        {"chunk_id": 2, "content": "b", "score": 0.4},
+    ]
+    out = kq.rerank_chunks("query", chunks)
+    assert [c["chunk_id"] for c in out] == [2, 1]
+    assert out[0]["score"] == 0.9  # el score del ancla se actualiza
+
+
+def test_rerank_chunks_degrades_on_model_failure(monkeypatch):
+    import src.kag_query as kq
+
+    monkeypatch.setattr(kq, "RERANK_ENABLED", True)
+
+    def boom():
+        raise RuntimeError("modelo no disponible")
+
+    monkeypatch.setattr(kq, "_get_reranker", boom)
+
+    chunks = [{"chunk_id": 1, "content": "a"}, {"chunk_id": 2, "content": "b"}]
+    assert kq.rerank_chunks("query", chunks) is chunks

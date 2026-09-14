@@ -464,6 +464,8 @@ class LlmModel(Base):
     prompt_style: Mapped[str] = mapped_column(Text, default="")
     syntax_profile: Mapped[dict] = mapped_column(JSONB, default=dict)
     is_active: Mapped[bool] = mapped_column(default=True)
+    # Identifica modelos de visión (VLM) para lectura de imágenes (0018).
+    is_vision: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
 

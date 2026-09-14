@@ -1,6 +1,7 @@
 """Tests del seed de visión (src/db/seed_vision.py) y del soporte de
 visión en compilador/cliente — sin base real ni red."""
 
+import os
 import uuid
 from types import SimpleNamespace
 
@@ -143,6 +144,21 @@ def test_seed_returns_summary_with_ids():
         uuid.UUID(mid)  # no lanza
     for tid in result["templates"]:
         uuid.UUID(tid)
+
+
+def test_fix_db_host_replaces_docker_host(monkeypatch):
+    from src.db.seed_vision import _fix_db_host
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@db:5432/kag")
+    monkeypatch.setenv(
+        "DATABASE_URL_ASYNC", "postgresql+asyncpg://user:pass@db:5432/kag"
+    )
+    _fix_db_host()
+    assert os.environ["DATABASE_URL"] == "postgresql://user:pass@localhost:5432/kag"
+    assert (
+        os.environ["DATABASE_URL_ASYNC"]
+        == "postgresql+asyncpg://user:pass@localhost:5432/kag"
+    )
 
 
 # ---------------------------------------------------------------------

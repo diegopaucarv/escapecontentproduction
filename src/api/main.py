@@ -2363,3 +2363,94 @@ def list_order_kaizen_cycles(
         .all()
     )
     return [_kaizen_cycle_to_dict(c) for c in rows]
+
+
+# ---------------------------------------------------------------------
+# Motor KAG proposicional — consulta e ingesta
+# ---------------------------------------------------------------------
+
+
+class KagAskRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=4000)
+    top_propositions: int = Field(15, ge=1, le=100)
+    max_iterations: int = Field(2, ge=0, le=5)
+
+
+@app.post("/kag/ask", response_model=dict)
+def kag_ask(body: KagAskRequest, session: Session = Depends(get_session)) -> dict:
+    """Consulta proposicional al motor KAG (§3 del diseño).
+
+    Devuelve el payload enriquecido: respuesta final, veredicto de
+    suficiencia, estado de Branch A (citas auditadas en grounded_evidence)
+    y metadatos de las obras consultadas (consulted_documents, dedup por
+    document_id). El import de ask_propositional es lazy: el módulo KAG
+    carga torch/spacy y no debe pesarse al arrancar la API.
+    """
+    from src.kag_agents import ask_propositional
+
+    try:
+        result = ask_propositional(
+            session,
+            body.query,
+            top_propositions=body.top_propositions,
+            max_iterations=body.max_iterations,
+            verbose=False,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    consulted: dict[str, dict] = {}
+    for ev in result.get("grounded_evidence", []) or []:
+        doc_id = ev.get("document_id")
+        if doc_id is None:
+            continue
+        if doc_id not in consulted:
+            consulted[doc_id] = {
+                "document_id": doc_id,
+                "document_title": ev.get("document_title"),
+                "bibtex_citation_key": ev.get("bibtex_citation_key"),
+            }
+    return {
+        "answer": result.get("answer"),
+        "verdict": result.get("verdict"),
+        "grounded_evidence": result.get("grounded_evidence", []),
+        "epistemic_tensions": result.get("epistemic_tensions", []),
+        "used_fallback": result.get("used_fallback", False),
+        "consulted_documents": list(consulted.values()),
+    }
+
+
+class KagIngestRequest(BaseModel):
+    file_path: str | None = Field(
+        None, description="Ruta del .md a indexar; None = todos los de docs/"
+    )
+    force: bool = False
+
+
+@app.post("/kag/ingest", response_model=dict)
+def kag_ingest(
+    body: KagIngestRequest,
+    session: Session = Depends(get_session),
+    user: AppUser = Depends(require_role("lider")),
+) -> dict:
+    """Ingesta proposicional: indexa un .md concreto o todos los de
+    data/knowledge_repository/docs/ (force=True reindexa aunque ya estén
+    indexados). Solo un 🟨 líder puede disparar la ingesta.
+    """
+    if body.file_path:
+        from src.kag_propositional import index_stacked_file
+
+        try:
+            results = index_stacked_file(
+                session, body.file_path, force=body.force, verbose=False
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+    else:
+        from src.kag_propositional import index_all
+
+        try:
+            results = index_all(session, force=body.force, verbose=False)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {"results": results, "count": len(results)}

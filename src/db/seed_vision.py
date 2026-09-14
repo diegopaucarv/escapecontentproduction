@@ -22,11 +22,12 @@ Uso:
 from __future__ import annotations
 
 import argparse
+import os
+from pathlib import Path
 
 from sqlalchemy import select
 
 from src.db.models import ApiKey, LlmModel, PromptTemplate
-from src.db.session import SessionLocal
 
 # ---------------------------------------------------------------------
 # Api key de visión (tabla api_keys)
@@ -83,6 +84,7 @@ VISION_MODELS = [
         "model_name": "meta-llama/Llama-3.2-11B-Vision-Instruct-Turbo",
         "provider": "together",
         "model_size": "vision",
+        "is_vision": True,
         "context_window": 8192,
         "max_output_tokens": 2048,
         "temperature_default": 0.4,
@@ -95,6 +97,7 @@ VISION_MODELS = [
         "model_name": "Qwen/Qwen2-VL-72B-Instruct",
         "provider": "together",
         "model_size": "vision",
+        "is_vision": True,
         "context_window": 32768,
         "max_output_tokens": 4096,
         "temperature_default": 0.4,
@@ -159,6 +162,25 @@ VISION_TEMPLATES = [
         "few_shot": [],
     },
 ]
+
+
+def _fix_db_host() -> None:
+    """Reemplaza '@db:' por '@localhost:' en DATABASE_URL/DATABASE_URL_ASYNC.
+
+    El host 'db' es la red Docker y no resuelve desde el host; las credenciales
+    son las mismas. Debe llamarse ANTES de importar src.db.session.
+    """
+    env_path = Path(__file__).resolve().parent.parent.parent / ".env"
+    for var in ("DATABASE_URL", "DATABASE_URL_ASYNC"):
+        val = os.environ.get(var, "")
+        if not val and env_path.exists():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith(f"{var}="):
+                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
+        if "@db:" in val:
+            os.environ[var] = val.replace("@db:", "@localhost:")
 
 
 def _upsert_api_key(session, data: dict) -> ApiKey:
@@ -226,6 +248,9 @@ def seed(session=None) -> dict:
     """
     own_session = session is None
     if own_session:
+        _fix_db_host()
+        from src.db.session import SessionLocal
+
         session = SessionLocal()
     try:
         key = _upsert_api_key(session, VISION_API_KEY)
@@ -249,6 +274,7 @@ def main() -> None:
         description="Seed de infraestructura de visión (key + modelos + specs)."
     )
     parser.parse_args()
+    _fix_db_host()
     result = seed()
     print("Infraestructura de visión lista:")
     print(
