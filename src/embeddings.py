@@ -134,5 +134,8 @@ def embed_text(text: str, input_type: str = "document") -> list[float]:
     )
     vec = emb[0]
     if hasattr(vec, "detach"):  # torch.Tensor -> numpy
-        vec = vec.detach().cpu().numpy()
+        # .float() convierte bfloat16 -> float32: pgvector NO soporta bfloat16
+        # ("Got unsupported ScalarType BFloat16") y el modelo corre en bfloat16
+        # en GPU. Los valores no cambian, solo el dtype.
+        vec = vec.detach().cpu().float().numpy()
     return vec.tolist() if hasattr(vec, "tolist") else list(vec)

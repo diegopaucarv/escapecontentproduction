@@ -245,6 +245,9 @@ def test_embed_text_handles_tensor(monkeypatch):
         def cpu(self):
             return self
 
+        def float(self):
+            return self
+
         def numpy(self):
             return np.array([0.1, 0.2, 0.3])
 
