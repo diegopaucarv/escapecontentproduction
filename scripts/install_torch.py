@@ -22,6 +22,11 @@ import subprocess
 import sys
 
 TORCH_VERSION = "2.12.0"
+# torchvision debe matchear la versión de torch (torch 2.x → torchvision 0.(x+15).0).
+# Un torchvision desajustado rompe transformers con el confuso error
+# "operator torchvision::nms does not exist" (y de rebote "Could not import
+# module 'XLMRobertaModel'"). Se instala junto a torch para que siempre matcheen.
+TORCHVISION_VERSION = "0.27.0"
 CPU_INDEX = "https://download.pytorch.org/whl/cpu"
 CUDA_INDEX = "https://download.pytorch.org/whl/cu126"  # CUDA 12.6 — ajustar si el driver lo requiere
 
@@ -47,6 +52,10 @@ def main() -> int:
         index, pkg = CPU_INDEX, f"torch=={TORCH_VERSION}+cpu"
         print(f"Sin GPU NVIDIA -> {pkg} desde {index}")
 
+    suffix = pkg.split("+", 1)[1]  # cpu | cu126
+    tv_pkg = f"torchvision=={TORCHVISION_VERSION}+{suffix}"
+    print(f"torchvision -> {tv_pkg} desde {index}")
+
     cmd = [
         sys.executable,
         "-m",
@@ -55,6 +64,7 @@ def main() -> int:
         "--extra-index-url",
         index,
         pkg,
+        tv_pkg,
     ]
     return subprocess.call(cmd)
 
