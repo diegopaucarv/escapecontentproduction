@@ -691,13 +691,63 @@ def index_document(session, md_path, force=False, no_summary=False, verbose=True
     doc_type = "long" if token_estimate >= LONG_DOC_THRESHOLD else "short"
 
     existing = session.execute(
-        text("SELECT id, content_hash FROM kag_documents WHERE doc_path = :p"),
+        text("SELECT id, content_hash, status FROM kag_documents WHERE doc_path = :p"),
         {"p": doc_path},
     ).first()
     if existing and existing.content_hash == content_hash and not force:
+        # ── Graceful degradation ────────────────────────────────────────────
+        # Solo se salta un doc si está COMPLETO (status='ready' y sin chunks
+        # con embedding NULL). Si quedó pending/failed (proceso interrumpido)
+        # o con embeddings incompletos, se re-procesa en vez de saltar.
+        if existing.status == "ready":
+            null_emb = session.execute(
+                text(
+                    "SELECT COUNT(*) FROM kag_chunks "
+                    "WHERE doc_id = :id AND embedding IS NULL"
+                ),
+                {"id": existing.id},
+            ).scalar()
+            if null_emb == 0:
+                if verbose:
+                    print(f"[KAG] ⏭ {doc_path} ya indexado (hash idéntico).")
+                return {"status": "skipped", "doc_path": doc_path}
+            # ready pero con embeddings incompletos → re-embeder solo los que
+            # faltan (sin re-segmentar ni re-extraer entidades).
+            if verbose:
+                print(
+                    f"[KAG] ♻ {doc_path} ready pero {null_emb} chunks sin "
+                    "embedding — re-embebiendo..."
+                )
+            rows = session.execute(
+                text(
+                    "SELECT id, content FROM kag_chunks "
+                    "WHERE doc_id = :id AND embedding IS NULL"
+                ),
+                {"id": existing.id},
+            ).fetchall()
+            from src.embeddings import embed_text
+
+            for r in rows:
+                try:
+                    emb = embed_text(r.content, input_type="document")
+                except Exception as exc:  # noqa: BLE001 — chunk sin embedding
+                    if verbose:
+                        print(f"[KAG] ⚠ Embedding falló (chunk {r.id}): {exc}")
+                    continue
+                session.execute(
+                    text(
+                        "UPDATE kag_chunks SET embedding = CAST(:emb AS vector) "
+                        "WHERE id = :id"
+                    ),
+                    {"emb": embedding_to_sql(emb), "id": r.id},
+                )
+            session.commit()
+            return {"status": "reembedded", "doc_path": doc_path}
         if verbose:
-            print(f"[KAG] ⏭ {doc_path} ya indexado (hash idéntico).")
-        return {"status": "skipped", "doc_path": doc_path}
+            print(
+                f"[KAG] ♻ {doc_path} en estado '{existing.status}' (proceso "
+                "interrumpido?) — re-indexando..."
+            )
 
     if existing:
         session.execute(

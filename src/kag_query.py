@@ -161,8 +161,9 @@ def _deterministic_entity_fallback(session, query: str) -> list:
     for w in words:
         rows = session.execute(
             text(
-                "SELECT DISTINCT name FROM kag_entities "
-                "WHERE name_norm LIKE :pat LIMIT 5"
+                "SELECT DISTINCT e.name FROM kag_entities e "
+                "JOIN kag_documents d ON d.id = e.doc_id "
+                "WHERE e.name_norm LIKE :pat AND d.status = 'ready' LIMIT 5"
             ),
             {"pat": f"%{w}%"},
         ).fetchall()
@@ -246,8 +247,9 @@ def _noun_chunk_fallback(session, query: str) -> list:
             continue
         rows = session.execute(
             text(
-                "SELECT DISTINCT name FROM kag_entities "
-                "WHERE name_norm LIKE :pat LIMIT 5"
+                "SELECT DISTINCT e.name FROM kag_entities e "
+                "JOIN kag_documents d ON d.id = e.doc_id "
+                "WHERE e.name_norm LIKE :pat AND d.status = 'ready' LIMIT 5"
             ),
             {"pat": f"%{nn}%"},
         ).fetchall()
@@ -325,13 +327,21 @@ def match_entities_candidates(session, names: list) -> list:
         nn = normalize_entity_name(name)
         group = []
         rows = session.execute(
-            text("SELECT id FROM kag_entities WHERE name_norm = :nn"),
+            text(
+                "SELECT e.id FROM kag_entities e "
+                "JOIN kag_documents d ON d.id = e.doc_id "
+                "WHERE e.name_norm = :nn AND d.status = 'ready'"
+            ),
             {"nn": nn},
         ).fetchall()
         group.extend(r.id for r in rows)
         if not group:
             rows = session.execute(
-                text("SELECT id FROM kag_entities WHERE name_norm LIKE :pat LIMIT 5"),
+                text(
+                    "SELECT e.id FROM kag_entities e "
+                    "JOIN kag_documents d ON d.id = e.doc_id "
+                    "WHERE e.name_norm LIKE :pat AND d.status = 'ready' LIMIT 5"
+                ),
                 {"pat": f"%{nn}%"},
             ).fetchall()
             group.extend(r.id for r in rows)
@@ -457,13 +467,19 @@ def personalized_pagerank(adjacency, seed, alpha=0.15, max_iter=50, tol=1e-6):
 
 
 def vector_search(session, query_embedding, top_k):
-    """pgvector <=> (coseno). Devuelve lista de (chunk_id, score)."""
+    """pgvector <=> (coseno). Devuelve lista de (chunk_id, score).
+
+    Solo chunks de documentos 'ready': los docs pending/failed (proceso
+    interrumpido) no deben contaminar los resultados (degradación elegante).
+    """
     q = embedding_to_sql(query_embedding)
     rows = session.execute(
         text(
-            "SELECT id, 1 - (embedding <=> CAST(:q AS vector)) AS score "
-            "FROM kag_chunks WHERE embedding IS NOT NULL "
-            "ORDER BY embedding <=> CAST(:q AS vector) LIMIT :top_k"
+            "SELECT c.id, 1 - (c.embedding <=> CAST(:q AS vector)) AS score "
+            "FROM kag_chunks c "
+            "JOIN kag_documents d ON d.id = c.doc_id "
+            "WHERE c.embedding IS NOT NULL AND d.status = 'ready' "
+            "ORDER BY c.embedding <=> CAST(:q AS vector) LIMIT :top_k"
         ),
         {"q": q, "top_k": top_k},
     ).fetchall()
@@ -502,9 +518,11 @@ def fts_search(session, query_text, top_k):
         return []
     rows = session.execute(
         text(
-            "SELECT id, ts_rank_cd(content_tsv, plainto_tsquery('simple', :q)) "
-            "AS score FROM kag_chunks "
-            "WHERE content_tsv @@ plainto_tsquery('simple', :q) "
+            "SELECT c.id, ts_rank_cd(c.content_tsv, plainto_tsquery('simple', :q)) "
+            "AS score FROM kag_chunks c "
+            "JOIN kag_documents d ON d.id = c.doc_id "
+            "WHERE c.content_tsv @@ plainto_tsquery('simple', :q) "
+            "AND d.status = 'ready' "
             "ORDER BY score DESC LIMIT :top_k"
         ),
         {"q": query_text, "top_k": top_k},
@@ -546,7 +564,7 @@ def chunks_for_entities(session, entity_ids, top_n):
             "FROM kag_chunks c "
             "JOIN kag_entities e ON e.chunk_id = c.id "
             "JOIN kag_documents d ON d.id = c.doc_id "
-            "WHERE e.id IN :ids "
+            "WHERE e.id IN :ids AND d.status = 'ready' "
             "GROUP BY c.id, d.doc_path "
             "ORDER BY mentions DESC LIMIT :top_n"
         ).bindparams(bindparam("ids", expanding=True)),
@@ -576,7 +594,8 @@ def subgraph_triples(session, entity_ids, limit=25):
             "JOIN kag_entities se ON se.id = r.source_entity_id "
             "JOIN kag_entities te ON te.id = r.target_entity_id "
             "JOIN kag_documents d ON d.id = r.doc_id "
-            "WHERE r.source_entity_id IN :ids OR r.target_entity_id IN :ids "
+            "WHERE (r.source_entity_id IN :ids OR r.target_entity_id IN :ids) "
+            "AND d.status = 'ready' "
             "LIMIT :limit"
         ).bindparams(bindparam("ids", expanding=True)),
         {"ids": list(entity_ids), "limit": limit},
