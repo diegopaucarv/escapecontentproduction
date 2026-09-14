@@ -9,9 +9,15 @@ Inserta/actualiza:
      llama.cpp server en http://localhost:8080/v1).
   3. La api_key local en `api_keys` (provider 'local', key_name 'local-qwen',
      api_key '' — sin auth).
+  4. La `embedding_settings` activa: registra el modelo de embeddings Jina
+     (`jinaai/jina-embeddings-v5-text-nano`, dim 768) en `llm_models` y la
+     api_key de HuggingFace en `api_keys` (token leído de la variable de
+     entorno HUGGINGFACE_API_KEY o HF_TOKEN; vacío si no existe — el modelo
+     es público y se descarga sin auth), y crea la fila activa en
+     `embedding_settings` (desactivando cualquier activa previa).
 
 A diferencia de src/db/seed_llm.py, NO requiere variables de entorno: es
-datos puros.
+datos puros (el token de HuggingFace es opcional).
 
 Uso:
     python -m src.db.seed_kag
@@ -24,9 +30,9 @@ import json
 import os
 from pathlib import Path
 
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 
-from src.db.models import ApiKey, LlmModel
+from src.db.models import ApiKey, EmbeddingSetting, LlmModel
 
 # ---------------------------------------------------------------------
 # Configuración del segmentador (tabla kag_segmenter_settings)
@@ -82,6 +88,44 @@ LOCAL_API_KEY = {
     "provider": "local",
     "key_name": "local-qwen",
     "api_key": "",
+    "is_active": True,
+}
+
+# ---------------------------------------------------------------------
+# Embeddings (embedding_settings -> api_keys + llm_models)
+# ---------------------------------------------------------------------
+
+# Modelo de embeddings Jina (inferencia local vía transformers, ver
+# src/embeddings.py). Mismo registro que src/db/seed_ai.py — aquí se
+# upserta de forma idempotente para que seed_kag sea autocontenido.
+EMBEDDING_MODEL = {
+    "model_name": "jinaai/jina-embeddings-v5-text-nano",
+    "provider": "huggingface",
+    "model_size": "embedding",
+    "context_window": 8192,
+    "max_output_tokens": 0,
+    "temperature_default": 0.0,
+    "strengths": [
+        "multilingue",
+        "nano: rapido y economico",
+        "adapters por tarea (retrieval, text-matching, clustering)",
+    ],
+    "weaknesses": ["dimension 768 (menor que modelos grandes)"],
+    "prompt_style": "",
+    "syntax_profile": {},
+}
+
+# Dimensión del vector de jina-embeddings-v5-text-nano.
+EMBEDDING_DIMENSION = 768
+
+# Api key de HuggingFace: se usa como token para descargar el modelo desde
+# el Hub. Se lee de HUGGINGFACE_API_KEY o HF_TOKEN; si no existe, se guarda
+# vacía (el modelo es público y se descarga sin auth).
+HF_API_KEY = {
+    "provider": "huggingface",
+    "key_name": "huggingface-main",
+    "api_key": os.environ.get("HUGGINGFACE_API_KEY", "")
+    or os.environ.get("HF_TOKEN", ""),
     "is_active": True,
 }
 
@@ -183,10 +227,30 @@ def _fix_db_host() -> None:
             os.environ[var] = val.replace("@db:", "@localhost:")
 
 
-def seed(session=None) -> dict:
-    """Inserta/actualiza la config del segmentador, el modelo local y la key.
+def _upsert_embedding_settings(session, api_key_id, model_id) -> EmbeddingSetting:
+    """Crea la embedding_settings activa (singleton: desactiva la previa)."""
+    session.execute(
+        update(EmbeddingSetting)
+        .where(EmbeddingSetting.is_active.is_(True))
+        .values(is_active=False)
+    )
+    setting = EmbeddingSetting(
+        api_key_id=api_key_id,
+        llm_model_id=model_id,
+        dimension=EMBEDDING_DIMENSION,
+        is_active=True,
+    )
+    session.add(setting)
+    session.flush()
+    return setting
 
-    Devuelve un resumen con los ids. No requiere variables de entorno.
+
+def seed(session=None) -> dict:
+    """Inserta/actualiza la config del segmentador, el modelo local, la key
+    local y la embedding_settings activa (modelo Jina + api_key HF).
+
+    Devuelve un resumen con los ids. No requiere variables de entorno (el
+    token de HuggingFace es opcional).
     """
     own_session = session is None
     if own_session:
@@ -198,12 +262,18 @@ def seed(session=None) -> dict:
         settings_id = _upsert_segmenter_settings(session, SEGMENTER_SETTINGS)
         key = _upsert_api_key(session, LOCAL_API_KEY)
         model = _upsert_model(session, LOCAL_QWEN_MODEL)
+        emb_model = _upsert_model(session, EMBEDDING_MODEL)
+        hf_key = _upsert_api_key(session, HF_API_KEY)
+        emb_settings = _upsert_embedding_settings(session, hf_key.id, emb_model.id)
         session.commit()
         return {
             "segmenter_settings_id": str(settings_id),
             "api_key_id": str(key.id),
             "model_id": str(model.id),
             "model_name": model.model_name,
+            "embedding_model_id": str(emb_model.id),
+            "embedding_api_key_id": str(hf_key.id),
+            "embedding_settings_id": str(emb_settings.id),
         }
     finally:
         if own_session:
@@ -212,7 +282,7 @@ def seed(session=None) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Seed del sistema KAG (segmentador + modelo local Qwen 2.5)."
+        description="Seed del sistema KAG (segmentador + modelo local Qwen 2.5 + embeddings)."
     )
     parser.parse_args()
     _fix_db_host()
@@ -223,6 +293,15 @@ def main() -> None:
         f"  Api key local: {result['api_key_id']} (provider local, key_name local-qwen)"
     )
     print(f"  Modelo local: {result['model_id']} ({result['model_name']})")
+    print(
+        f"  Modelo embeddings: {result['embedding_model_id']} "
+        f"({EMBEDDING_MODEL['model_name']})"
+    )
+    print(
+        f"  Api key HF: {result['embedding_api_key_id']} "
+        f"(provider huggingface, key_name huggingface-main)"
+    )
+    print(f"  Embedding settings activa: {result['embedding_settings_id']}")
 
 
 if __name__ == "__main__":

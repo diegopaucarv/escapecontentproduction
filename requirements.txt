@@ -67,6 +67,7 @@ sentence-transformers==5.7.0
 scipy==1.16.3
 scikit-learn==1.6.1
 numpy==2.1.3
+pyyaml==6.0.3   # config/languages.yaml (scripts/ensure_languages.py)
 
 # Testing
 pytest==9.1.1

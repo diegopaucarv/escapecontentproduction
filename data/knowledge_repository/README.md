@@ -32,12 +32,23 @@ data/knowledge_repository/
 ## Uso
 
 ```bash
-# Indexar todo lo pendiente/cambiado
+# 1. Configurar el sistema KAG (segmentador + modelo local + embeddings)
+python -m src.db.seed_kag
+
+# 2. Indexar todo lo pendiente/cambiado
 python -m src.kag_ingest
 
-# Responder una pregunta
+# 3. Responder una pregunta
 python -m src.kag_query "¿Qué fórmula usa la propagación hacia atrás?"
 
 # Demo completa (indexa + responde, con prints detallados)
 python scripts/kag_demo.py --index "tu pregunta aquí"
 ```
+
+> **Embeddings:** `seed_kag` registra el modelo `jinaai/jina-embeddings-v5-text-nano`
+> y crea la `embedding_settings` activa. El token de HuggingFace se lee de
+> `HUGGINGFACE_API_KEY` o `HF_TOKEN` (opcional: el modelo es público). Si un
+> documento se indexó sin embeddings (chunks con `embedding = NULL`), re-indexa
+> con `--force` para poblar los vectores: `python -m src.kag_ingest --force`.
+> Sin `embedding_settings`, la consulta degrada a solo FTS (sigue respondiendo,
+> pero sin búsqueda densa).

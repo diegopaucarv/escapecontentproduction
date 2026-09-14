@@ -1,7 +1,9 @@
 import gc
+import json
 import logging
 import re
 import unicodedata
+from pathlib import Path
 from typing import Optional
 
 import hnswlib
@@ -33,25 +35,55 @@ DEFAULT_SPACY_MODELS = {
     "fr": "fr_core_news_md",
 }
 
+# Idiomas con coref de Stanza (fuente: docs oficiales de Stanza). Para el
+# resto, get_stanza() no intenta cargar el pipeline (desactiva correferencia).
+STANZA_COREF_LANGS = {
+    "ca",
+    "cs",
+    "de",
+    "en",
+    "es",
+    "fr",
+    "he",
+    "hi",
+    "nb",
+    "nn",
+    "pl",
+    "ru",
+    "ta",
+}
+
 # ── Stanza coref bug-fix (compartido con scripts/ensure_stanza.py) ──────────
 from src.kag.stanza_patch import apply_stanza_coref_patch
 
 apply_stanza_coref_patch()
 
+# ── Pivots conversacionales multilingües (archivo externo) ────────────────────
+# Los pivots por idioma viven en src/kag/pivots.json. Si se añade un idioma,
+# actualízalo con scripts/update_pivots.py (o edita el JSON a mano).
+_PIVOTS_PATH = Path(__file__).resolve().parent / "pivots.json"
+_PIVOTS_CACHE: dict[str, set[str]] = {}
+
+
+def _load_pivots(lang: str) -> set[str]:
+    """Devuelve los pivots conversacionales del idioma (cacheado)."""
+    if lang in _PIVOTS_CACHE:
+        return _PIVOTS_CACHE[lang]
+    try:
+        data = json.loads(_PIVOTS_PATH.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — archivo ausente/corrupto: fallback vacío
+        data = {}
+    pivots = set(data.get(lang, []))
+    _PIVOTS_CACHE[lang] = pivots
+    return pivots
+
 
 @Language.component("conversational_sbd")
 def conversational_sbd(doc):
-    # Common conversational pivots in Spanish discourse
-    pivots = {
-        "entonces",
-        "bueno",
-        "o sea",
-        "además",
-        "pero",
-        "porque",
-        "luego",
-        "así que",
-    }
+    # Pivots conversacionales del idioma del documento (multilingüe).
+    pivots = _load_pivots(doc.lang_)
+    if not pivots:
+        return doc
 
     # We iterate through the tokens, looking for specific syntactic patterns
     for i in range(len(doc) - 2):
@@ -318,6 +350,15 @@ class ProgressiveSegmenter:
     # ─────────────────────────────────────────────────────────────────────────
     def get_stanza(self) -> Optional[stanza.Pipeline]:
         if self._stanza_pipeline is None:
+            # Solo los idiomas con coref de Stanza tienen pipeline; el resto
+            # desactiva la correferencia sin intentar descargar/cargar nada.
+            if self.stanza_lang not in STANZA_COREF_LANGS:
+                print(
+                    f"[COREF] '{self.stanza_lang}' no soporta coref de Stanza — "
+                    "correferencias deshabilitadas."
+                )
+                self._stanza_pipeline = None
+                return None
             print("[COREF] Stanza pipeline not loaded — iniciando carga...")
             try:
                 stanza.download(
@@ -1195,6 +1236,7 @@ def build_segmenter(session, lang="es", verbose=False):
             model_name=cfg["segmenter_embedding_model"],
             spacy_model=spacy_model,
             nli_model=cfg["nli_model"],
+            stanza_lang=lang,
             debug_coref=False,
         )
     return _SEGMENTER_CACHE[lang]

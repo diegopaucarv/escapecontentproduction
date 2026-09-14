@@ -1,0 +1,35 @@
+{
+  "es": [
+    "entonces",
+    "bueno",
+    "o sea",
+    "además",
+    "pero",
+    "porque",
+    "luego",
+    "así que"
+  ],
+  "en": [
+    "so",
+    "well",
+    "you know",
+    "like",
+    "but",
+    "because",
+    "then",
+    "actually",
+    "anyway"
+  ],
+  "pt": ["então", "bom", "tipo", "mas", "porque", "depois", "assim", "aí"],
+  "de": ["also", "na ja", "und", "aber", "weil", "dann", "eigentlich", "so"],
+  "fr": [
+    "alors",
+    "bon",
+    "en fait",
+    "mais",
+    "parce que",
+    "puis",
+    "du coup",
+    "donc"
+  ]
+}

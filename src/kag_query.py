@@ -515,11 +515,14 @@ def fts_search(session, query_text, top_k):
 def hybrid_search(session, query_text, query_embedding, top_k, rrf_k=60, verbose=False):
     """Búsqueda híbrida: densa (pgvector) + léxica (FTS) + RRF.
 
-    Si la migración 0014 no está aplicada (columna content_tsv ausente,
+    Si query_embedding es None (embeddings no disponibles), degrada a solo
+    FTS. Si la migración 0014 no está aplicada (columna content_tsv ausente,
     ProgrammingError), degrada a solo búsqueda densa. Otros errores se
     propagan al caller (ask() los degrada a vec_hits=[]).
     """
-    dense_hits = vector_search(session, query_embedding, top_k)
+    dense_hits = []
+    if query_embedding is not None:
+        dense_hits = vector_search(session, query_embedding, top_k)
     try:
         sparse_hits = fts_search(session, query_text, top_k)
     except ProgrammingError as exc:  # migración 0014 sin aplicar
@@ -527,6 +530,8 @@ def hybrid_search(session, query_text, query_embedding, top_k, rrf_k=60, verbose
         if verbose:
             print(f"[KAG] ⚠ FTS no disponible ({exc}); solo búsqueda densa.")
         return dense_hits
+    if not dense_hits:
+        return sparse_hits
     return rrf_merge(dense_hits, sparse_hits, k=rrf_k, top_k=top_k)
 
 
@@ -718,12 +723,18 @@ def ask(session, query, top_k=8, global_top_k=20, verbose=True):
         print(f"[KAG] Clasificación: {qtype} (top_k={k})")
 
     # 2. Búsqueda híbrida (densa + FTS + RRF)
+    q_emb = None
     try:
         # Import perezoso: src.embeddings importa src.db.session (que lee .env
         # al importar) — debe ocurrir DESPUÉS de _fix_db_host().
         from src.embeddings import embed_text
 
         q_emb = embed_text(query, input_type="query")
+    except Exception as exc:  # noqa: BLE001 — degradación natural
+        session.rollback()  # la transacción queda abortada tras el error
+        if verbose:
+            print(f"[KAG] ⚠ Embeddings no disponibles ({exc}); solo FTS.")
+    try:
         vec_hits = hybrid_search(session, query, q_emb, k, verbose=verbose)
     except Exception as exc:  # noqa: BLE001 — degradación natural
         session.rollback()  # la transacción queda abortada tras el error

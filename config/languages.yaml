@@ -1,0 +1,36 @@
+# =============================================================================
+# Configuración de idiomas del sistema KAG
+# =============================================================================
+# Este archivo es la fuente de verdad de qué idiomas usa el segmentador.
+# Edítalo y corre `python scripts/ensure_languages.py` para descargar los
+# modelos que falten (spaCy + Stanza) de forma paciente (con reintentos).
+#
+# Los idiomas activos se eligen SOLO entre los que tienen pipeline entrenado
+# de spaCy (ver docs/languages.md). El coref de Stanza solo existe para un
+# subconjunto de idiomas (ver STANZA_COREF_LANGS en ensure_languages.py):
+#   CA, CS, DE, EN, ES, FR, HE, HI, NB, NN, PL, RU, TA
+# Si un idioma activo no tiene coref de Stanza, el segmentador usa spaCy
+# para el resto del pipeline y simplemente desactiva la correferencia.
+# =============================================================================
+
+# Idiomas activos (códigos ISO 639-1). Los que tienen coref de Stanza
+# disponible se marcan automáticamente; el resto usa solo spaCy.
+languages:
+  - es
+  - en
+  - pt
+  - de
+  - fr
+
+# Preferencia de tamaño de modelo spaCy por idioma: sm | md | lg | trf
+# (trf = transformer, el más pesado y preciso; solo existe para algunos).
+# Si el tamaño pedido no existe para un idioma, ensure_languages.py baja
+# automáticamente al más cercano disponible.
+spacy_size: md
+
+# Usar Stanza para correferencia en los idiomas que lo soportan.
+# Si es false, el segmentador nunca carga Stanza (más ligero y rápido).
+use_stanza_coref: true
+
+# Reintentos para descargas (spaCy y Stanza) ante fallos de red.
+download_retries: 8

@@ -37,6 +37,32 @@ def _fix_db_host() -> None:
             os.environ[var] = val.replace("@db:", "@localhost:")
 
 
+def _warn_missing_embedding_settings(session) -> None:
+    """Avisa si no hay embedding_settings activa (la búsqueda densa degradará).
+
+    No bloquea: la consulta degrada a solo FTS (ver src/kag_query.py::ask).
+    """
+    from sqlalchemy import select
+
+    from src.db.models import EmbeddingSetting
+
+    setting = (
+        session.execute(
+            select(EmbeddingSetting).where(EmbeddingSetting.is_active.is_(True))
+        )
+        .scalars()
+        .first()
+    )
+    if setting is None:
+        print(
+            "[KAG] ⚠ No hay embedding_settings activa: la búsqueda densa (pgvector) "
+            "no estará disponible y la consulta degradará a solo FTS. "
+            "Créala con `python -m src.db.seed_kag` (o POST /embedding-settings) "
+            "y re-indexa con `python -m src.kag_ingest --force` para poblar "
+            "los embeddings de los chunks existentes."
+        )
+
+
 def main() -> None:
     # Windows: la consola usa cp1252 y no imprime emojis — forzar UTF-8.
     if hasattr(sys.stdout, "reconfigure"):
@@ -77,6 +103,7 @@ def main() -> None:
 
         print("\n💬 FASE 2 — CONSULTA")
         print("=" * 60)
+        _warn_missing_embedding_settings(session)
         answer = ask(
             session,
             query,

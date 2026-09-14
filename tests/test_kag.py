@@ -773,3 +773,54 @@ def test_hybrid_search_merges_dense_and_sparse(monkeypatch):
     assert 1 in ids and 2 in ids and 3 in ids
     # El chunk 2 (rank 2 denso + rank 1 sparse) debe liderar.
     assert hits[0][0] == 2
+
+
+def test_hybrid_search_none_embedding_degrades_to_fts_only(monkeypatch):
+    """Sin query_embedding (embeddings no disponibles), no se llama a
+    vector_search y se devuelven solo los hits de FTS."""
+    import src.kag_query as kq
+
+    class _FakeSession:
+        def rollback(self):
+            pass
+
+    session = _FakeSession()
+
+    def fake_vector(session, q_emb, top_k):
+        raise AssertionError("vector_search no debe llamarse con embedding None")
+
+    def fake_fts(session, query_text, top_k):
+        return [(2, 5.0), (3, 4.0)]
+
+    monkeypatch.setattr(kq, "vector_search", fake_vector)
+    monkeypatch.setattr(kq, "fts_search", fake_fts)
+
+    hits = hybrid_search(session, "pregunta", None, top_k=5)
+    assert hits == [(2, 5.0), (3, 4.0)]
+
+
+def test_hybrid_search_none_embedding_and_no_fts_returns_empty(monkeypatch):
+    """Sin embedding y sin FTS (migración 0014 sin aplicar) → [] sin error."""
+    from sqlalchemy.exc import ProgrammingError
+
+    import src.kag_query as kq
+
+    class _FakeSession:
+        def rollback(self):
+            pass
+
+    session = _FakeSession()
+
+    def fake_vector(session, q_emb, top_k):
+        raise AssertionError("vector_search no debe llamarse con embedding None")
+
+    def fake_fts(session, query_text, top_k):
+        raise ProgrammingError(
+            "stmt", {}, Exception("column content_tsv does not exist")
+        )
+
+    monkeypatch.setattr(kq, "vector_search", fake_vector)
+    monkeypatch.setattr(kq, "fts_search", fake_fts)
+
+    hits = hybrid_search(session, "pregunta", None, top_k=5)
+    assert hits == []
