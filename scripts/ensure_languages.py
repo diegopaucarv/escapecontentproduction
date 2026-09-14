@@ -63,7 +63,7 @@ def _download_spacy(model: str, retries: int) -> bool:
                 f"[spacy] intento {attempt}/{retries} — descargando {model}...",
                 flush=True,
             )
-            spacy.cli.download(model, quiet=True)
+            spacy.cli.download(model)
             if _spacy_installed(model):
                 print(f"[spacy] ✅ {model} instalado", flush=True)
                 return True
