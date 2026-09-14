@@ -2,7 +2,9 @@ import gc
 import json
 import logging
 import re
+import threading
 import unicodedata
+from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 
@@ -47,6 +49,65 @@ def _configure_torch_threads() -> None:
 
 
 _configure_torch_threads()
+
+
+# ── Caché de embeddings acotada (LRU) ────────────────────────────────────────
+# Por qué existe: build_segmenter() cachea el ProgressiveSegmenter por idioma
+# (ver _SEGMENTER_CACHE al final del archivo) para no recargar spaCy/
+# SentenceTransformer/NLI en cada documento. Eso significa que _embed_cache
+# vive mientras vive el proceso, no un solo documento — y acumula entradas de
+# TODOS los documentos que pasen por ese worker.
+#
+# La mayoría de esas entradas son concatenaciones de segmento (crecen en cada
+# merge — ver ClassicSegmenter.segment_sentences y
+# ProgressiveSegmenter.progressive_clustering) que casi nunca se repiten
+# verbatim entre documentos distintos. Sin límite, un dict normal crece para
+# siempre. Esta clase es un dict con límite de tamaño y desalojo LRU.
+#
+# Importante: esto NUNCA cambia un resultado de segmentación. encode() es
+# determinístico — texto -> vector es siempre el mismo, así que un miss por
+# desalojo simplemente vuelve a calcular el vector idéntico. Lo único que
+# varía con el tamaño de la caché es memoria y velocidad, nunca la salida.
+class _BoundedEmbeddingCache:
+    """Dict-like caché texto -> vector con tope de tamaño (LRU)."""
+
+    def __init__(self, max_size: int = 20_000):
+        self.max_size = max_size
+        self._data: "OrderedDict[str, np.ndarray]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def __contains__(self, key) -> bool:
+        return key in self._data
+
+    def __getitem__(self, key):
+        with self._lock:
+            self._data.move_to_end(key)
+            return self._data[key]
+
+    def __setitem__(self, key, value) -> None:
+        with self._lock:
+            if key in self._data:
+                self._data.move_to_end(key)
+            self._data[key] = value
+            if len(self._data) > self.max_size:
+                self._data.popitem(last=False)  # descarta el menos usado
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+
+def _default_embed_cache_size() -> int:
+    """Tope por defecto del caché de embeddings, configurable vía
+    KAG_EMBED_CACHE_SIZE. Cada vector pesa unos pocos KB (384 floats para
+    all-MiniLM), así que 20k entradas son ~30MB — barato frente al riesgo de
+    una caché sin límite en un proceso de larga vida."""
+    import os
+
+    try:
+        return max(1, int(os.environ.get("KAG_EMBED_CACHE_SIZE", 20_000)))
+    except Exception:  # noqa: BLE001 — valor mal formado: usa el default
+        return 20_000
+
 
 # ── Configuración por defecto del segmentador ────────────────────────────────
 # La configuración real se lee de kag_segmenter_settings en la DB (ver
@@ -181,7 +242,9 @@ class AttentionShiftDetector:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ClassicSegmenter  (unchanged from original)
+# ClassicSegmenter — la lógica de segmentación es la original; usa la caché
+# de embeddings compartida y acotada de ProgressiveSegmenter (ver
+# _BoundedEmbeddingCache) cuando se instancia desde ahí.
 # ─────────────────────────────────────────────────────────────────────────────
 class ClassicSegmenter:
     def __init__(
@@ -194,8 +257,12 @@ class ClassicSegmenter:
         self.nlp = spacy.load(spacy_model)
         self.embedding_model = embedding_model
         # Caché compartida con el ProgressiveSegmenter (si se pasa): mismo
-        # texto -> mismo vector, solo evita re-embeder lo ya embebido.
-        self.embedding_cache = embed_cache if embed_cache is not None else {}
+        # texto -> mismo vector, solo evita re-embeder lo ya embebido. Si se
+        # instancia suelta (sin ProgressiveSegmenter), usa su propia caché
+        # acotada en vez de un dict sin límite.
+        self.embedding_cache = (
+            embed_cache if embed_cache is not None else _BoundedEmbeddingCache()
+        )
         self.nli_model_name = nli_model
         self._nli_model = None  # carga perezosa (~1.6GB, solo si hace falta)
 
@@ -237,8 +304,9 @@ class ClassicSegmenter:
             return -1.0
 
         # ── Standard Math ──
-        emb1 = self._get_cached_embedding(segment1)
-        emb2 = self._get_cached_embedding(segment2)
+        # Batch: un solo encode() para los que falten (mismo patrón que
+        # ProgressiveSegmenter.generate_embeddings / detect_topic_shift).
+        emb1, emb2 = self._get_cached_embeddings([segment1, segment2])
 
         norm1 = np.linalg.norm(emb1)
         norm2 = np.linalg.norm(emb2)
@@ -254,14 +322,36 @@ class ClassicSegmenter:
         return 0.5 * (1 - similarity) + 0.5 * (1 - cohesion)
 
     def _get_cached_embedding(self, text):
-        if text not in self.embedding_cache:
-            # Normalizado: la caché es compartida con ProgressiveSegmenter
-            # (generate_embeddings normaliza). Solo se usa para similitud
-            # coseno, que es invariante a la normalización -> mismo resultado.
-            self.embedding_cache[text] = self.embedding_model.encode(
-                [text], normalize_embeddings=True, convert_to_numpy=True
-            )[0]
-        return self.embedding_cache[text]
+        """Compat de un solo texto. Para 2+ textos usa _get_cached_embeddings
+        (batchea el encode() de los que falten en vez de uno por uno)."""
+        return self._get_cached_embeddings([text])[0]
+
+    def _get_cached_embeddings(self, texts):
+        """Devuelve los embeddings de `texts` en el mismo orden, pidiendo al
+        modelo en un solo batch únicamente los que falten en caché.
+
+        Normalizado: la caché es compartida con ProgressiveSegmenter
+        (generate_embeddings normaliza). Solo se usa para similitud coseno,
+        que es invariante a la normalización -> mismo resultado que sin
+        normalizar. Mismo texto -> mismo vector, así que el resultado es
+        idéntico a pedirlos uno a uno.
+        """
+        # dict.fromkeys en vez de un set: preserva orden y deduplica (por si
+        # segment1 == segment2 en el mismo llamado).
+        missing = [
+            t for t in dict.fromkeys(texts) if t not in self.embedding_cache
+        ]
+        if missing:
+            embs = self.embedding_model.encode(
+                missing,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                batch_size=min(64, len(missing)),
+                show_progress_bar=False,
+            )
+            for t, e in zip(missing, embs):
+                self.embedding_cache[t] = e
+        return [self.embedding_cache[t] for t in texts]
 
     def robust_sentence_split(self, text):
         doc = self.nlp(text)
@@ -335,6 +425,9 @@ class ProgressiveSegmenter:
         device=None,
         # ── new: control debug verbosity ────────────────────────────
         debug_coref=True,
+        # Tope del caché de embeddings compartido (ver _BoundedEmbeddingCache).
+        # None -> usa el default (KAG_EMBED_CACHE_SIZE o 20_000).
+        embed_cache_size=None,
     ):
         self.similarity_threshold = similarity_threshold
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
@@ -349,9 +442,13 @@ class ProgressiveSegmenter:
         self.stanza_use_gpu = device is not None
         self.debug_coref = debug_coref  # toggle for coref debug prints
 
-        # Caché de embeddings compartida (texto -> vector). Solo optimiza
-        # rendimiento: mismo texto -> mismo vector, nunca cambia el resultado.
-        self._embed_cache: dict = {}
+        # Caché de embeddings compartida (texto -> vector), acotada con LRU:
+        # esta instancia persiste entre documentos (ver _SEGMENTER_CACHE), así
+        # que sin límite crecería para siempre. Solo optimiza rendimiento:
+        # mismo texto -> mismo vector, nunca cambia el resultado.
+        self._embed_cache = _BoundedEmbeddingCache(
+            max_size=embed_cache_size or _default_embed_cache_size()
+        )
 
         self.model = SentenceTransformer(model_name).to(self.device)
         self.classicseg = ClassicSegmenter(
