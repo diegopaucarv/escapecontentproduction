@@ -27,6 +27,10 @@ from __future__ import annotations
 import re
 from collections import Counter
 
+import numpy as np
+
+from src.kag.thresholds import auto_margin as _auto_margin
+
 # Etiquetas NER que NO entran al grafo: nombres propios, países,
 # organizaciones, fechas, cifras... se sirven por búsqueda textual.
 _NER_EXCLUDED = {
@@ -57,6 +61,8 @@ DEFAULT_SIM_THRESHOLD = 0.92
 # Margen mínimo entre la mejor y la segunda mejor similitud para fusionar
 # variantes: si dos representantes están igual de cerca, es ambiguo y NO se
 # fusiona (mejor dejar variantes separadas que fusionar conceptos distintos).
+# Con gap_margin=None (default) el margen se deriva de la distribución
+# observada (mediana de los gaps) — ver _canonicalize.
 DEFAULT_GAP_MARGIN = 0.03
 
 
@@ -123,11 +129,53 @@ def _candidate_from_token(tok, lang: str) -> str | None:
     return tok.text
 
 
+def _greedy_groups(arr, threshold, gap_margin):
+    """Agrupa variantes por coseno ≥ threshold con margen (greedy O(N×R)).
+
+    Replica la lógica greedy de _canonicalize y además devuelve los gaps
+    (best_sim - second_sim) de los candidatos que SÍ tienen señal
+    (best >= 0, best_sim >= threshold y second_sim >= 0 — es decir, hay al
+    menos 2 grupos a los que comparar). Los gaps alimentan el margen
+    automático (mediana) cuando gap_margin=None.
+
+    Devuelve (groups, gaps): groups es lista de listas de índices; gaps es
+    la lista de gaps observados (vacía si no hay señal).
+    """
+    groups: list[list[int]] = []
+    gaps: list[float] = []
+    for i in range(len(arr)):
+        best = -1
+        best_sim = -1.0
+        second_sim = -1.0
+        for g, members in enumerate(groups):
+            sim = float(np.dot(arr[i], arr[members[0]]))
+            if sim > best_sim:
+                second_sim = best_sim
+                best_sim = sim
+                best = g
+            elif sim > second_sim:
+                second_sim = sim
+        if (
+            best >= 0
+            and best_sim >= threshold
+            and (best_sim - second_sim) >= gap_margin
+        ):
+            groups[best].append(i)
+        else:
+            groups.append([i])
+        # Gap con señal: hay ≥2 grupos comparables y el mejor supera el
+        # umbral. Sin esto, los candidatos con 1 solo grupo aportan gaps
+        # ~1.9 (best+1) que inflan la mediana.
+        if best >= 0 and best_sim >= threshold and second_sim >= 0:
+            gaps.append(best_sim - second_sim)
+    return groups, gaps
+
+
 def _canonicalize(
     names: list[str],
     embed_fn,
     threshold: float = DEFAULT_SIM_THRESHOLD,
-    gap_margin: float = DEFAULT_GAP_MARGIN,
+    gap_margin: float | None = None,
 ):
     """Agrupa variantes superficiales por coseno ≥ threshold (greedy).
 
@@ -139,6 +187,12 @@ def _canonicalize(
     superar a la segunda mejor por al menos este margen. Si dos
     representantes están igual de cerca (empate), la variante es ambigua y
     se queda separada en vez de fusionarse a ciegas.
+
+    Con `gap_margin=None` (default) el margen se deriva de la distribución
+    observada en DOS pasadas: la pasada 1 con margen 0 recolecta los gaps
+    de los candidatos con señal y el margen final es la MEDIANA de esos
+    gaps (con piso DEFAULT_GAP_MARGIN). La pasada 2 aplica el margen. Con
+    <2 gaps (sin distribución) se usa el piso.
     """
     if not names:
         return {}
@@ -153,37 +207,18 @@ def _canonicalize(
     if len(vecs) != len(unique):
         return {n: [n] for n in unique}
 
-    import numpy as np
-
     arr = np.asarray(vecs, dtype=np.float32)
     norms = np.linalg.norm(arr, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     arr = arr / norms
 
-    groups: list[list[int]] = []
-    for i in range(len(unique)):
-        best = -1
-        best_sim = -1.0
-        second_sim = -1.0
-        for g, members in enumerate(groups):
-            sim = float(np.dot(arr[i], arr[members[0]]))
-            if sim > best_sim:
-                second_sim = best_sim
-                best_sim = sim
-                best = g
-            elif sim > second_sim:
-                second_sim = sim
-        # Fusiona solo si supera el umbral Y con margen claro sobre la
-        # segunda mejor (si dos representantes están igual de cerca, es
-        # ambiguo → no fusionar).
-        if (
-            best >= 0
-            and best_sim >= threshold
-            and (best_sim - second_sim) >= gap_margin
-        ):
-            groups[best].append(i)
-        else:
-            groups.append([i])
+    if gap_margin is None:
+        # Pasada 1 (margen 0): recolectar los gaps de los candidatos con
+        # señal. La mediana es el margen — la distribución manda.
+        _, gaps = _greedy_groups(arr, threshold, 0.0)
+        gap_margin = _auto_margin(gaps, 0.5, floor=DEFAULT_GAP_MARGIN)
+
+    groups, _ = _greedy_groups(arr, threshold, gap_margin)
 
     result = {}
     for members in groups:
@@ -200,6 +235,7 @@ def extract_entities_deterministic(
     sim_threshold: float = DEFAULT_SIM_THRESHOLD,
     min_freq: int = 2,
     lang: str = "es",
+    gap_margin: float | None = None,
 ) -> dict:
     """Extrae entidades (sustantivos vía depparse) y relaciones (co-ocurrencia).
 
@@ -244,7 +280,7 @@ def extract_entities_deterministic(
             kept.append(c)
 
     # 3. Canonicalización por embeddings (variantes → canónico).
-    canon = _canonicalize(kept, embed_fn, sim_threshold)
+    canon = _canonicalize(kept, embed_fn, sim_threshold, gap_margin)
 
     # 4. Relaciones: co-ocurrencia dentro de la misma oración.
     #    Mapeamos cada oración a los canónicos presentes (por substring

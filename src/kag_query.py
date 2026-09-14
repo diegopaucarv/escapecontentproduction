@@ -26,6 +26,8 @@ from pathlib import Path
 from sqlalchemy import bindparam, text
 from sqlalchemy.exc import ProgrammingError
 
+from src.kag.thresholds import auto_cutoff
+from src.kag.thresholds import auto_margin as _auto_margin
 from src.kag_ingest import (
     detect_language,
     embedding_to_sql,
@@ -71,6 +73,13 @@ PPR_Z = 0.5
 # no supera el piso o el margen, se conserva el primero (ambiguo).
 DISAMBIG_MIN_OVERLAP = 0.1
 DISAMBIG_MARGIN = 0.05
+
+# Umbrales automáticos (Tier 1): Kneedle para codos (PPR, relevancia) y
+# mediana de gaps para márgenes (desambiguación, canonicalización). Con
+# AUTO_THRESHOLDS = True los umbrales fijos de arriba son solo el FALLBACK
+# cuando la distribución no tiene codo claro o hay <2 gaps. Con False se
+# vuelve al comportamiento fijo de siempre.
+AUTO_THRESHOLDS = True
 
 # ---------------------------------------------------------------------
 # Helpers
@@ -406,6 +415,8 @@ def disambiguate_by_cooccurrence(
     adjacency=None,
     min_overlap: float = DISAMBIG_MIN_OVERLAP,
     margin: float = DISAMBIG_MARGIN,
+    auto: bool = AUTO_THRESHOLDS,
+    verbose: bool = False,
 ) -> list:
     """Desambiguación por copresencia en el grafo.
 
@@ -420,6 +431,13 @@ def disambiguate_by_cooccurrence(
     margen >= `margin` sobre el segundo. Si no, se conserva el primer
     candidato (ambiguo). Sin entidades confirmadas, conserva el primer
     candidato de cada mención (no hay señal de copresencia).
+
+    Con `auto=True` el margen se deriva de la distribución observada:
+    se puntúan TODAS las menciones ambiguas, se recolectan los gaps
+    (best - second) de las que tienen señal (best >= min_overlap) y el
+    margen es la MEDIANA de esos gaps (robusta: la mitad de las menciones
+    con señal se resuelven, la otra mitad queda ambigua). Con <2 gaps se
+    usa el margen fijo (fallback).
     """
     if not groups:
         return []
@@ -431,17 +449,45 @@ def disambiguate_by_cooccurrence(
     confirmed_neighbors = set()
     for eid in confirmed:
         confirmed_neighbors.update(adjacency.get(eid, {}).keys())
-    result = []
-    for g in groups:
-        if len(g) == 1:
-            result.append(g[0])
-            continue
+
+    def _score_group(g):
         scored = []
         for c in g:
             shared = len(confirmed_neighbors & set(adjacency.get(c, {}).keys()))
             denom = min(len(adjacency.get(c, {})), len(confirmed_neighbors)) or 1
             scored.append((c, shared / denom))
         scored.sort(key=lambda x: -x[1])
+        return scored
+
+    # Pasada 1: puntuar todas las menciones ambiguas y recolectar los gaps
+    # de las que tienen señal (best >= min_overlap). El margen automático es
+    # la mediana de esos gaps — la distribución manda, no una constante.
+    gaps = []
+    scored_groups = []
+    for g in groups:
+        if len(g) == 1:
+            scored_groups.append(None)
+            continue
+        scored = _score_group(g)
+        scored_groups.append(scored)
+        best_s = scored[0][1]
+        second_s = scored[1][1] if len(scored) > 1 else 0.0
+        if best_s >= min_overlap:
+            gaps.append(best_s - second_s)
+    if auto:
+        margin = _auto_margin(gaps, 0.5, floor=margin)
+        if verbose:
+            print(
+                f"[KAG] Desambiguación: margen automático = {margin:.4f} "
+                f"(mediana de {len(gaps)} gaps)"
+            )
+
+    # Pasada 2: decidir con el margen (automático o fijo).
+    result = []
+    for g, scored in zip(groups, scored_groups):
+        if scored is None:
+            result.append(g[0])
+            continue
         best_c, best_s = scored[0]
         second_s = scored[1][1] if len(scored) > 1 else 0.0
         if best_s >= min_overlap and (best_s - second_s) >= margin:
@@ -527,7 +573,11 @@ def personalized_pagerank(adjacency, seed, alpha=0.15, max_iter=50, tol=1e-6):
 
 
 def ppr_entity_selection(
-    scores: dict, min_ratio: float = PPR_MIN_RATIO, z: float = PPR_Z
+    scores: dict,
+    min_ratio: float = PPR_MIN_RATIO,
+    z: float = PPR_Z,
+    auto: bool = AUTO_THRESHOLDS,
+    verbose: bool = False,
 ) -> list:
     """Entidades PPR 'cerca' de la semilla — umbral de cercanía en el grafo.
 
@@ -541,7 +591,11 @@ def ppr_entity_selection(
         En grafos pequeños la media es significativa y este término
         sobre-filtra; en grafos grandes separa la señal de la cola.
 
-    Devuelve lista de entity_ids ordenados por score desc.
+    Con `auto=True` (default) el corte es el CODO de la curva (Kneedle,
+    Satopää et al. 2011): normaliza rank→[0,1] y score→[0,1], encuentra el
+    punto de máxima curvatura y corta ahí. El codo manda — el piso relativo
+    es solo el fallback cuando la curva no tiene codo claro (plana, corta o
+    casi lineal). Devuelve lista de entity_ids ordenados por score desc.
     """
     if not scores:
         return []
@@ -552,7 +606,16 @@ def ppr_entity_selection(
         mean = sum(vals) / len(vals)
         std = (sum((v - mean) ** 2 for v in vals) / len(vals)) ** 0.5
         floor = max(floor, mean + z * std)
-    return [eid for eid, s in sorted(scores.items(), key=lambda x: -x[1]) if s >= floor]
+    sorted_items = sorted(scores.items(), key=lambda x: -x[1])
+    if auto:
+        cutoff = auto_cutoff(vals)
+        if cutoff is not None:
+            if verbose:
+                print(f"[KAG] PPR: codo automático en score {cutoff:.4f}")
+            return [eid for eid, s in sorted_items if s >= cutoff]
+        if verbose:
+            print(f"[KAG] PPR: sin codo claro → piso relativo {floor:.4f}")
+    return [eid for eid, s in sorted_items if s >= floor]
 
 
 # ---------------------------------------------------------------------
@@ -741,12 +804,22 @@ def doc_summaries(session, doc_ids):
 # ---------------------------------------------------------------------
 
 
-def apply_relevance_threshold(hits, min_ratio=MIN_SCORE_RATIO, min_abs=MIN_ABS_SCORE):
+def apply_relevance_threshold(
+    hits,
+    min_ratio=MIN_SCORE_RATIO,
+    min_abs=MIN_ABS_SCORE,
+    auto: bool = AUTO_THRESHOLDS,
+    verbose: bool = False,
+):
     """Filtra hits (id, score) por relevancia relativa y absoluta.
 
     Escala-agnóstico: funciona con RRF (~0.01-0.03), coseno ([0,1]) o
     ts_rank (sin cota). Se descartan los resultados con score <
     min_ratio × max_score (cola larga irrelevante) o < min_abs (sin señal).
+
+    Con `auto=True` (default) el corte es el CODO de la curva de scores
+    (Kneedle): el punto donde la relevancia cae abruptamente. El codo manda
+    — el piso relativo es solo el fallback cuando no hay codo claro.
     """
     if not hits:
         return []
@@ -754,6 +827,14 @@ def apply_relevance_threshold(hits, min_ratio=MIN_SCORE_RATIO, min_abs=MIN_ABS_S
     if max_score <= 0:
         return []
     floor = max(min_abs, min_ratio * max_score)
+    if auto:
+        cutoff = auto_cutoff([s for _, s in hits])
+        if cutoff is not None:
+            if verbose:
+                print(f"[KAG] Relevancia: codo automático en score {cutoff:.4f}")
+            return [(cid, s) for cid, s in hits if s >= cutoff]
+        if verbose:
+            print(f"[KAG] Relevancia: sin codo claro → piso relativo {floor:.4f}")
     return [(cid, s) for cid, s in hits if s >= floor]
 
 
@@ -1084,7 +1165,7 @@ def ask(session, query, top_k=8, global_top_k=20, verbose=True, history=None):
             print(f"[KAG] ⚠ Búsqueda híbrida falló: {exc}")
         vec_hits = []
     # Threshold de relevancia: descarta la cola larga irrelevante.
-    vec_hits = apply_relevance_threshold(vec_hits)
+    vec_hits = apply_relevance_threshold(vec_hits, verbose=verbose)
     if verbose:
         print(f"[KAG] Búsqueda híbrida: {len(vec_hits)} chunks (tras threshold)")
         for cid, score in vec_hits[:5]:
@@ -1123,6 +1204,7 @@ def ask(session, query, top_k=8, global_top_k=20, verbose=True, history=None):
         adjacency=adj,
         min_overlap=DISAMBIG_MIN_OVERLAP,
         margin=DISAMBIG_MARGIN,
+        verbose=verbose,
     )
     if verbose:
         print(
@@ -1144,7 +1226,7 @@ def ask(session, query, top_k=8, global_top_k=20, verbose=True, history=None):
     #      semilla (relativo al máximo + baseline estadístico). Reemplaza
     #      el top-10 fijo: si solo 3 entidades están cerca, no arrastra 7
     #      irrelevantes; si 20 están cerca, no descarta la mitad.
-    ppr_entities = ppr_entity_selection(ppr_scores)
+    ppr_entities = ppr_entity_selection(ppr_scores, verbose=verbose)
     if verbose:
         print(f"[KAG] PPR cercanas: {len(ppr_entities)} entidades (umbral relativo)")
 

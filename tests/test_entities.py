@@ -245,6 +245,44 @@ def test_canonicalize_clear_winner_merges():
     assert "a e" in result
 
 
+def test_canonicalize_auto_margin_keeps_ambiguous_separate():
+    # gap_margin=None (auto): la pasada 1 con margen 0 recolecta los gaps
+    # de los candidatos con señal y el margen final es la mediana.
+    #   Orden: ["a b", "a c", "a e", "a f", "a d"]
+    #   "a e" → gap 0.1963 (0.99 vs 0.794)
+    #   "a f" → gap 0.1519 (0.98 vs 0.828)
+    #   "a d" → gap 0.0622 (0.95 vs 0.888)
+    # Gaps = [0.1963, 0.1519, 0.0622] → mediana 0.1519. Con margen 0.1519:
+    # "a d" (gap 0.0622) queda ambiguo → separado. Resultado:
+    # {"a b", "a c", "a d"} ("a e" y "a f" se fusionan con "a b").
+    vecs = {
+        "a b": [1.0, 0.0],
+        "a c": [0.7, 0.714],
+        "a e": [0.99, 0.141],
+        "a f": [0.98, 0.199],
+        "a d": [0.95, 0.312],
+    }
+    result = _canonicalize(list(vecs), _fake_embed_fn(vecs), threshold=0.92)
+    assert set(result.keys()) == {"a b", "a c", "a d"}
+
+
+def test_canonicalize_fixed_margin_merges_ambiguous():
+    # El mismo set con gap_margin=0.03 (fijo): "a d" (gap 0.0622) supera el
+    # margen → se fusiona con su grupo más cercano. "a f" (gap 0.0622)
+    # también. Resultado: {"a b", "a c"} — "a d" y "a f" se fusionan.
+    vecs = {
+        "a b": [1.0, 0.0],
+        "a c": [0.7, 0.714],
+        "a e": [0.99, 0.141],
+        "a f": [0.98, 0.199],
+        "a d": [0.95, 0.312],
+    }
+    result = _canonicalize(
+        list(vecs), _fake_embed_fn(vecs), threshold=0.92, gap_margin=0.03
+    )
+    assert set(result.keys()) == {"a b", "a c"}
+
+
 def test_canonicalize_empty():
     assert _canonicalize([], lambda t: []) == {}
 

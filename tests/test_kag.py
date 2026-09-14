@@ -19,6 +19,7 @@ from src.kag_ingest import (
     normalize_entity_name,
 )
 from src.kag_query import (
+    apply_relevance_threshold,
     assemble_context,
     build_adjacency,
     classify_query,
@@ -483,13 +484,24 @@ def test_rrf_merge_single_layer_preserves_order():
 # ---------------------------------------------------------------------
 
 
-def test_ppr_entity_selection_relative_threshold():
+def test_ppr_entity_selection_auto_knee():
     # Semilla domina (0.33); primer salto 0.05; segundo salto 0.007; cola 1e-4.
+    # Con auto=True el codo (Kneedle) corta en 0.05 → {1..5} (el 6, 0.007,
+    # queda en la cola). El piso relativo (0.02×0.33=0.0066) habría dejado
+    # pasar al 6 — el codo es más estricto y data-driven.
     scores = {1: 0.33, 2: 0.33, 3: 0.33, 4: 0.05, 5: 0.05, 6: 0.007, 7: 1e-4, 8: 1e-4}
     selected = ppr_entity_selection(scores, min_ratio=0.02)
-    assert set(selected) == {1, 2, 3, 4, 5, 6}
+    assert set(selected) == {1, 2, 3, 4, 5}
     # Ordenado por score desc.
     assert selected == sorted(selected, key=lambda e: -scores[e])
+
+
+def test_ppr_entity_selection_fixed_floor():
+    # Con auto=False se vuelve al comportamiento fijo: el piso relativo
+    # (0.02×0.33=0.0066) deja pasar al 6 (0.007).
+    scores = {1: 0.33, 2: 0.33, 3: 0.33, 4: 0.05, 5: 0.05, 6: 0.007, 7: 1e-4, 8: 1e-4}
+    selected = ppr_entity_selection(scores, min_ratio=0.02, auto=False)
+    assert set(selected) == {1, 2, 3, 4, 5, 6}
 
 
 def test_ppr_entity_selection_empty():
@@ -517,6 +529,44 @@ def test_ppr_entity_selection_small_graph_no_statistical_guard():
     scores = {1: 0.33, 2: 0.33, 3: 0.33, 4: 0.05, 5: 0.05, 6: 0.007}
     selected = ppr_entity_selection(scores, min_ratio=0.02, z=0.5)
     assert set(selected) == {1, 2, 3, 4, 5, 6}
+
+
+# ---------------------------------------------------------------------
+# apply_relevance_threshold — codo automático (Kneedle)
+# ---------------------------------------------------------------------
+
+
+def test_apply_relevance_threshold_auto_knee():
+    # Curva con codo claro: 0.9, 0.5, 0.3, 0.1, 0.05, 0.01. El codo corta en
+    # 0.1 → quedan los 4 primeros. El piso relativo (0.15×0.9=0.135) habría
+    # dejado solo 3 — el codo es data-driven.
+    hits = [(1, 0.9), (2, 0.5), (3, 0.3), (4, 0.1), (5, 0.05), (6, 0.01)]
+    result = apply_relevance_threshold(hits)
+    assert [cid for cid, _ in result] == [1, 2, 3, 4]
+
+
+def test_apply_relevance_threshold_fixed_floor():
+    # Con auto=False: piso relativo 0.15×0.9=0.135 → solo los 3 primeros.
+    hits = [(1, 0.9), (2, 0.5), (3, 0.3), (4, 0.1), (5, 0.05), (6, 0.01)]
+    result = apply_relevance_threshold(hits, auto=False)
+    assert [cid for cid, _ in result] == [1, 2, 3]
+
+
+def test_apply_relevance_threshold_empty():
+    assert apply_relevance_threshold([]) == []
+
+
+def test_apply_relevance_threshold_no_signal():
+    # max_score <= 0 → sin señal → nada pasa.
+    assert apply_relevance_threshold([(1, 0.0), (2, -0.1)]) == []
+
+
+def test_apply_relevance_threshold_no_knee_falls_back_to_floor():
+    # Curva casi lineal (sin codo claro) → fallback al piso relativo.
+    hits = [(1, 0.9), (2, 0.8), (3, 0.7), (4, 0.6), (5, 0.5)]
+    result = apply_relevance_threshold(hits)
+    # Piso = 0.15×0.9 = 0.135 → todos pasan.
+    assert [cid for cid, _ in result] == [1, 2, 3, 4, 5]
 
 
 # ---------------------------------------------------------------------
@@ -787,6 +837,46 @@ def test_disambiguate_empty_adjacency_does_not_crash():
     groups = [[1], [2, 3]]
     result = disambiguate_by_cooccurrence(None, groups, adjacency={})
     assert result == [1, 2]  # default=g[0] para la ambigua
+
+
+def test_disambiguate_auto_margin_uses_median():
+    # Confirmada: 1 con vecinos {2..8}. Cuatro menciones ambiguas:
+    #   [10,11]: 10 overlap 0.8, 11 overlap 1.0 → gap 0.2
+    #   [21,20]: 20 overlap 0.8, 21 overlap 0.667 → gap 0.133
+    #   [30,31]: 30 overlap 0.8, 31 overlap 1.0 → gap 0.2
+    # Gaps = [0.2, 0.133, 0.2] → mediana 0.2. Con auto, el margen es 0.2:
+    #   [10,11] gap 0.2 >= 0.2 → 11; [21,20] gap 0.133 < 0.2 → ambiguo (21);
+    #   [30,31] gap 0.2 >= 0.2 → 31.
+    adj = {1: {2: 1, 3: 1, 4: 1, 5: 1, 6: 1, 7: 1, 8: 1}}
+    adj[10] = {2: 1, 3: 1, 4: 1, 5: 1, 100: 1}  # overlap 0.8
+    adj[11] = {2: 1, 3: 1}  # overlap 1.0
+    adj[20] = {2: 1, 3: 1, 4: 1, 5: 1, 200: 1}  # overlap 0.8
+    adj[21] = {2: 1, 3: 1, 201: 1}  # overlap 0.667
+    adj[30] = {2: 1, 3: 1, 4: 1, 5: 1, 300: 1}  # overlap 0.8
+    adj[31] = {2: 1, 3: 1, 4: 1, 5: 1, 6: 1, 7: 1, 8: 1, 301: 1}  # overlap 1.0
+    groups = [[1], [10, 11], [21, 20], [30, 31]]
+    result = disambiguate_by_cooccurrence(
+        None, groups, adjacency=adj, min_overlap=0.1, margin=0.05
+    )
+    assert result == [1, 11, 21, 31]
+
+
+def test_disambiguate_fixed_margin_resolves_all():
+    # El mismo grafo con auto=False y margen fijo 0.05: todos los gaps
+    # (0.2, 0.133, 0.2) superan 0.05 → todas las menciones se resuelven al
+    # mejor candidato.
+    adj = {1: {2: 1, 3: 1, 4: 1, 5: 1, 6: 1, 7: 1, 8: 1}}
+    adj[10] = {2: 1, 3: 1, 4: 1, 5: 1, 100: 1}
+    adj[11] = {2: 1, 3: 1}
+    adj[20] = {2: 1, 3: 1, 4: 1, 5: 1, 200: 1}
+    adj[21] = {2: 1, 3: 1, 201: 1}
+    adj[30] = {2: 1, 3: 1, 4: 1, 5: 1, 300: 1}
+    adj[31] = {2: 1, 3: 1, 4: 1, 5: 1, 6: 1, 7: 1, 8: 1, 301: 1}
+    groups = [[1], [10, 11], [21, 20], [30, 31]]
+    result = disambiguate_by_cooccurrence(
+        None, groups, adjacency=adj, min_overlap=0.1, margin=0.05, auto=False
+    )
+    assert result == [1, 11, 20, 31]
 
 
 def test_noun_chunk_fallback_no_phrases_degrades(monkeypatch):
