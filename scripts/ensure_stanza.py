@@ -10,11 +10,21 @@ from __future__ import annotations
 
 import sys
 import time
+from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+# Asegura que la raíz del proyecto esté en sys.path al correr como script.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import stanza
+
+# Aplica el parche de Stanza coref (Config.__init__ exige plateau_epochs) ANTES
+# de crear el pipeline — el mismo parche que aplica src/kag/segmentador.py.
+from src.kag.stanza_patch import apply_stanza_coref_patch
+
+apply_stanza_coref_patch()
 
 PROCESSORS = "tokenize,pos,lemma,depparse,constituency,coref"
 MAX_ATTEMPTS = 8
