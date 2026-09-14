@@ -43,6 +43,10 @@ langchain-anthropic==1.7.2
 # Embeddings locales (jina-embeddings-v5-text-nano vía transformers.AutoModel).
 # Inferencia LOCAL: el modelo se descarga desde HuggingFace Hub y se ejecuta
 # en el contenedor — no hay API externa.
+# OJO: el modelo Jina usa trust_remote_code y su código remoto importa módulos
+# SOLO de transformers 5.x (modeling_flash_attention_utils, ALL_ATTENTION_FUNCTIONS,
+# processing_utils.Unpack). Con transformers 4.x falla con el confuso error
+# "Could not import module 'XLMRobertaModel'". Mantener transformers==5.1.0.
 # torch NO va aquí: el wheel depende del hardware (CPU vs CUDA). Se instala
 # en el Dockerfile (ARGs TORCH_INDEX_URL/TORCH_PACKAGE, default CPU) o con
 # scripts/install_torch.py (auto-detección) en instalaciones fuera de Docker.
