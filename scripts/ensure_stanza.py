@@ -1,7 +1,7 @@
 """Asegura que los modelos Stanza de español estén descargados (con reintentos).
 
 El segmentador llama a stanza.download('es', processors='tokenize,pos,lemma,
-depparse,constituency,coref') en get_stanza. Esa llamada re-descarga
+depparse,coref') en get_stanza. Esa llamada re-descarga
 resources.json desde GitHub en cada invocación y falla con ConnectionResetError
 si la red es inestable. Este script reintenta hasta completar.
 """
@@ -26,7 +26,7 @@ from src.kag.stanza_patch import apply_stanza_coref_patch
 
 apply_stanza_coref_patch()
 
-PROCESSORS = "tokenize,pos,lemma,depparse,constituency,coref"
+PROCESSORS = "tokenize,pos,lemma,depparse,coref"
 MAX_ATTEMPTS = 8
 
 for attempt in range(1, MAX_ATTEMPTS + 1):

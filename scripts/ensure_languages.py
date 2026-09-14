@@ -7,7 +7,7 @@ Reglas:
   - spaCy: baja `{lang}_core_news_{size}` para cada idioma activo. Si el tamaño
     pedido no existe para un idioma, baja al más cercano disponible.
   - Stanza: baja con los procesadores EXACTOS que usa el segmentador
-    (`tokenize,pos,lemma,depparse,constituency,coref`) SOLO para los idiomas
+    (`tokenize,pos,lemma,depparse,coref`) SOLO para los idiomas
     que soportan coref. Para el resto, no baja Stanza (el segmentador
     desactiva la correferencia vía try/except en get_stanza).
 
@@ -28,25 +28,10 @@ sys.path.insert(0, str(ROOT))
 
 import yaml
 
-# Procesadores EXACTOS que pide el segmentador (src/kag/segmentador.py get_stanza).
-STANZA_PROCESSORS = "tokenize,pos,lemma,depparse,constituency,coref"
-
-# Idiomas con coref de Stanza (fuente: docs oficiales de Stanza).
-STANZA_COREF_LANGS = {
-    "ca",
-    "cs",
-    "de",
-    "en",
-    "es",
-    "fr",
-    "he",
-    "hi",
-    "nb",
-    "nn",
-    "pl",
-    "ru",
-    "ta",
-}
+# Procesadores de Stanza por idioma (compartido con src/kag/segmentador.py).
+# El pipeline es uniforme (sin constituency): la extracción de sujetos NP la
+# hace spaCy, no Stanza.
+from src.kag.langs import STANZA_COREF_LANGS, stanza_processors
 
 # Orden de tamaños spaCy para el fallback (de más a menos pesado).
 SPACY_SIZES = ["trf", "lg", "md", "sm"]
@@ -110,14 +95,15 @@ def _stanza_downloaded(lang: str) -> bool:
 def _download_stanza(lang: str, retries: int) -> bool:
     import stanza
 
+    processors = stanza_processors(lang)
     for attempt in range(1, retries + 1):
         try:
             print(
                 f"[stanza] intento {attempt}/{retries} — descargando {lang} "
-                f"({STANZA_PROCESSORS})...",
+                f"({processors})...",
                 flush=True,
             )
-            stanza.download(lang, processors=STANZA_PROCESSORS, verbose=False)
+            stanza.download(lang, processors=processors, verbose=False)
             if _stanza_downloaded(lang):
                 print(f"[stanza] ✅ {lang} descargado", flush=True)
                 return True
@@ -219,7 +205,7 @@ def main() -> int:
                 print(f"[stanza] ✓ {lang} ya descargado")
                 continue
             if args.dry_run:
-                print(f"[stanza] faltaría: {lang} ({STANZA_PROCESSORS})")
+                print(f"[stanza] faltaría: {lang} ({stanza_processors(lang)})")
                 continue
             if not _download_stanza(lang, retries):
                 ok = False

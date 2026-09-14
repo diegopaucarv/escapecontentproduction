@@ -21,6 +21,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 CATALOG_PATH = ROOT / "data" / "language_catalog.json"
 DOC_PATH = ROOT / "docs" / "languages.md"
 
@@ -29,22 +30,8 @@ SPACY_COMPAT_URL = (
 )
 STANZA_RAW_URL = "https://raw.githubusercontent.com/stanfordnlp/stanza-resources/main/resources_1.8.0.json"
 
-# Idiomas con coref de Stanza (fuente: docs oficiales de Stanza).
-STANZA_COREF_LANGS = {
-    "ca",
-    "cs",
-    "de",
-    "en",
-    "es",
-    "fr",
-    "he",
-    "hi",
-    "nb",
-    "nn",
-    "pl",
-    "ru",
-    "ta",
-}
+# Idiomas con coref de Stanza (compartido con src/kag/segmentador.py).
+from src.kag.langs import STANZA_COREF_LANGS
 
 
 def _http_json(url: str) -> dict:
@@ -135,7 +122,8 @@ def _write_doc(spacy_ver: str, spacy: dict, stanza: dict) -> None:
         "",
         (
             "- El segmentador pide a Stanza los procesadores "
-            "`tokenize,pos,lemma,depparse,constituency,coref`."
+            "`tokenize,pos,lemma,depparse,coref` (sin constituency: la "
+            "extracción de sujetos NP la hace spaCy)."
         ),
         "- El coref de Stanza **solo** existe para: "
         + ", ".join(sorted(STANZA_COREF_LANGS))

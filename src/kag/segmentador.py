@@ -35,28 +35,16 @@ DEFAULT_SPACY_MODELS = {
     "fr": "fr_core_news_md",
 }
 
-# Idiomas con coref de Stanza (fuente: docs oficiales de Stanza). Para el
-# resto, get_stanza() no intenta cargar el pipeline (desactiva correferencia).
-STANZA_COREF_LANGS = {
-    "ca",
-    "cs",
-    "de",
-    "en",
-    "es",
-    "fr",
-    "he",
-    "hi",
-    "nb",
-    "nn",
-    "pl",
-    "ru",
-    "ta",
-}
-
 # ── Stanza coref bug-fix (compartido con scripts/ensure_stanza.py) ──────────
 from src.kag.stanza_patch import apply_stanza_coref_patch
 
 apply_stanza_coref_patch()
+
+# ── Idiomas y procesadores de Stanza (compartido con ensure_languages.py) ────
+from src.kag.langs import (
+    STANZA_COREF_LANGS,
+    stanza_processors,
+)
 
 # ── Pivots conversacionales multilingües (archivo externo) ────────────────────
 # Los pivots por idioma viven en src/kag/pivots.json. Si se añade un idioma,
@@ -360,16 +348,17 @@ class ProgressiveSegmenter:
                 self._stanza_pipeline = None
                 return None
             print("[COREF] Stanza pipeline not loaded — iniciando carga...")
+            processors = stanza_processors(self.stanza_lang)
             try:
                 stanza.download(
                     self.stanza_lang,
-                    processors="tokenize,pos,lemma,depparse,constituency,coref",
+                    processors=processors,
                     verbose=False,
                 )
                 # ── FIX: use self._stanza_pipeline (with underscore) ─────────
                 self._stanza_pipeline = stanza.Pipeline(
                     self.stanza_lang,
-                    processors="tokenize,pos,lemma,depparse,constituency,coref",
+                    processors=processors,
                     use_gpu=self.stanza_use_gpu,
                     verbose=False,
                 )
@@ -692,47 +681,26 @@ class ProgressiveSegmenter:
 
     def find_subjects_for_roots(self, text: str) -> list:
         """
-        Extracts full Noun Phrases (NP) as subjects.
-        Includes fallback logic for MWT index mismatches.
+        Extrae los sintagmas nominales (NP) que son sujeto de la raíz de cada
+        oración usando spaCy (dependency parsing + noun_chunks).
+
+        Reemplaza al parser de constituency de Stanza: spaCy no tiene
+        constituency nativo, pero para obtener el NP sujeto basta con buscar el
+        token con dep_ == "nsubj" cuyo head sea la raíz de la oración y
+        expandirlo a su noun_chunk completo. Así el pipeline de Stanza queda
+        uniforme (sin constituency) para todos los idiomas.
         """
         subjects = []
         try:
-            stanza_pipe = self.get_stanza()
-            if not stanza_pipe:
-                return []
-
-            doc = stanza_pipe(text)
-            for sentence in doc.sentences:
-                tree = sentence.constituency
-                root_ids = [word.id for word in sentence.words if word.head == 0]
-
-                for word in sentence.words:
-                    if word.head in root_ids and "nsubj" in word.deprel:
-                        phrase_found = False
-                        try:
-                            # 1. Attempt to find the phrase 'box' (NP)
-                            # word.id is 1-based, tree index is 0-based
-                            leaf = tree.get_leaf_for_index(word.id - 1)
-                            curr = leaf
-                            while curr.parent is not None:
-                                if curr.label == "NP":
-                                    subjects.append(" ".join(curr.leaf_labels()))
-                                    phrase_found = True
-                                    break
-                                curr = curr.parent
-                        except Exception:
-                            # Catch potential index out of range for MWTs
-                            phrase_found = False
-
-                        # 2. FALLBACK: If tree traversal failed, take the raw word
-                        if not phrase_found:
-                            subjects.append(word.text)
-
-            return list(set([s.strip() for s in subjects if s]))
-
+            doc = self.nlp(text)
+            for chunk in doc.noun_chunks:
+                tok = chunk.root
+                if tok.dep_ in ("nsubj", "nsubjpass") and tok.head == tok.sent.root:
+                    subjects.append(chunk.text)
         except Exception as e:
-            logging.error(f"[COREF] Subject extraction  failure: {e}")
+            logging.error(f"[COREF] Subject extraction failure: {e}")
             return []
+        return list(set([s.strip() for s in subjects if s]))
 
     # ─────────────────────────────────────────────────────────────────────────
     # _extract_global_chains — with full debug prints + chain deduplication FIX
