@@ -27,6 +27,7 @@ from src.kag_query import (
     hybrid_search,
     match_entities_candidates,
     personalized_pagerank,
+    ppr_entity_selection,
     rrf_merge,
 )
 
@@ -297,6 +298,35 @@ def test_assemble_context_empty_graceful():
     assert "sin resúmenes" in ctx
 
 
+def test_assemble_context_with_history():
+    chunks = [
+        {
+            "doc_path": "a.md",
+            "section_path": "## Intro",
+            "chunk_index": 0,
+            "content": "contenido a",
+            "is_anchor": True,
+            "score": 0.5,
+        }
+    ]
+    history = [
+        {"role": "user", "content": "¿qué es X?"},
+        {"role": "assistant", "content": "X es Y."},
+    ]
+    ctx = assemble_context(chunks, [], [], [], "pregunta", history=history)
+    assert "HISTORIAL DE CONVERSACIÓN" in ctx
+    assert "[USER] ¿qué es X?" in ctx
+    assert "[ASSISTANT] X es Y." in ctx
+    # El historial no rompe las secciones normales.
+    assert "FRAGMENTOS RECUPERADOS" in ctx
+    assert "contenido a" in ctx
+
+
+def test_assemble_context_without_history_omits_section():
+    ctx = assemble_context([], [], [], [], "pregunta")
+    assert "HISTORIAL DE CONVERSACIÓN" not in ctx
+
+
 # ---------------------------------------------------------------------
 # complete_local
 # ---------------------------------------------------------------------
@@ -426,6 +456,69 @@ def test_rrf_merge_empty():
     assert rrf_merge([], [], k=60, top_k=5) == []
 
 
+def test_rrf_merge_three_layers():
+    # Tres capas (vector, regex, PPR): cada una aporta 1/(k+rank).
+    vec = [(1, 0.9), (2, 0.8)]
+    regex = [(2, 5.0), (3, 4.0)]
+    ppr = [(3, 0.0), (4, 0.0)]
+    merged = rrf_merge(vec, regex, ppr, k=60, top_k=10)
+    scores = dict(merged)
+    assert scores[2] == pytest.approx(1 / 62 + 1 / 61)  # rank2 vec + rank1 regex
+    assert scores[3] == pytest.approx(1 / 62 + 1 / 61)  # rank2 regex + rank1 ppr
+    assert scores[1] == pytest.approx(1 / 61)
+    assert scores[4] == pytest.approx(1 / 62)
+    # Sin duplicación: cada id aparece una sola vez.
+    assert len(merged) == 4
+
+
+def test_rrf_merge_single_layer_preserves_order():
+    # RRF de una sola lista preserva el orden (monótono en rank).
+    hits = [(3, 0.9), (1, 0.8), (2, 0.7)]
+    merged = rrf_merge(hits, k=60, top_k=10)
+    assert [cid for cid, _ in merged] == [3, 1, 2]
+
+
+# ---------------------------------------------------------------------
+# ppr_entity_selection — umbral de cercanía en el grafo
+# ---------------------------------------------------------------------
+
+
+def test_ppr_entity_selection_relative_threshold():
+    # Semilla domina (0.33); primer salto 0.05; segundo salto 0.007; cola 1e-4.
+    scores = {1: 0.33, 2: 0.33, 3: 0.33, 4: 0.05, 5: 0.05, 6: 0.007, 7: 1e-4, 8: 1e-4}
+    selected = ppr_entity_selection(scores, min_ratio=0.02)
+    assert set(selected) == {1, 2, 3, 4, 5, 6}
+    # Ordenado por score desc.
+    assert selected == sorted(selected, key=lambda e: -scores[e])
+
+
+def test_ppr_entity_selection_empty():
+    assert ppr_entity_selection({}) == []
+
+
+def test_ppr_entity_selection_large_graph_statistical_guard():
+    # 200 nodos: 3 semilla (0.3), 5 primer salto (0.05), resto ruido (1e-4).
+    # El piso estadístico (mean + z*std) separa la señal de la cola.
+    scores = {}
+    for i in range(3):
+        scores[i] = 0.3
+    for i in range(3, 8):
+        scores[i] = 0.05
+    for i in range(8, 200):
+        scores[i] = 1e-4
+    selected = ppr_entity_selection(scores, min_ratio=0.02, z=0.5)
+    assert set(range(8)) <= set(selected)
+    assert not any(e >= 8 for e in selected)
+
+
+def test_ppr_entity_selection_small_graph_no_statistical_guard():
+    # Grafo pequeño (n < 100): el piso es solo relativo al máximo — el
+    # término estadístico sobre-filtraría (la media es significativa).
+    scores = {1: 0.33, 2: 0.33, 3: 0.33, 4: 0.05, 5: 0.05, 6: 0.007}
+    selected = ppr_entity_selection(scores, min_ratio=0.02, z=0.5)
+    assert set(selected) == {1, 2, 3, 4, 5, 6}
+
+
 # ---------------------------------------------------------------------
 # disambiguate_by_cooccurrence (opt 2)
 # ---------------------------------------------------------------------
@@ -454,6 +547,44 @@ def test_disambiguate_no_confirmed_keeps_first():
 
 def test_disambiguate_empty_groups():
     assert disambiguate_by_cooccurrence(None, [], adjacency={}) == []
+
+
+def test_disambiguate_overlap_normalizes_by_degree():
+    # Confirmada: 1 con vecinos {2,3,4,5}. Candidato A (hub, grado 100)
+    # comparte 3; candidato B (grado 3) comparte 3. El overlap coefficient
+    # prefiere a B (3/3=1.0) sobre A (3/4=0.75); el conteo crudo empataría
+    # y el código viejo elegiría al primero (el hub).
+    adj = {1: {2: 1, 3: 1, 4: 1, 5: 1}}
+    adj[10] = {2: 1, 3: 1, 4: 1}
+    for i in range(97):
+        adj[10][f"h{i}"] = 1  # grado 100
+    adj[11] = {2: 1, 3: 1, 4: 1}  # grado 3
+    groups = [[1], [10, 11]]
+    result = disambiguate_by_cooccurrence(
+        None, groups, adjacency=adj, min_overlap=0.1, margin=0.05
+    )
+    assert result == [1, 11]
+
+
+def test_disambiguate_ambiguous_falls_back_to_first():
+    # Dos candidatos con el mismo overlap (0.5) → margen 0 → primer candidato.
+    adj = {1: {2: 1, 3: 1, 4: 1}, 2: {1: 1, 3: 1}, 3: {1: 1, 2: 1}, 4: {1: 1}}
+    groups = [[1], [2, 3]]
+    result = disambiguate_by_cooccurrence(
+        None, groups, adjacency=adj, min_overlap=0.1, margin=0.05
+    )
+    assert result == [1, 2]
+
+
+def test_disambiguate_below_min_overlap_falls_back():
+    # El mejor candidato no comparte vecinos (overlap 0 < min_overlap) →
+    # ambiguo → primer candidato.
+    adj = {1: {2: 1, 3: 1}, 2: {1: 1}, 3: {1: 1}, 4: {}}
+    groups = [[1], [2, 3]]
+    result = disambiguate_by_cooccurrence(
+        None, groups, adjacency=adj, min_overlap=0.1, margin=0.05
+    )
+    assert result == [1, 2]
 
 
 # ---------------------------------------------------------------------
@@ -681,6 +812,129 @@ def test_noun_chunk_fallback_no_phrases_degrades(monkeypatch):
     # Sin noun chunks ni PROPN → degrada al fallback determinista por tokens.
     found = kq._noun_chunk_fallback(session, "¿Cómo se calcula?")
     assert found == ["Cálculo"]
+
+
+# ---------------------------------------------------------------------
+# critic_regex_search — LLM crítico + heurística determinista
+# ---------------------------------------------------------------------
+
+
+class _RegexSession:
+    """Sesión falsa: responde a la query FTS por término."""
+
+    def __init__(self, hits_by_term):
+        self.hits_by_term = hits_by_term  # {term: [(id, score)]}
+
+    def execute(self, stmt, params=None):
+        term = params["q"]
+        rows = [
+            SimpleNamespace(id=cid, score=s)
+            for cid, s in self.hits_by_term.get(term, [])
+        ]
+
+        class _Result:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def fetchall(self):
+                return self._rows
+
+        return _Result(rows)
+
+
+def test_deterministic_regex_terms():
+    import src.kag_query as kq
+
+    assert kq._deterministic_regex_terms("¿Qué es CVE-2024-3094?") == ["CVE-2024-3094"]
+    assert kq._deterministic_regex_terms("¿Quién es Pierre Bourdieu?") == [
+        "Pierre Bourdieu"
+    ]
+    assert kq._deterministic_regex_terms("¿qué es el capital cultural?") == []
+
+
+def test_critic_regex_search_returns_terms(monkeypatch):
+    import src.kag_query as kq
+
+    session = _RegexSession({"CVE-2024-3094": [(7, 3.0), (8, 2.0)]})
+    monkeypatch.setattr(
+        kq,
+        "load_settings",
+        lambda session: SimpleNamespace(llm_retries=3, fallback_model=None),
+    )
+
+    def fake_call(
+        session,
+        *,
+        prompt,
+        system,
+        model_size,
+        response_format,
+        retries,
+        fallback_model=None,
+    ):
+        return '{"needs_regex": true, "terms": ["CVE-2024-3094"]}', "small", False
+
+    monkeypatch.setattr(kq, "call_with_retries", fake_call)
+
+    hits, terms = kq.critic_regex_search(session, "¿Qué es CVE-2024-3094?", top_k=5)
+    assert terms == ["CVE-2024-3094"]
+    assert hits == [(7, 3.0), (8, 2.0)]
+
+
+def test_critic_regex_search_no_terms_returns_empty(monkeypatch):
+    import src.kag_query as kq
+
+    def fake_call(
+        session,
+        *,
+        prompt,
+        system,
+        model_size,
+        response_format,
+        retries,
+        fallback_model=None,
+    ):
+        return '{"needs_regex": false, "terms": []}', "small", False
+
+    monkeypatch.setattr(kq, "call_with_retries", fake_call)
+    monkeypatch.setattr(
+        kq,
+        "load_settings",
+        lambda session: SimpleNamespace(llm_retries=3, fallback_model=None),
+    )
+
+    hits, terms = kq.critic_regex_search(None, "¿Qué es el capital cultural?", top_k=5)
+    assert hits == []
+    assert terms == []
+
+
+def test_critic_regex_search_llm_fails_uses_heuristic(monkeypatch):
+    import src.kag_query as kq
+
+    session = _RegexSession({"CVE-2024-3094": [(7, 3.0)]})
+
+    def fake_call(
+        session,
+        *,
+        prompt,
+        system,
+        model_size,
+        response_format,
+        retries,
+        fallback_model=None,
+    ):
+        raise RuntimeError("LLM caído")
+
+    monkeypatch.setattr(kq, "call_with_retries", fake_call)
+    monkeypatch.setattr(
+        kq,
+        "load_settings",
+        lambda session: SimpleNamespace(llm_retries=3, fallback_model=None),
+    )
+
+    hits, terms = kq.critic_regex_search(session, "¿Qué es CVE-2024-3094?", top_k=5)
+    assert terms == ["CVE-2024-3094"]  # heurística determinista
+    assert hits == [(7, 3.0)]
 
 
 # ---------------------------------------------------------------------

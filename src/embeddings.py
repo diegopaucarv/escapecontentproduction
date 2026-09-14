@@ -139,3 +139,27 @@ def embed_text(text: str, input_type: str = "document") -> list[float]:
         # en GPU. Los valores no cambian, solo el dtype.
         vec = vec.detach().cpu().float().numpy()
     return vec.tolist() if hasattr(vec, "tolist") else list(vec)
+
+
+def embed_texts(texts: list[str], input_type: str = "document") -> list[list[float]]:
+    """Versión batch de embed_text: una sola llamada a model.encode para N textos.
+
+    Útil para canonicalizar muchos candidatos (p. ej. entidades del KAG) sin
+    pagar el overhead de N llamadas individuales. Mismo modelo/config que
+    embed_text; devuelve una lista de vectores en el mismo orden de entrada.
+    """
+    if not texts:
+        return []
+    api_key, model_name, _dimension = _active_embedding_config()
+    model = _get_model(api_key, model_name)
+    embs = model.encode(
+        texts=texts,
+        task="retrieval",
+        prompt_name=_prompt_name(input_type),
+    )
+    out = []
+    for vec in embs:
+        if hasattr(vec, "detach"):  # torch.Tensor -> numpy (bfloat16 -> float32)
+            vec = vec.detach().cpu().float().numpy()
+        out.append(vec.tolist() if hasattr(vec, "tolist") else list(vec))
+    return out

@@ -18,6 +18,7 @@ from src.embeddings import (
     _get_model,
     _prompt_name,
     embed_text,
+    embed_texts,
 )
 
 
@@ -268,3 +269,81 @@ def test_embed_text_handles_tensor(monkeypatch):
 
     result = embed_text("texto", input_type="document")
     assert result == [0.1, 0.2, 0.3]
+
+
+# ---------------------------------------------------------------------
+# embed_texts — versión batch (una sola llamada a model.encode para N textos)
+# ---------------------------------------------------------------------
+
+
+def test_embed_texts_batch(monkeypatch):
+    import src.embeddings as embeddings_mod
+
+    captured = {}
+
+    class _FakeModel:
+        def encode(self, texts=None, task=None, prompt_name=None):
+            captured["texts"] = texts
+            captured["task"] = task
+            captured["prompt_name"] = prompt_name
+            return [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]
+
+    monkeypatch.setattr(
+        embeddings_mod, "_get_model", lambda api_key, model_name: _FakeModel()
+    )
+    monkeypatch.setattr(
+        embeddings_mod,
+        "_active_embedding_config",
+        lambda session=None: ("hf_xxx", "jinaai/jina-embeddings-v5-text-nano", 768),
+    )
+
+    result = embed_texts(["a", "b", "c"], input_type="document")
+    assert result == [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]
+    assert captured["texts"] == ["a", "b", "c"]
+    assert captured["task"] == "retrieval"
+    assert captured["prompt_name"] == "document"
+
+
+def test_embed_texts_empty_returns_empty(monkeypatch):
+    import src.embeddings as embeddings_mod
+
+    def fake_model(api_key, model_name):
+        raise AssertionError("no debe cargar el modelo con lista vacía")
+
+    monkeypatch.setattr(embeddings_mod, "_get_model", fake_model)
+    assert embed_texts([]) == []
+
+
+def test_embed_texts_handles_tensors(monkeypatch):
+    """Si .encode() devuelve tensores, se aplanan a list[float] (bfloat16→f32)."""
+
+    class _FakeTensor:
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def float(self):
+            return self
+
+        def numpy(self):
+            return np.array([0.1, 0.2])
+
+    class _FakeModel:
+        def encode(self, texts=None, task=None, prompt_name=None):
+            return [_FakeTensor(), _FakeTensor()]
+
+    import src.embeddings as embeddings_mod
+
+    monkeypatch.setattr(
+        embeddings_mod, "_get_model", lambda api_key, model_name: _FakeModel()
+    )
+    monkeypatch.setattr(
+        embeddings_mod,
+        "_active_embedding_config",
+        lambda session=None: ("hf_xxx", "jinaai/jina-embeddings-v5-text-nano", 768),
+    )
+
+    result = embed_texts(["a", "b"])
+    assert result == [[0.1, 0.2], [0.1, 0.2]]

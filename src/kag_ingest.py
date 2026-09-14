@@ -673,10 +673,15 @@ def _title_from_md(text: str, doc_path: str) -> str:
     return Path(doc_path).stem[:300]
 
 
-def index_document(session, md_path, force=False, no_summary=False, verbose=True):
+def index_document(
+    session, md_path, force=False, no_summary=False, verbose=True, llm_entities=False
+):
     """Indexa un documento .md en el KAG (flujo §2.3 del diseño).
 
     Idempotente por content_hash; --force re-indexa. Devuelve dict resumen.
+
+    `llm_entities=True` usa la extracción LLM por chunk (Together, costosa);
+    por defecto se usa la extracción determinista con spaCy (gratis).
     """
     md_path = Path(md_path)
     if not md_path.exists():
@@ -802,7 +807,7 @@ def index_document(session, md_path, force=False, no_summary=False, verbose=True
         for i, chunk in enumerate(chunks):
             # Import perezoso: src.embeddings importa src.db.session (que lee
             # .env al importar) — debe ocurrir DESPUÉS de _fix_db_host().
-            from src.embeddings import embed_text
+            from src.embeddings import embed_text, embed_texts
 
             try:
                 emb = embed_text(chunk["content"], input_type="document")
@@ -828,7 +833,20 @@ def index_document(session, md_path, force=False, no_summary=False, verbose=True
                 },
             ).scalar()
             chunk_count += 1
-            data = extract_entities_relations(session, chunk["content"])
+            if llm_entities:
+                data = extract_entities_relations(session, chunk["content"])
+            else:
+                # Extracción determinista con spaCy (gratis): reutiliza el nlp
+                # del segmentador (ya cargado) y canonicaliza con el modelo de
+                # embeddings de la DB (embed_texts, batch).
+                from src.kag.entities import extract_entities_deterministic
+
+                data = extract_entities_deterministic(
+                    segmenter.nlp,
+                    chunk["content"],
+                    embed_fn=embed_texts,
+                    lang=lang,
+                )
             _store_entities_relations(session, doc_id, chunk_id, data)
         session.commit()
 
@@ -911,7 +929,7 @@ def index_document(session, md_path, force=False, no_summary=False, verbose=True
         raise
 
 
-def index_all(session, force=False, no_summary=False, verbose=True):
+def index_all(session, force=False, no_summary=False, verbose=True, llm_entities=False):
     """Indexa todos los .md de data/knowledge_repository/docs/."""
     docs = sorted(DOCS_DIR.glob("*.md"))
     if not docs:
@@ -923,7 +941,12 @@ def index_all(session, force=False, no_summary=False, verbose=True):
         try:
             results.append(
                 index_document(
-                    session, md, force=force, no_summary=no_summary, verbose=verbose
+                    session,
+                    md,
+                    force=force,
+                    no_summary=no_summary,
+                    verbose=verbose,
+                    llm_entities=llm_entities,
                 )
             )
         except Exception as exc:  # noqa: BLE001 — un doc no bloquea el resto
@@ -955,6 +978,12 @@ def main() -> None:
         "--no-summary", action="store_true", help="Omite el resumen local Qwen 2.5."
     )
     parser.add_argument(
+        "--llm-entities",
+        action="store_true",
+        help="Usa la extracción LLM por chunk (Together, costosa) en vez de la "
+        "determinista con spaCy (default).",
+    )
+    parser.add_argument(
         "--verbose", action="store_true", default=True, help="Prints descriptivos."
     )
     args = parser.parse_args()
@@ -971,6 +1000,7 @@ def main() -> None:
                 force=args.force,
                 no_summary=args.no_summary,
                 verbose=args.verbose,
+                llm_entities=args.llm_entities,
             )
         else:
             index_all(
@@ -978,6 +1008,7 @@ def main() -> None:
                 force=args.force,
                 no_summary=args.no_summary,
                 verbose=args.verbose,
+                llm_entities=args.llm_entities,
             )
     finally:
         session.close()
