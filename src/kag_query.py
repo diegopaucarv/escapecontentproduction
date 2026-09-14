@@ -81,6 +81,16 @@ DISAMBIG_MARGIN = 0.05
 # vuelve al comportamiento fijo de siempre.
 AUTO_THRESHOLDS = True
 
+# Caché del grafo de entidades (build_adjacency) por versión en DB. La
+# versión la mantiene la migración 0016_kag_graph_version: un trigger sobre
+# kag_relations la incrementa en cada ingesta (INSERT/UPDATE/DELETE). En
+# consulta se lee la versión (O(1), una fila) y se reutiliza el dict si no
+# cambió — espejo del índice HNSW, que Postgres mantiene incrementalmente.
+# Si la migración no está aplicada, version = None y se degrada al
+# comportamiento viejo (reconstruir en cada llamada, sin cachear).
+_adjacency_cache: dict | None = None
+_adjacency_version: int = -1
+
 # ---------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------
@@ -506,8 +516,29 @@ def build_adjacency(session):
     """Grafo desde kag_relations: {entity_id: {neighbor_id: weight}}.
 
     Simétrico: cada relación aporta arista en ambos sentidos, ponderada por
-    frecuencia.
+    frecuencia. Cacheado por versión en DB (migración 0016): si la versión
+    no cambió, devuelve el dict en memoria sin releer kag_relations. Si la
+    migración no está aplicada (o la sesión no soporta el SELECT de versión),
+    degrada al comportamiento viejo: reconstruir en cada llamada, sin
+    cachear.
     """
+    global _adjacency_cache, _adjacency_version
+
+    try:
+        version = session.execute(
+            text("SELECT version FROM kag_graph_state WHERE id = 1")
+        ).scalar()
+    except Exception:
+        # Migración 0016 sin aplicar, o sesión falsa de tests sin .scalar().
+        version = None
+
+    if (
+        version is not None
+        and version == _adjacency_version
+        and _adjacency_cache is not None
+    ):
+        return _adjacency_cache
+
     rows = session.execute(
         text("SELECT source_entity_id, target_entity_id FROM kag_relations")
     ).fetchall()
@@ -518,6 +549,10 @@ def build_adjacency(session):
         adj.setdefault(t, {})
         adj[s][t] = adj[s].get(t, 0) + 1
         adj[t][s] = adj[t].get(s, 0) + 1
+
+    if version is not None:
+        _adjacency_cache = adj
+        _adjacency_version = version
     return adj
 
 

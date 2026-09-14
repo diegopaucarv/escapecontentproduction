@@ -32,6 +32,24 @@ from src.kag_query import (
     rrf_merge,
 )
 
+
+@pytest.fixture(autouse=True)
+def _reset_adjacency_cache():
+    """Resetea el caché module-level de build_adjacency entre tests.
+
+    El caché es global al módulo src.kag_query y contamina entre tests: un
+    test que cachea con una sesión falsa dejaría el dict/versión para el
+    siguiente. Se resetea antes y después de cada test.
+    """
+    import src.kag_query as kq
+
+    kq._adjacency_cache = None
+    kq._adjacency_version = -1
+    yield
+    kq._adjacency_cache = None
+    kq._adjacency_version = -1
+
+
 # ---------------------------------------------------------------------
 # estimate_tokens / normalize_entity_name
 # ---------------------------------------------------------------------
@@ -259,6 +277,142 @@ def test_build_adjacency_symmetric_with_weights():
     assert adj[2][1] == 2  # simétrico
     assert adj[2][3] == 1
     assert adj[3][2] == 1
+
+
+def test_build_adjacency_cached_by_version():
+    """Con la tabla de versión (migración 0016), la segunda llamada con la
+    misma versión devuelve el MISMO objeto sin releer kag_relations."""
+    import src.kag_query as kq
+
+    class _Result:
+        def __init__(self, rows=None, scalar=None):
+            self._rows = rows or []
+            self._scalar = scalar
+
+        def fetchall(self):
+            return self._rows
+
+        def scalar(self):
+            return self._scalar
+
+    class _FakeSession:
+        def __init__(self, version, rows):
+            self.version = version
+            self.rows = rows
+            self.relation_queries = 0
+
+        def execute(self, stmt, params=None):
+            sql = str(stmt)
+            if "kag_graph_state" in sql:
+                return _Result(scalar=self.version)
+            self.relation_queries += 1
+            return _Result(rows=self.rows)
+
+    rows = [
+        SimpleNamespace(source_entity_id=1, target_entity_id=2),
+        SimpleNamespace(source_entity_id=2, target_entity_id=3),
+    ]
+    session = _FakeSession(version=1, rows=rows)
+
+    adj1 = build_adjacency(session)
+    assert session.relation_queries == 1
+    assert adj1[1][2] == 1
+    assert adj1[2][3] == 1
+
+    adj2 = build_adjacency(session)
+    assert session.relation_queries == 1  # no relee
+    assert adj2 is adj1  # mismo objeto
+
+
+def test_build_adjacency_rebuilds_on_version_change():
+    """Si la versión en DB cambió (ingesta), la siguiente llamada relee
+    kag_relations y reconstruye el dict."""
+    import src.kag_query as kq
+
+    class _Result:
+        def __init__(self, rows=None, scalar=None):
+            self._rows = rows or []
+            self._scalar = scalar
+
+        def fetchall(self):
+            return self._rows
+
+        def scalar(self):
+            return self._scalar
+
+    class _FakeSession:
+        def __init__(self, version, rows):
+            self.version = version
+            self.rows = rows
+            self.relation_queries = 0
+
+        def execute(self, stmt, params=None):
+            sql = str(stmt)
+            if "kag_graph_state" in sql:
+                return _Result(scalar=self.version)
+            self.relation_queries += 1
+            return _Result(rows=self.rows)
+
+    rows_v1 = [
+        SimpleNamespace(source_entity_id=1, target_entity_id=2),
+        SimpleNamespace(source_entity_id=2, target_entity_id=3),
+    ]
+    session = _FakeSession(version=1, rows=rows_v1)
+
+    adj1 = build_adjacency(session)
+    assert session.relation_queries == 1
+    assert 3 in adj1[2]
+
+    # Ingesta: versión sube y las relaciones cambian.
+    session.version = 2
+    session.rows = [
+        SimpleNamespace(source_entity_id=1, target_entity_id=4),
+        SimpleNamespace(source_entity_id=4, target_entity_id=5),
+    ]
+
+    adj2 = build_adjacency(session)
+    assert session.relation_queries == 2
+    assert 2 not in adj2  # entidad 2 ya no está en el grafo
+    assert adj2[1][4] == 1
+    assert adj2[4][5] == 1
+
+
+def test_build_adjacency_degrades_without_version_table():
+    """Sin la migración 0016 (o sesión sin .scalar()), build_adjacency
+    reconstruye en cada llamada (comportamiento viejo) y no cachea."""
+    import src.kag_query as kq
+
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    class _FakeSession:
+        def __init__(self, rows):
+            self.rows = rows
+            self.relation_queries = 0
+
+        def execute(self, stmt, params=None):
+            sql = str(stmt)
+            if "kag_graph_state" in sql:
+                raise AttributeError("no .scalar() en sesión falsa")
+            self.relation_queries += 1
+            return _Result(rows=self.rows)
+
+    rows = [
+        SimpleNamespace(source_entity_id=1, target_entity_id=2),
+        SimpleNamespace(source_entity_id=2, target_entity_id=3),
+    ]
+    session = _FakeSession(rows=rows)
+
+    adj1 = build_adjacency(session)
+    assert session.relation_queries == 1
+    adj2 = build_adjacency(session)
+    assert session.relation_queries == 2  # relee cada vez
+    assert adj2 is not adj1  # no cachea
+    assert adj2[1][2] == 1
 
 
 # ---------------------------------------------------------------------
