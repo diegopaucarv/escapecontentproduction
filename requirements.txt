@@ -49,5 +49,20 @@ langchain-anthropic==1.7.2
 transformers==5.1.0
 peft==0.20.0   # jina-embeddings-v5 usa adapters LoRA (PEFT)
 
+# Sistema KAG — segmentador (src/kag/segmentador.py) y consulta (src/kag_query.py).
+# El segmentador importa estos a nivel de módulo: si faltan, la ingesta falla.
+# Los modelos de spaCy (es_core_news_md, en_core_web_md, pt_core_news_md,
+# de_core_news_md, fr_core_news_md) se descargan aparte con:
+#   python -m spacy download es_core_news_md en_core_web_md pt_core_news_md de_core_news_md fr_core_news_md
+# Los modelos Stanza de español (coref) se descargan con scripts/ensure_stanza.py.
+spacy==3.8.16
+stanza==1.11.1
+rapidfuzz==3.14.5
+hnswlib==0.8.0
+sentence-transformers==5.7.0
+scipy==1.16.3
+scikit-learn==1.6.1
+numpy==2.1.3
+
 # Testing
 pytest==9.1.1
