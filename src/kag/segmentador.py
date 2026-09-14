@@ -21,6 +21,33 @@ from spacy.language import Language
 from sqlalchemy import text
 from transformers import AutoTokenizer, BertModel, BertTokenizer, pipeline
 
+
+# ── Optimización de recursos: hilos de torch ─────────────────────────────────
+# Los modelos de embeddings del segmentador son pequeños (all-MiniLM, jina
+# nano). torch usa por defecto TODOS los cores, lo que en modelos pequeños
+# causa thread thrashing (overhead de sincronización > ganancia). Se limita a
+# un número sensato de hilos, configurable vía KAG_TORCH_THREADS. No cambia el
+# resultado numérico (mismos pesos, mismos vectores), solo el rendimiento.
+def _configure_torch_threads() -> None:
+    import os
+
+    try:
+        if os.environ.get("KAG_TORCH_THREADS"):
+            n = max(1, int(os.environ["KAG_TORCH_THREADS"]))
+        else:
+            cpus = os.cpu_count() or 4
+            # Cap: para modelos pequeños, >4 hilos casi nunca ayuda y añade
+            # overhead. En GPU los hilos CPU apenas importan (el cómputo va
+            # al GPU); en CPU 2-4 hilos suele ser el punto dulce.
+            n = min(4, max(1, cpus))
+        torch.set_num_threads(n)
+        logging.info(f"[Threads] torch.set_num_threads({n})")
+    except Exception:  # noqa: BLE001 — nunca debe romper la carga
+        pass
+
+
+_configure_torch_threads()
+
 # ── Configuración por defecto del segmentador ────────────────────────────────
 # La configuración real se lee de kag_segmenter_settings en la DB (ver
 # load_segmenter_config); estos defaults solo existen para entornos sin DB.
@@ -157,10 +184,18 @@ class AttentionShiftDetector:
 # ClassicSegmenter  (unchanged from original)
 # ─────────────────────────────────────────────────────────────────────────────
 class ClassicSegmenter:
-    def __init__(self, embedding_model, spacy_model, nli_model=DEFAULT_NLI_MODEL):
+    def __init__(
+        self,
+        embedding_model,
+        spacy_model,
+        nli_model=DEFAULT_NLI_MODEL,
+        embed_cache=None,
+    ):
         self.nlp = spacy.load(spacy_model)
         self.embedding_model = embedding_model
-        self.embedding_cache = {}
+        # Caché compartida con el ProgressiveSegmenter (si se pasa): mismo
+        # texto -> mismo vector, solo evita re-embeder lo ya embebido.
+        self.embedding_cache = embed_cache if embed_cache is not None else {}
         self.nli_model_name = nli_model
         self._nli_model = None  # carga perezosa (~1.6GB, solo si hace falta)
 
@@ -220,8 +255,11 @@ class ClassicSegmenter:
 
     def _get_cached_embedding(self, text):
         if text not in self.embedding_cache:
+            # Normalizado: la caché es compartida con ProgressiveSegmenter
+            # (generate_embeddings normaliza). Solo se usa para similitud
+            # coseno, que es invariante a la normalización -> mismo resultado.
             self.embedding_cache[text] = self.embedding_model.encode(
-                [text], convert_to_numpy=True
+                [text], normalize_embeddings=True, convert_to_numpy=True
             )[0]
         return self.embedding_cache[text]
 
@@ -311,9 +349,16 @@ class ProgressiveSegmenter:
         self.stanza_use_gpu = device is not None
         self.debug_coref = debug_coref  # toggle for coref debug prints
 
+        # Caché de embeddings compartida (texto -> vector). Solo optimiza
+        # rendimiento: mismo texto -> mismo vector, nunca cambia el resultado.
+        self._embed_cache: dict = {}
+
         self.model = SentenceTransformer(model_name).to(self.device)
         self.classicseg = ClassicSegmenter(
-            self.model, spacy_model=spacy_model, nli_model=nli_model
+            self.model,
+            spacy_model=spacy_model,
+            nli_model=nli_model,
+            embed_cache=self._embed_cache,
         )
         self.nlp = spacy.load(spacy_model)
         if "conversational_sbd" not in self.nlp.pipe_names:
@@ -406,14 +451,24 @@ class ProgressiveSegmenter:
         return sentences
 
     def generate_embeddings(self, sentences):
-        embeddings = self.model.encode(
-            sentences,
-            batch_size=min(64, len(sentences)),
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-            show_progress_bar=False,
-        )
-        return embeddings
+        """Embebe una lista de textos con caché + batching.
+
+        Solo los textos que faltan en la caché se pasan al modelo (en un solo
+        batch); los ya vistos se reutilizan. Mismo texto -> mismo vector, así
+        que el resultado es idéntico al de embeder todo cada vez.
+        """
+        missing = [s for s in sentences if s not in self._embed_cache]
+        if missing:
+            embs = self.model.encode(
+                missing,
+                batch_size=min(64, len(missing)),
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
+            for s, e in zip(missing, embs):
+                self._embed_cache[s] = e
+        return np.array([self._embed_cache[s] for s in sentences])
 
     def compute_similarities(self, embeddings):
         return cosine_similarity(embeddings)
@@ -556,8 +611,10 @@ class ProgressiveSegmenter:
             return False
 
         # ── 2. HEAVY MATH ONLY IF IT PASSES THE FILTER ──
-        emb1 = self.model.encode([seg1_tail])[0]
-        emb2 = self.model.encode([segment2])[0]
+        # Batch: un solo encode para ambos textos (mismo resultado que dos
+        # encodes separados; la similitud coseno es invariante a la
+        # normalización, así que usar la caché normalizada es seguro).
+        emb1, emb2 = self.generate_embeddings([seg1_tail, segment2])
         similarity = cosine_similarity([emb1], [emb2])[0][0]
 
         try:
