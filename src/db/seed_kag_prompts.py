@@ -506,7 +506,7 @@ Summary:""",
         "task_key": "kag_proposition_chunking",
         "user_template": """Archivo: {source_file}
 Documento: {document_id}
-Capítulo/Sección: {section_path}
+Capítulo: {chapter_id}
 Rango: Línea {line_start} a Línea {line_end}
 
 Texto a procesar:
@@ -514,14 +514,14 @@ Texto a procesar:
 {chapter_text_content}
 ---
 
-Genera el JSON con las proposiciones organizadas por divisiones (capítulos/secciones del texto):
-{"divisions": [{"section_path": str, "propositions": [{"core_idea_id": str, "argument_id": str, "statement": str, "text_span": str, "char_start": int, "char_end": int, "line_start": int, "line_end": int, "citations_references": [str]}]}]}""",
+Genera el JSON con las proposiciones organizadas por divisiones (capítulos del texto):
+{{"divisions": [{{"chapter_id": str, "propositions": [{{"core_idea_id": str, "argument_id": str, "statement": str, "text_span": str, "char_start": int, "char_end": int, "line_start": int, "line_end": int, "citations_references": [str]}}]}}]}}""",
         "version": "2.0",
         "intent": (
             "Eres un analista de epistemologia y analisis del discurso. Tu "
             "objetivo es descomponer el texto en proposiciones atomicas "
             "gramaticalmente independientes y autocontenidas, organizadas por "
-            "capitulos/secciones (divisiones)."
+            "capitulos (divisiones)."
         ),
         "rules": [
             (
@@ -536,7 +536,7 @@ Genera el JSON con las proposiciones organizadas por divisiones (capítulos/secc
             ),
             (
                 "Organizar el output por divisiones: cada division declara su "
-                "section_path (el capitulo/seccion del texto al que pertenecen "
+                "chapter_id (el capitulo del texto al que pertenecen "
                 "sus proposiciones) y su lista de proposiciones"
             ),
             (
@@ -551,13 +551,163 @@ Genera el JSON con las proposiciones organizadas por divisiones (capítulos/secc
         "input_schema": {
             "source_file": "string",
             "document_id": "string",
-            "section_path": "string",
+            "chapter_id": "string",
             "line_start": "integer",
             "line_end": "integer",
             "chapter_text_content": "string",
         },
         "output_schema": {
             "divisions": "array",
+        },
+        "few_shot": [],
+    },
+    # --- E. Pipeline documental nuevo (Fases 1-5) -------------------------
+    {
+        "task_key": "kag_document_separation",
+        "user_template": """Archivo: {source_file}
+
+Esqueleto del archivo (líneas del texto plano):
+---
+{skeleton}
+---
+
+Identifica los documentos contenidos en el archivo y devuelve el JSON:
+{{"documents": [{{"document_id": str, "title": str, "line_start": int, "line_end": int, "language": str}}]}}""",
+        "version": "1.0",
+        "intent": (
+            "Eres un analista documental. Tu tarea es separar un archivo en "
+            "los documentos que contiene, delimitando cada uno por su rango "
+            "de lineas en el archivo fuente."
+        ),
+        "rules": [
+            "Cada documento debe tener un document_id unico y estable",
+            "line_start/line_end delimitan el rango de lineas del documento en el archivo fuente",
+            "language: codigo ISO 639-1 del idioma principal del documento",
+            "Salida JSON estricta con el schema indicado",
+        ],
+        "input_schema": {
+            "source_file": "string",
+            "skeleton": "string",
+        },
+        "output_schema": {
+            "documents": "array",
+        },
+        "few_shot": [],
+    },
+    {
+        "task_key": "kag_document_analysis",
+        "user_template": """Archivo: {source_file}
+Documento: {document_id}
+
+Esqueleto del documento (líneas del texto plano):
+---
+{skeleton}
+---
+
+Analiza el documento y devuelve el JSON:
+{{"ficha": {{"title": str, "technical_level": str, "thematic_areas_iso25964": [{{"preferred_term": str, "non_preferred_terms": [str], "scope_note_disambiguation": str, "broader_term": str, "narrower_terms": [str], "related_terms": [str]}}], "library_of_congress": {{"lcsh_terms": [str], "lcc_classification": {{"label": str, "call_number": str}}}}, "bibtex": str, "key_entities": [{{"name": str, "type": str}}]}}, "chapters": [{{"chapter_id": str, "title": str, "line_start": int, "line_end": int, "has_images": bool}}]}}""",
+        "version": "1.0",
+        "intent": (
+            "Eres un analista documental y bibliotecario. Tu tarea es producir "
+            "la ficha documental (tesauro ISO 25964, clasificacion LCC/LCSH, "
+            "cita BibTeX) y detectar los capitulos del documento con su rango "
+            "de lineas."
+        ),
+        "rules": [
+            "thematic_areas_iso25964: minimo 3 tematicas con termino preferido, no preferidos, nota de alcance y relaciones de tesauro",
+            "library_of_congress.lcsh_terms: encabezamientos de materia; lcc_classification: clasificacion de la Biblioteca del Congreso",
+            "bibtex: cita completa en formato BibTeX",
+            "key_entities: entidades clave del documento con su tipo",
+            "chapters: cada capitulo con chapter_id unico, titulo y rango de lineas (SIN resumen: los resumenes de capitulo se reemplazan por proposiciones atomicas)",
+            "has_images: true si el capitulo contiene imagenes o figuras",
+            "Salida JSON estricta con el schema indicado",
+        ],
+        "input_schema": {
+            "source_file": "string",
+            "document_id": "string",
+            "skeleton": "string",
+        },
+        "output_schema": {
+            "ficha": "object",
+            "chapters": "array",
+        },
+        "few_shot": [],
+    },
+    {
+        "task_key": "kag_chunk_paraphrase",
+        "user_template": """Archivo: {source_file}
+Documento: {document_id}
+Capítulo: {chapter_id}
+
+Chunks del capítulo:
+---
+{chunks_json}
+---
+
+Parafrasea cada chunk y devuelve el JSON:
+{{"paraphrases": [{{"chunk_index": int, "paraphrase": str}}]}}""",
+        "version": "1.0",
+        "intent": (
+            "Eres un parafraseador academico. Tu tarea es reescribir cada chunk "
+            "preservando el significado, la estructura argumentativa y las "
+            "referencias, sin anadidos ni omisiones."
+        ),
+        "rules": [
+            "Cada chunk_index del input debe tener exactamente una paraphrase",
+            "La parafrasis preserva el significado y las referencias del original",
+            "No anadir informacion que no este en el chunk",
+            "Salida JSON estricta con el schema indicado",
+        ],
+        "input_schema": {
+            "source_file": "string",
+            "document_id": "string",
+            "chapter_id": "string",
+            "chunks_json": "string",
+        },
+        "output_schema": {
+            "paraphrases": "array",
+        },
+        "few_shot": [],
+    },
+    {
+        "task_key": "kag_chapter_propositions",
+        "user_template": """Archivo: {source_file}
+Documento: {document_id}
+Capítulo: {chapter_id}
+
+Paráfrasis del capítulo:
+---
+{paraphrases_json}
+---
+
+Extrae las proposiciones atomicas y devuelve el JSON:
+{{"propositions": [{{"chunk_index": int, "core_idea_id": str, "argument_id": str, "statement": str, "text_span": str, "citations_references": [str]}}], "entities": [{{"name": str, "type": str, "description": str}}], "relations": [{{"source": str, "target": str, "type": str, "description": str}}]}}""",
+        "version": "1.1",
+        "intent": (
+            "Eres un analista de epistemologia y analisis del discurso. Tu "
+            "objetivo es descomponer las parafrasis del capitulo en "
+            "proposiciones atomicas autocontenidas y extraer las entidades y "
+            "relaciones del capitulo."
+        ),
+        "rules": [
+            "Proposiciones atomicas gramaticalmente independientes y autocontenidas",
+            "chunk_index: indice del chunk (0-based) al que pertenece la proposicion",
+            "text_span debe contener el fragmento de texto exacto de la parafrasis",
+            "citations_references: preservar y duplicar las referencias academicas en todas las proposiciones derivadas",
+            "entities: entidades del capitulo con su tipo y descripcion",
+            "relations: relaciones entre entidades con su tipo y descripcion",
+            "Salida JSON estricta con el schema indicado",
+        ],
+        "input_schema": {
+            "source_file": "string",
+            "document_id": "string",
+            "chapter_id": "string",
+            "paraphrases_json": "string",
+        },
+        "output_schema": {
+            "propositions": "array",
+            "entities": "array",
+            "relations": "array",
         },
         "few_shot": [],
     },

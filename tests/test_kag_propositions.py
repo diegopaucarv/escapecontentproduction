@@ -129,7 +129,7 @@ def test_extract_propositions_llm_ok(monkeypatch):
                 {
                     "divisions": [
                         {
-                            "section_path": "# Intro",
+                            "chapter_id": "# Intro",
                             "propositions": [
                                 {
                                     "core_idea_id": "CI-1",
@@ -159,14 +159,14 @@ def test_extract_propositions_llm_ok(monkeypatch):
         content="El gato duerme.",
         doc_path="doc.md",
         chunk_index=0,
-        section_path="# Intro",
+        chapter_id="# Intro",
         verbose=False,
     )
     assert len(props) == 1
     p = props[0]
     assert p["doc_id"] == 1
     assert p["chunk_id"] == 2
-    assert p["section_path"] == "# Intro"
+    assert p["chapter_id"] == "# Intro"
     assert p["core_idea_id"] == "CI-1"
     assert p["argument_id"] == "ARG-1"
     assert p["statement"] == "El gato duerme."
@@ -201,7 +201,7 @@ def test_extract_propositions_llm_fails_returns_empty(monkeypatch):
         content="texto",
         doc_path="doc.md",
         chunk_index=0,
-        section_path="",
+        chapter_id="",
         verbose=False,
     )
     assert props == []
@@ -230,7 +230,7 @@ def test_extract_propositions_invalid_json_returns_empty(monkeypatch):
         content="texto",
         doc_path="doc.md",
         chunk_index=0,
-        section_path="",
+        chapter_id="",
         verbose=False,
     )
     assert props == []
@@ -259,7 +259,7 @@ def test_extract_propositions_json_without_propositions_returns_empty(monkeypatc
         content="texto",
         doc_path="doc.md",
         chunk_index=0,
-        section_path="",
+        chapter_id="",
         verbose=False,
     )
     assert props == []
@@ -284,7 +284,7 @@ def test_extract_propositions_span_not_found_keeps_none_spans(monkeypatch):
                 {
                     "divisions": [
                         {
-                            "section_path": "",
+                            "chapter_id": "",
                             "propositions": [
                                 {
                                     "core_idea_id": "CI-1",
@@ -314,7 +314,7 @@ def test_extract_propositions_span_not_found_keeps_none_spans(monkeypatch):
         content="El gato duerme.",
         doc_path="doc.md",
         chunk_index=0,
-        section_path="",
+        chapter_id="",
         verbose=False,
     )
     assert len(props) == 1
@@ -351,7 +351,7 @@ def test_extract_propositions_truncates_long_content(monkeypatch):
         content=long_content,
         doc_path="doc.md",
         chunk_index=0,
-        section_path="",
+        chapter_id="",
         verbose=False,
     )
     assert len(captured["prompt"]) < 20000
@@ -367,7 +367,7 @@ def _prop(doc_id=1, chunk_id=2, i=0, citations=None):
     return {
         "doc_id": doc_id,
         "chunk_id": chunk_id,
-        "section_path": "s1",
+        "chapter_id": "s1",
         "core_idea_id": f"CI-{i}",
         "argument_id": f"ARG-{i}",
         "statement": f"Proposición {i}.",
@@ -406,12 +406,12 @@ def test_store_propositions_single_multi_values_statement():
     # Un solo statement multi-VALUES: dos filas con placeholders indexados.
     assert ":d0" in sql and ":d1" in sql
     assert ":c0" in sql and ":c1" in sql
-    assert ":sp0" in sql and ":sp1" in sql
+    assert ":ch0" in sql and ":ch1" in sql
     assert ":s0" in sql and ":s1" in sql
     assert "executemany" not in sql.lower()
     assert params["d0"] == 1
     assert params["c0"] == 2
-    assert params["sp0"] == "s1"
+    assert params["ch0"] == "s1"
     assert params["s0"] == "Proposición 0."
     assert params["cr0"] == json.dumps(["Bourdieu, 1984"], ensure_ascii=False)
     assert params["cr1"] == "[]"
@@ -471,8 +471,8 @@ def test_store_propositions_empty_does_nothing():
 # ---------------------------------------------------------------------
 
 
-def _chunk(content, section="s1", cid=0):
-    return {"id": cid, "content": content, "chunk_index": cid, "section_path": section}
+def _chunk(content, chapter="s1", cid=0):
+    return {"id": cid, "content": content, "chunk_index": cid, "chapter_id": chapter}
 
 
 def test_batch_chunks_by_tokens_groups_by_budget():
@@ -489,7 +489,7 @@ def test_batch_chunks_by_tokens_groups_by_budget():
 def test_batch_chunks_by_tokens_respects_250k_limit():
     """El corte respeta el límite de 250k tokens (secciones distintas)."""
     chunks = [
-        _chunk("x" * 400000, section=f"s{i}", cid=i)
+        _chunk("x" * 400000, chapter=f"s{i}", cid=i)
         for i in range(6)  # 100k c/u
     ]
     batches = ki._batch_chunks_by_tokens(
@@ -501,18 +501,18 @@ def test_batch_chunks_by_tokens_respects_250k_limit():
 
 
 def test_batch_chunks_by_tokens_keeps_same_section_together():
-    """Chunks consecutivos de la misma sección quedan juntos si caben."""
+    """Chunks consecutivos del mismo capítulo quedan juntos si caben."""
     chunks = [
-        _chunk("x" * 400000, section="s1", cid=0),  # 100k
-        _chunk("x" * 400000, section="s1", cid=1),  # 100k (misma sección)
-        _chunk("x" * 400000, section="s2", cid=2),  # 100k (sección nueva)
+        _chunk("x" * 400000, chapter="s1", cid=0),  # 100k
+        _chunk("x" * 400000, chapter="s1", cid=1),  # 100k (mismo capítulo)
+        _chunk("x" * 400000, chapter="s2", cid=2),  # 100k (capítulo nuevo)
     ]
     batches = ki._batch_chunks_by_tokens(
         chunks, batch_size_tokens=250000, estimate_fn=lambda c: len(c) // 4
     )
-    # c0+c1 (misma sección) caben juntos; c2 corta por presupuesto.
+    # c0+c1 (mismo capítulo) caben juntos; c2 corta por presupuesto.
     assert [len(b) for b in batches] == [2, 1]
-    assert batches[0][0]["section_path"] == batches[0][1]["section_path"] == "s1"
+    assert batches[0][0]["chapter_id"] == batches[0][1]["chapter_id"] == "s1"
 
 
 def test_batch_chunks_by_tokens_single_chunk_over_budget():
@@ -533,13 +533,13 @@ def test_batch_chunks_by_tokens_single_chunk_over_budget():
 def test_group_chunks_by_chapter_respects_30k_threshold():
     """Capítulo >30k tokens = grupo propio; ≤30k = nivel archivo."""
     chunks = [
-        _chunk("x" * 40000, section="big1", cid=0),  # 10k
-        _chunk("x" * 40000, section="big1", cid=1),  # 10k (big1 total 20k ≤ 30k)
-        _chunk("x" * 200000, section="huge", cid=2),  # 50k > 30k → grupo propio
-        _chunk("x" * 40000, section="small", cid=3),  # 10k → nivel archivo
+        _chunk("x" * 40000, chapter="big1", cid=0),  # 10k
+        _chunk("x" * 40000, chapter="big1", cid=1),  # 10k (big1 total 20k ≤ 30k)
+        _chunk("x" * 200000, chapter="huge", cid=2),  # 50k > 30k → grupo propio
+        _chunk("x" * 40000, chapter="small", cid=3),  # 10k → nivel archivo
     ]
     groups = ki._group_chunks_by_chapter(chunks, estimate_fn=lambda c: len(c) // 4)
-    assert [g["section_path"] for g in groups] == ["huge", ""]
+    assert [g["chapter_id"] for g in groups] == ["huge", ""]
     assert [c["id"] for c in groups[0]["chunks"]] == [2]
     assert [c["id"] for c in groups[1]["chunks"]] == [0, 1, 3]
 
@@ -547,21 +547,21 @@ def test_group_chunks_by_chapter_respects_30k_threshold():
 def test_group_chunks_by_chapter_all_small_merges_to_file_level():
     """Todos los capítulos ≤30k → un único grupo a nivel de archivo."""
     chunks = [
-        _chunk("x" * 40000, section="s1", cid=0),  # 10k
-        _chunk("x" * 40000, section="s2", cid=1),  # 10k
+        _chunk("x" * 40000, chapter="s1", cid=0),  # 10k
+        _chunk("x" * 40000, chapter="s2", cid=1),  # 10k
     ]
     groups = ki._group_chunks_by_chapter(chunks, estimate_fn=lambda c: len(c) // 4)
     assert len(groups) == 1
-    assert groups[0]["section_path"] == ""
+    assert groups[0]["chapter_id"] == ""
     assert [c["id"] for c in groups[0]["chunks"]] == [0, 1]
 
 
 def test_group_chunks_by_chapter_keeps_chunk_index_order():
     """Los chunks de cada grupo conservan el orden por chunk_index."""
     chunks = [
-        _chunk("x" * 40000, section="s1", cid=0),  # 10k → archivo
-        _chunk("x" * 200000, section="huge", cid=1),  # 50k → propio
-        _chunk("x" * 40000, section="s2", cid=2),  # 10k → archivo
+        _chunk("x" * 40000, chapter="s1", cid=0),  # 10k → archivo
+        _chunk("x" * 200000, chapter="huge", cid=1),  # 50k → propio
+        _chunk("x" * 40000, chapter="s2", cid=2),  # 10k → archivo
     ]
     groups = ki._group_chunks_by_chapter(chunks, estimate_fn=lambda c: len(c) // 4)
     assert [c["id"] for c in groups[1]["chunks"]] == [0, 2]
@@ -636,7 +636,7 @@ def test_extract_propositions_batch_assigns_chunks_by_span(monkeypatch):
                 {
                     "divisions": [
                         {
-                            "section_path": "# Cap 1",
+                            "chapter_id": "# Cap 1",
                             "propositions": [
                                 {
                                     "core_idea_id": "CI-1",
@@ -652,7 +652,7 @@ def test_extract_propositions_batch_assigns_chunks_by_span(monkeypatch):
                             ],
                         },
                         {
-                            "section_path": "# Cap 2",
+                            "chapter_id": "# Cap 2",
                             "propositions": [
                                 {
                                     "core_idea_id": "CI-2",
@@ -681,8 +681,8 @@ def test_extract_propositions_batch_assigns_chunks_by_span(monkeypatch):
     assert len(props) == 2
     assert props[0]["chunk_id"] == 1
     assert props[1]["chunk_id"] == 2
-    assert props[0]["section_path"] == "# Cap 1"
-    assert props[1]["section_path"] == "# Cap 2"
+    assert props[0]["chapter_id"] == "# Cap 1"
+    assert props[1]["chapter_id"] == "# Cap 2"
     assert props[0]["statement"] == "El gato duerme."
     assert props[1]["statement"] == "El perro corre."
 
@@ -707,7 +707,7 @@ def test_extract_propositions_batch_span_not_found_chunk_none(monkeypatch):
                 {
                     "divisions": [
                         {
-                            "section_path": "",
+                            "chapter_id": "",
                             "propositions": [
                                 {
                                     "core_idea_id": "CI-1",
@@ -826,7 +826,7 @@ def test_extract_propositions_batch_model_size_small(monkeypatch):
 
 
 def test_extract_propositions_batch_parses_divisions(monkeypatch):
-    """El output con divisiones se parsea y asigna por section_path."""
+    """El output con divisiones se parsea y asigna por chapter_id."""
     monkeypatch.setattr(ki, "load_settings", lambda session: None)
     chunks = [
         _chunk("El gato duerme.", cid=1),
@@ -848,7 +848,7 @@ def test_extract_propositions_batch_parses_divisions(monkeypatch):
                 {
                     "divisions": [
                         {
-                            "section_path": "# Cap 1",
+                            "chapter_id": "# Cap 1",
                             "propositions": [
                                 {
                                     "core_idea_id": "CI-1",
@@ -864,7 +864,7 @@ def test_extract_propositions_batch_parses_divisions(monkeypatch):
                             ],
                         },
                         {
-                            "section_path": "# Cap 2",
+                            "chapter_id": "# Cap 2",
                             "propositions": [
                                 {
                                     "core_idea_id": "CI-2",
@@ -893,18 +893,18 @@ def test_extract_propositions_batch_parses_divisions(monkeypatch):
         chunks=chunks,
         doc_path="doc.md",
         verbose=False,
-        section_path="# Cap 1",
+        chapter_id="# Cap 1",
     )
     assert len(props) == 2
     assert props[0]["chunk_id"] == 1
-    assert props[0]["section_path"] == "# Cap 1"
+    assert props[0]["chapter_id"] == "# Cap 1"
     assert props[1]["chunk_id"] == 2
-    assert props[1]["section_path"] == "# Cap 2"
+    assert props[1]["chapter_id"] == "# Cap 2"
 
 
 def test_extract_propositions_batch_legacy_flat_output(monkeypatch):
     """Output legacy plano (artefacto compilado anterior) → una división con
-    el section_path del lote (transición sin romper)."""
+    el chapter_id del lote (transición sin romper)."""
     monkeypatch.setattr(ki, "load_settings", lambda session: None)
     chunks = [_chunk("El gato duerme.", cid=1)]
 
@@ -947,11 +947,11 @@ def test_extract_propositions_batch_legacy_flat_output(monkeypatch):
         chunks=chunks,
         doc_path="doc.md",
         verbose=False,
-        section_path="# Cap 1",
+        chapter_id="# Cap 1",
     )
     assert len(props) == 1
     assert props[0]["chunk_id"] == 1
-    assert props[0]["section_path"] == "# Cap 1"
+    assert props[0]["chapter_id"] == "# Cap 1"
 
 
 # ---------------------------------------------------------------------
@@ -1061,7 +1061,7 @@ def _chunk_row(cid, content, content_hash):
         id=cid,
         content=content,
         chunk_index=cid,
-        section_path="s1",
+        chapter_id="s1",
         content_hash=content_hash,
     )
 
@@ -1190,7 +1190,7 @@ def test_extract_propositions_for_doc_persists_in_chunk_index_order(monkeypatch)
             {
                 "doc_id": doc_id,
                 "chunk_id": c["id"],
-                "section_path": kwargs.get("section_path", ""),
+                "chapter_id": kwargs.get("chapter_id", ""),
                 "core_idea_id": "CI",
                 "argument_id": "ARG",
                 "statement": "Prop.",
@@ -1377,7 +1377,7 @@ class _IndexSession:
                         id=1,
                         content="Contenido del documento.",
                         chunk_index=0,
-                        section_path="",
+                        chapter_id=None,
                     )
                 ]
             )
@@ -1409,7 +1409,7 @@ def _index_document_setup(monkeypatch, tmp_path):
         "chunk_markdown",
         lambda *a, **k: [
             {
-                "section_path": "",
+                "chapter_id": None,
                 "content": "Contenido del documento.",
                 "token_estimate": 10,
             }
@@ -1429,7 +1429,7 @@ def test_index_document_extract_propositions_false_skips_llm(monkeypatch, tmp_pa
     calls = {"props": 0}
     monkeypatch.setattr(
         ki,
-        "_extract_propositions_for_doc",
+        "_extract_document_propositions",
         lambda *a, **k: calls.__setitem__("props", calls["props"] + 1),
     )
     result = ki.index_document(
@@ -1445,7 +1445,7 @@ def test_index_document_extract_propositions_true_calls_step(monkeypatch, tmp_pa
     calls = {"props": 0}
     monkeypatch.setattr(
         ki,
-        "_extract_propositions_for_doc",
+        "_extract_document_propositions",
         lambda *a, **k: calls.__setitem__("props", calls["props"] + 1),
     )
     result = ki.index_document(_IndexSession(), md, no_summary=True)

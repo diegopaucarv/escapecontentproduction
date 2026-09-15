@@ -39,6 +39,7 @@ KAG_DEFAULTS: dict[str, Any] = {
     "KAG_PROPOSITION_BATCH_SIZE": 400000,
     "KAG_PROPOSITION_MODEL": "large",  # enum: "small" | "large"
     "KAG_PROPOSITION_PARALLEL": 3,  # llamadas LLM concurrentes (semáforo)
+    "KAG_PARAPHRASE_PARALLEL": 3,  # llamadas LLM de paráfrasis concurrentes
     "KAG_LLM_ENTITIES": False,
     "KAG_USE_COREF": "auto",  # enum: "auto" | "never"
     "KAG_PROCESS_FIGURES": True,

@@ -52,10 +52,54 @@ from src.llm.together import complete_vision
 TASK_EXTRACT_ENTITIES = "kag_extract_entities"
 TASK_QWEN_SUMMARY = "kag_qwen_summary"
 TASK_PROPOSITION_CHUNKING = "kag_proposition_chunking"
+TASK_DOCUMENT_SEPARATION = "kag_document_separation"
+TASK_DOCUMENT_ANALYSIS = "kag_document_analysis"
+TASK_CHUNK_PARAPHRASE = "kag_chunk_paraphrase"
+TASK_CHAPTER_PROPOSITIONS = "kag_chapter_propositions"
 
 # System prompts cortos actuales — fallback EXACTO de hoy cuando no hay
 # artefacto compilado (tests sin DB: get_active_prompt devuelve None).
 EXTRACT_SYSTEM_SHORT = "Eres un extractor de conocimiento. Devuelve JSON válido."
+
+# Fase 1 — separación de documentos apilados (spec kag_document_separation).
+# El user fallback es el template EXACTO de la spec (src/db/seed_kag_prompts.py):
+# se rellena con _fill_prompt (replace por clave, NUNCA .format() — el template
+# contiene llaves JSON literales).
+DOCUMENT_SEPARATION_SYSTEM_SHORT = (
+    "Eres un bibliotecario digital. Identifica los documentos (libros, papers, "
+    "artículos) apilados en un archivo Markdown y devuelve sus límites físicos "
+    "de línea."
+)
+DOCUMENT_SEPARATION_USER_SHORT = """Archivo: {source_file}
+
+Esqueleto del archivo (líneas del texto plano):
+---
+{skeleton}
+---
+
+Identifica los documentos contenidos en el archivo y devuelve el JSON:
+{{"documents": [{{"document_id": str, "title": str, "line_start": int, "line_end": int, "language": str}}]}}"""
+
+# Fase 2 — análisis documental (spec kag_document_analysis). El user fallback
+# es el template EXACTO de la spec (src/db/seed_kag_prompts.py): se rellena con
+# _fill_prompt (replace por clave, NUNCA .format() — el template contiene llaves
+# JSON literales).
+TASK_DOCUMENT_ANALYSIS = "kag_document_analysis"
+DOCUMENT_ANALYSIS_SYSTEM_SHORT = (
+    "Eres un analista documental y bibliotecario. Produce la ficha documental "
+    "(tesauro ISO 25964, clasificación LCC/LCSH, cita BibTeX) y detecta los "
+    "capítulos del documento con su rango de líneas."
+)
+DOCUMENT_ANALYSIS_USER_SHORT = """Archivo: {source_file}
+Documento: {document_id}
+
+Esqueleto del documento (líneas del texto plano):
+---
+{skeleton}
+---
+
+Analiza el documento y devuelve el JSON:
+{{"ficha": {{"title": str, "technical_level": str, "thematic_areas_iso25964": [{{"preferred_term": str, "non_preferred_terms": [str], "scope_note_disambiguation": str, "broader_term": str, "narrower_terms": [str], "related_terms": [str]}}], "library_of_congress": {{"lcsh_terms": [str], "lcc_classification": {{"label": str, "call_number": str}}}}, "bibtex": str, "key_entities": [{{"name": str, "type": str}}]}}, "chapters": [{{"chapter_id": str, "title": str, "line_start": int, "line_end": int, "has_images": bool}}]}}"""
 
 
 def _get_system_prompt(session, model_name, task_key, fallback: str) -> str:
@@ -109,8 +153,8 @@ SUMMARY_MAX_CHARS = 16000 * 4
 # Límite de contexto del LLM por llamada (chars) para la extracción de
 # proposiciones atómicas (mismo valor que el proposicional).
 MAX_CONTEXT_CHARS = 12000
-# Umbral de agrupación por capítulo (tokens): un capítulo (section_path ya
-# detectado por chunk_markdown) con MÁS tokens que esto forma su propio
+# Umbral de agrupación por capítulo (tokens): un capítulo (chapter_id ya
+# detectado por LLM, Fase 2) con MÁS tokens que esto forma su propio
 # grupo de proposiciones; los capítulos ≤ umbral se agrupan a nivel de
 # archivo (una llamada LLM por capítulo grande, una por archivo para el resto).
 CHAPTER_TOKEN_THRESHOLD = 30000
@@ -317,50 +361,43 @@ def detect_language(text: str) -> str:
 
 
 def chunk_markdown(
-    md_text, doc_type, segmenter, max_tokens=CHUNK_MAX_TOKENS, use_coref=True
+    md_text,
+    doc_type,
+    segmenter,
+    max_tokens=CHUNK_MAX_TOKENS,
+    use_coref=True,
+    chapters=None,
 ):
-    """Parte el markdown por encabezados y segmenta cada sección.
+    """Segmenta el texto directamente (sin jerarquía de headers determinista).
 
-    - short: parte por `#`, `##`, `###` preservando section_path.
-    - long:  pre-segmenta por `#`, `##` (acota cada llamada al segmentador).
+    El `section_path` (jerarquía de headers markdown calculada por esta
+    función) se ELIMINA: la relación nueva es kag_chapters (detectados por
+    LLM, Fase 2) → kag_chunks.chapter_id. Los chunks se segmentan DENTRO de
+    cada capítulo (Fase 3): cada chunk resultante lleva el `chapter_id` del
+    capítulo que lo contiene.
+
+    `chapters` (opcional): lista de dicts {"chapter_id": uuid_str,
+    "line_start": int, "line_end": int} con líneas RELATIVAS a `md_text`
+    (1-based). Si es None o vacío, se segmenta el texto completo con
+    `chapter_id = None` (comportamiento clásico EXACTO). Si hay capítulos,
+    se extrae el texto de cada uno (`\n`.join de sus líneas), se segmenta
+    con la misma lógica de fusión hasta `max_tokens`, y cada chunk lleva el
+    `chapter_id` del capítulo. Los capítulos se procesan en orden; los
+    chunks se numeran globalmente por chunk_index (el INSERT ya lo hace con
+    enumerate).
 
     El segmentador produce cortes semánticos (a veces muy pequeños, ~50-100
-    tokens). Para la ingesta KAG fusionamos segmentos adyacentes de la MISMA
-    sección hasta `max_tokens` (respetando los cortes del segmentador como
-    fronteras duras): reduce el número de chunks (y de llamadas LLM de
-    extracción) sin perder los límites semánticos.
+    tokens). Para la ingesta KAG fusionamos segmentos adyacentes hasta
+    `max_tokens` (respetando los cortes del segmentador como fronteras
+    duras): reduce el número de chunks (y de llamadas LLM de extracción) sin
+    perder los límites semánticos.
 
     `use_coref=False` omite la resolución de correferencias del segmentador
     (monkeypatch temporal en la instancia): el coref Stanza cuesta ~11s por
     segmento y es prohibitivo en book stacks; los docs cortos sí lo usan.
 
-    Devuelve lista de dicts {"content", "section_path", "token_estimate"}.
+    Devuelve lista de dicts {"content", "chapter_id", "token_estimate"}.
     """
-    max_level = 2 if doc_type == "long" else 3
-    sections = []  # (section_path, content)
-    current_path: list = []
-    current_lines: list = []
-
-    def flush() -> None:
-        content = "\n".join(current_lines).strip()
-        if content:
-            sections.append((" > ".join(current_path), content))
-
-    for line in md_text.splitlines():
-        m = re.match(r"^(#{1,3})\s+(.*)$", line)
-        if m and len(m.group(1)) <= max_level:
-            flush()
-            level = len(m.group(1))
-            title = m.group(2).strip()
-            current_path = current_path[: level - 1] + [f"{'#' * level} {title}"]
-            current_lines = []
-        else:
-            current_lines.append(line)
-    flush()
-
-    if not sections:
-        sections = [("", md_text.strip())]
-
     # Coref opcional: no-op temporal en la instancia (no se modifica el
     # segmentador; el método original se restaura al salir).
     _orig_resolve = getattr(segmenter, "resolve_coreferences", None)
@@ -368,45 +405,80 @@ def chunk_markdown(
         segmenter.resolve_coreferences = lambda segments: segments  # noqa: E731
     try:
         chunks = []
-        for section_path, content in sections:
-            segments = segmenter.segment_text(content, max_tokens=max_tokens)
-            buffer = ""
-            buffer_tokens = 0
-            for seg in segments:
-                seg = seg.strip()
-                if not seg:
-                    continue
-                seg_tokens = estimate_tokens(seg)
-                # Fusiona hasta max_tokens; un segmento que ya excede se
-                # inserta solo (el segmentador ya lo cortó quirúrgicamente).
-                if buffer and buffer_tokens + seg_tokens > max_tokens:
-                    chunks.append(
-                        {
-                            "content": buffer,
-                            "section_path": section_path,
-                            "token_estimate": estimate_tokens(buffer),
-                        }
-                    )
-                    buffer = ""
-                    buffer_tokens = 0
-                if buffer:
-                    buffer += "\n\n" + seg
-                    buffer_tokens += seg_tokens
-                else:
-                    buffer = seg
-                    buffer_tokens = seg_tokens
-            if buffer:
-                chunks.append(
-                    {
-                        "content": buffer,
-                        "section_path": section_path,
-                        "token_estimate": estimate_tokens(buffer),
-                    }
+        if not chapters:
+            # Sin capítulos: comportamiento clásico EXACTO (texto completo,
+            # chapter_id=None).
+            return _merge_segments(
+                segmenter.segment_text(md_text.strip(), max_tokens=max_tokens),
+                chapter_id=None,
+                max_tokens=max_tokens,
+            )
+        lines = md_text.splitlines()
+        for chapter in chapters:
+            ls = int(chapter.get("line_start") or 1)
+            le = int(chapter.get("line_end") or len(lines))
+            if ls > le:
+                ls, le = le, ls
+            ls = max(1, min(ls, len(lines)))
+            le = max(1, min(le, len(lines)))
+            chapter_text = "\n".join(lines[ls - 1 : le])
+            chapter_id = chapter.get("chapter_id")
+            chunks.extend(
+                _merge_segments(
+                    segmenter.segment_text(chapter_text.strip(), max_tokens=max_tokens),
+                    chapter_id=chapter_id,
+                    max_tokens=max_tokens,
                 )
+            )
         return chunks
     finally:
         if _orig_resolve is not None:
             segmenter.resolve_coreferences = _orig_resolve
+
+
+def _merge_segments(segments, chapter_id, max_tokens):
+    """Fusiona segmentos adyacentes hasta `max_tokens` (fronteras duras).
+
+    El segmentador produce cortes semánticos (a veces muy pequeños, ~50-100
+    tokens); fusionar reduce el número de chunks (y de llamadas LLM de
+    extracción) sin perder los límites semánticos. Cada chunk resultante
+    lleva `chapter_id` (None = nivel documento).
+    """
+    chunks = []
+    buffer = ""
+    buffer_tokens = 0
+    for seg in segments:
+        seg = seg.strip()
+        if not seg:
+            continue
+        seg_tokens = estimate_tokens(seg)
+        # Fusiona hasta max_tokens; un segmento que ya excede se
+        # inserta solo (el segmentador ya lo cortó quirúrgicamente).
+        if buffer and buffer_tokens + seg_tokens > max_tokens:
+            chunks.append(
+                {
+                    "content": buffer,
+                    "chapter_id": chapter_id,
+                    "token_estimate": estimate_tokens(buffer),
+                }
+            )
+            buffer = ""
+            buffer_tokens = 0
+        if buffer:
+            buffer += "\n\n" + seg
+            buffer_tokens += seg_tokens
+        else:
+            buffer = seg
+            buffer_tokens = seg_tokens
+    if buffer:
+        chunks.append(
+            {
+                "content": buffer,
+                "chapter_id": chapter_id,
+                "token_estimate": estimate_tokens(buffer),
+            }
+        )
+    return chunks
 
 
 # ---------------------------------------------------------------------
@@ -737,7 +809,7 @@ PROPOSITIONAL_SYSTEM_SHORT = (
 
 PROPOSITIONAL_USER_SHORT = """Archivo: {source_file}
 Documento: {document_id}
-Capítulo/Sección: {section_path}
+Capítulo: {chapter_id}
 Rango: Línea {line_start} a Línea {line_end}
 
 Texto a procesar:
@@ -745,8 +817,59 @@ Texto a procesar:
 {chapter_text_content}
 ---
 
-Genera el JSON con las proposiciones organizadas por divisiones (capítulos/secciones del texto):
-{"divisions": [{"section_path": str, "propositions": [{"core_idea_id": str, "argument_id": str, "statement": str, "text_span": str, "char_start": int, "char_end": int, "line_start": int, "line_end": int, "citations_references": [str]}]}]}"""
+Genera el JSON con las proposiciones organizadas por divisiones (capítulos del texto):
+{{"divisions": [{{"chapter_id": str, "propositions": [{{"core_idea_id": str, "argument_id": str, "statement": str, "text_span": str, "char_start": int, "char_end": int, "line_start": int, "line_end": int, "citations_references": [str]}}]}}]}}"""
+
+# Paráfrasis de chunks (Fase 4, etapa 'paraphrased') — fallback EXACTO cuando
+# no hay artefacto compilado (tests sin DB: get_active_prompt devuelve None).
+# El template USER es el de la spec kag_chunk_paraphrase (seed_kag_prompts.py)
+# con el schema de salida ajustado a {"paraphrases": [{"chunk_index": int,
+# "paraphrase": str}]} (por chunk_index, no por chunk_id).
+PARAPHRASE_SYSTEM_SHORT = (
+    "Eres un parafraseador académico. Parafrasea cada chunk preservando el "
+    "significado exacto, sin añadir ni omitir información."
+)
+
+PARAPHRASE_USER_SHORT = """Archivo: {source_file}
+Documento: {document_id}
+Capítulo: {chapter_id}
+
+Chunks del capítulo:
+---
+{chunks_json}
+---
+
+Parafrasea cada chunk y devuelve el JSON:
+{{"paraphrases": [{{"chunk_index": int, "paraphrase": str}}]}}"""
+
+# Proposiciones + entidades + relaciones por documento (Fase 5, etapa
+# 'chunked') — fallback EXACTO cuando no hay artefacto compilado (tests sin
+# DB: get_active_prompt devuelve None). El template USER es el de la spec
+# kag_chapter_propositions (seed_kag_prompts.py) con el schema de salida
+# {"propositions": [{"chunk_index": int, ...}], "entities": [...],
+# "relations": [...]} (asignación primaria por chunk_index).
+CHAPTER_PROPOSITIONS_SYSTEM_SHORT = (
+    "Eres un analista de epistemología y análisis del discurso. Tu objetivo "
+    "es descomponer las paráfrasis del capítulo en proposiciones atómicas "
+    "autocontenidas y extraer las entidades y relaciones del capítulo. "
+    "'text_span' debe contener el fragmento de texto EXACTO de la paráfrasis. "
+    "REGLA DE REFERENCIAS DUPLICADAS: si una frase contiene una referencia "
+    "académica (ej. 'Bourdieu, 1984, p. 52'), dicha referencia DEBE "
+    "preservarse y duplicarse en 'citations_references' de TODAS las "
+    "proposiciones que deriven de ella. Devuelve JSON válido."
+)
+
+CHAPTER_PROPOSITIONS_USER_SHORT = """Archivo: {source_file}
+Documento: {document_id}
+Capítulo: {chapter_id}
+
+Paráfrasis del capítulo:
+---
+{paraphrases_json}
+---
+
+Extrae las proposiciones atomicas y devuelve el JSON:
+{{"propositions": [{{"chunk_index": int, "core_idea_id": str, "argument_id": str, "statement": str, "text_span": str, "citations_references": [str]}}], "entities": [{{"name": str, "type": str, "description": str}}], "relations": [{{"source": str, "target": str, "type": str, "description": str}}]}}"""
 
 
 def _span_offsets(content: str, char_start: int, char_end: int):
@@ -799,14 +922,14 @@ def _locate_span_in_chunk(content: str, text_span: str):
     return _span_offsets(content, char_start, char_end)
 
 
-def _propositions_from_llm(data, default_section_path=""):
+def _propositions_from_llm(data, default_chapter_id=""):
     """Extrae las proposiciones del output del LLM (organizado por divisiones).
 
-    Formato nuevo (exigido por el prompt): {"divisions": [{"section_path":
+    Formato nuevo (exigido por el prompt): {"divisions": [{"chapter_id":
     str, "propositions": [...]}]}. Formato legacy (artefacto compilado
     anterior a la agrupación por capítulo): {"propositions": [...]} — se
-    trata como una única división con `default_section_path`. Devuelve lista
-    de (section_path, prop_dict) o [] si no hay proposiciones.
+    trata como una única división con `default_chapter_id`. Devuelve lista
+    de (chapter_id, prop_dict) o [] si no hay proposiciones.
     """
     if not isinstance(data, dict):
         return []
@@ -816,26 +939,26 @@ def _propositions_from_llm(data, default_section_path=""):
         for div in divisions:
             if not isinstance(div, dict):
                 continue
-            div_path = str(div.get("section_path") or "").strip()
-            div_path = div_path or default_section_path
+            div_path = str(div.get("chapter_id") or "").strip()
+            div_path = div_path or default_chapter_id
             for p in div.get("propositions") or []:
                 if isinstance(p, dict):
                     out.append((div_path, p))
         return out
     propositions = data.get("propositions")
     if isinstance(propositions, list):
-        return [(default_section_path, p) for p in propositions if isinstance(p, dict)]
+        return [(default_chapter_id, p) for p in propositions if isinstance(p, dict)]
     return []
 
 
 def _extract_propositions(
-    session, doc_id, chunk_id, content, doc_path, chunk_index, section_path, verbose
+    session, doc_id, chunk_id, content, doc_path, chunk_index, chapter_id, verbose
 ):
     """Extrae proposiciones atómicas de un chunk con el modelo pequeño.
 
     Usa _get_prompt_pair (artefacto compilado o fallback a constantes) +
     call_with_retries (model_size="small"). Devuelve lista de dicts
-    {doc_id, chunk_id, section_path, core_idea_id, argument_id, statement,
+    {doc_id, chunk_id, chapter_id, core_idea_id, argument_id, statement,
     text_span, char_start, char_end, line_start, line_end, citations}. Si el
     LLM falla o devuelve JSON inválido → [] (degradación: la ingesta sigue).
     """
@@ -856,9 +979,9 @@ def _extract_propositions(
         user_template,
         source_file=doc_path,
         document_id=doc_id,
-        section_path=section_path or "",
+        chapter_id=chapter_id or "",
         chunk_index=chunk_index,
-        chunk_title=section_path or "",
+        chunk_title=chapter_id or "",
         line_start=1,
         line_end=chunk_text.count("\n") + 1,
         chapter_text_content=chunk_text,
@@ -880,7 +1003,7 @@ def _extract_propositions(
         return []
     out = []
     for div_path, p in _propositions_from_llm(
-        data, default_section_path=section_path or ""
+        data, default_chapter_id=chapter_id or ""
     ):
         statement = str(p.get("statement") or "").strip()
         if not statement:
@@ -896,7 +1019,7 @@ def _extract_propositions(
             {
                 "doc_id": doc_id,
                 "chunk_id": chunk_id,
-                "section_path": div_path,
+                "chapter_id": div_path,
                 "core_idea_id": str(p.get("core_idea_id") or "")[:50],
                 "argument_id": str(p.get("argument_id") or "")[:50],
                 "statement": statement,
@@ -931,7 +1054,7 @@ def _store_propositions(session, doc_id, propositions, embed_fn=None):
     else:
         embs = [None] * len(propositions)
     placeholders = ", ".join(
-        f"(:d{i}, :c{i}, :sp{i}, :ci{i}, :a{i}, :s{i}, :ts{i}, :cs{i}, :ce{i}, "
+        f"(:d{i}, :c{i}, :ch{i}, :ci{i}, :a{i}, :s{i}, :ts{i}, :cs{i}, :ce{i}, "
         f":ls{i}, :le{i}, CAST(:cr{i} AS jsonb), CAST(:emb{i} AS vector))"
         for i in range(len(propositions))
     )
@@ -941,7 +1064,7 @@ def _store_propositions(session, doc_id, propositions, embed_fn=None):
             {
                 f"d{i}": p["doc_id"],
                 f"c{i}": p["chunk_id"],
-                f"sp{i}": p.get("section_path"),
+                f"ch{i}": p.get("chapter_id"),
                 f"ci{i}": p["core_idea_id"],
                 f"a{i}": p["argument_id"],
                 f"s{i}": sanitize_text(p["statement"]),
@@ -957,7 +1080,7 @@ def _store_propositions(session, doc_id, propositions, embed_fn=None):
     session.execute(
         text(
             "INSERT INTO kag_propositions "
-            "(doc_id, chunk_id, section_path, core_idea_id, argument_id, statement, "
+            "(doc_id, chunk_id, chapter_id, core_idea_id, argument_id, statement, "
             "text_span, char_start, char_end, line_start, line_end, "
             "citation_references, embedding) "
             f"VALUES {placeholders}"
@@ -1008,7 +1131,7 @@ def _batch_chunks_by_tokens(
 
     Acumula `estimate_fn(content)` hasta alcanzar `batch_size_tokens`; cada
     lote = UNA llamada LLM. El corte es por el límite de tokens, NO por un
-    número fijo de chunks. Los chunks consecutivos de la misma `section_path`
+    número fijo de chunks. Los chunks consecutivos del mismo `chapter_id`
     quedan juntos (orden por chunk_index); un chunk que excede el presupuesto
     forma su propio lote (no se parte).
     """
@@ -1031,21 +1154,23 @@ def _batch_chunks_by_tokens(
 def _group_chunks_by_chapter(
     chunks, chapter_token_threshold=CHAPTER_TOKEN_THRESHOLD, estimate_fn=estimate_tokens
 ):
-    """Agrupa chunks por documento→capítulo (section_path ya detectado).
+    """Agrupa chunks por documento→capítulo (chapter_id ya detectado).
 
-    Los chunks llegan ordenados por chunk_index. Cada capítulo (section_path)
+    Los chunks llegan ordenados por chunk_index. Cada capítulo (chapter_id)
     con > `chapter_token_threshold` tokens forma su propio grupo (una llamada
     LLM por capítulo); los capítulos ≤ umbral se fusionan en un único grupo a
-    nivel de archivo (section_path ""). Devuelve lista de dicts
-    {"section_path": str, "chunks": [...]} en orden de aparición.
+    nivel de archivo (chapter_id ""). Si TODOS los chunks tienen chapter_id
+    NULL (Fase 3 aún no segmenta dentro de capítulos), se produce un único
+    grupo a nivel de documento. Devuelve lista de dicts
+    {"chapter_id": str, "chunks": [...]} en orden de aparición.
     """
     chapters: list[dict] = []
     for ch in chunks:
-        path = ch["section_path"] or ""
-        if chapters and chapters[-1]["section_path"] == path:
+        path = ch.get("chapter_id") or ""
+        if chapters and chapters[-1]["chapter_id"] == path:
             chapters[-1]["chunks"].append(ch)
         else:
-            chapters.append({"section_path": path, "chunks": [ch]})
+            chapters.append({"chapter_id": path, "chunks": [ch]})
     groups: list[dict] = []
     file_level: list = []
     for chapter in chapters:
@@ -1055,7 +1180,7 @@ def _group_chunks_by_chapter(
         else:
             file_level.extend(chapter["chunks"])
     if file_level:
-        groups.append({"section_path": "", "chunks": file_level})
+        groups.append({"chapter_id": "", "chunks": file_level})
     return groups
 
 
@@ -1067,28 +1192,34 @@ def _run_proposition_batches_parallel(
     verbose,
     model_size="large",
     max_parallel=3,
+    batch_fn=None,
 ):
     """Dispara las llamadas LLM de los lotes en paralelo (ThreadPoolExecutor).
 
-    `units`: lista de (section_path, chunks) — cada lote es UNA llamada LLM
+    `units`: lista de (chapter_id, chunks) — cada lote es UNA llamada LLM
     independiente. `max_parallel` (semáforo) limita las llamadas LLM
-    concurrentes para respetar el rate limit del proveedor. Devuelve los
-    resultados en el MISMO orden que `units` (persistencia determinista por
+    concurrentes para respetar el rate limit del proveedor. `batch_fn`:
+    función de extracción por lote (default `_extract_propositions_batch`;
+    el flujo por documento usa `_extract_document_batch`, que devuelve
+    (propositions, entities, relations) por lote). Devuelve los resultados
+    en el MISMO orden que `units` (persistencia determinista por
     chunk_index aunque se procesen en paralelo).
     """
+    if batch_fn is None:
+        batch_fn = _extract_propositions_batch
     sem = threading.BoundedSemaphore(max_parallel)
     results: list = [None] * len(units)
 
-    def work(i, section_path, batch):
+    def work(i, chapter_id, batch):
         with sem:
-            return i, _extract_propositions_batch(
+            return i, batch_fn(
                 session,
                 doc_id,
                 batch,
                 doc_path,
                 verbose,
                 model_size=model_size,
-                section_path=section_path,
+                chapter_id=chapter_id,
             )
 
     # El pool admite hasta 2×N workers; el semáforo es quien limita la
@@ -1128,15 +1259,15 @@ def _locate_span_in_batch(chunks, batch_text: str, offsets, text_span: str):
 
 
 def _extract_propositions_batch(
-    session, doc_id, chunks, doc_path, verbose, model_size="large", section_path=""
+    session, doc_id, chunks, doc_path, verbose, model_size="large", chapter_id=""
 ):
     """Extrae proposiciones de un lote de chunks con UNA llamada LLM.
 
-    `chunks`: lista de dicts {id, content, chunk_index, section_path}.
-    `section_path`: capítulo/división del lote (metadata del prompt; "" =
+    `chunks`: lista de dicts {id, content, chunk_index, chapter_id}.
+    `chapter_id`: capítulo/división del lote (metadata del prompt; "" =
     nivel archivo). Concatena los contenidos (separador \n\n---\n\n) y pasa
     el texto como `chapter_text_content`; el prompt exige el output
-    organizado por divisiones ({"divisions": [{"section_path",
+    organizado por divisiones ({"divisions": [{"chapter_id",
     "propositions"}]}) y cada proposición se asigna al chunk que contiene su
     text_span (offsets relativos al chunk). `model_size` ("small" |
     "large", default "large" vía KAG_PROPOSITION_MODEL): la respuesta de un
@@ -1183,9 +1314,9 @@ def _extract_propositions_batch(
         user_template,
         source_file=doc_path,
         document_id=doc_id,
-        section_path=section_path or "(archivo completo)",
+        chapter_id=chapter_id or "(archivo completo)",
         chunk_index=chunk_index_label,
-        chunk_title=chunks[0]["section_path"] or "",
+        chunk_title=chunks[0].get("chapter_id") or "",
         line_start=1,
         line_end=batch_text.count("\n") + 1,
         chapter_text_content=batch_text,
@@ -1205,10 +1336,10 @@ def _extract_propositions_batch(
         if verbose:
             print(f"[KAG] ⚠ Proposiciones fallaron (lote {chunk_index_label}): {exc}")
         return []
-    chunk_sections = {ch["id"]: (ch["section_path"] or "") for ch in chunks}
+    chunk_chapters = {ch["id"]: (ch.get("chapter_id") or "") for ch in chunks}
     out = []
     for div_path, p in _propositions_from_llm(
-        data, default_section_path=section_path or ""
+        data, default_chapter_id=chapter_id or ""
     ):
         statement = str(p.get("statement") or "").strip()
         if not statement:
@@ -1220,14 +1351,14 @@ def _extract_propositions_batch(
         citations = p.get("citations_references") or []
         if not isinstance(citations, list):
             citations = []
-        # section_path: el del capítulo declarado por el LLM en la división;
+        # chapter_id: el del capítulo declarado por el LLM en la división;
         # si falta, el del chunk asignado (o "").
-        prop_section = div_path or chunk_sections.get(chunk_id, "")
+        prop_chapter = div_path or chunk_chapters.get(chunk_id, "")
         out.append(
             {
                 "doc_id": doc_id,
                 "chunk_id": chunk_id,
-                "section_path": prop_section,
+                "chapter_id": prop_chapter,
                 "core_idea_id": str(p.get("core_idea_id") or "")[:50],
                 "argument_id": str(p.get("argument_id") or "")[:50],
                 "statement": statement,
@@ -1240,6 +1371,175 @@ def _extract_propositions_batch(
             }
         )
     return out
+
+
+def _extract_document_batch(
+    session, doc_id, chunks, doc_path, verbose, model_size="large", chapter_id=""
+):
+    """Extrae proposiciones + entidades + relaciones de un lote de chunks
+    (paráfrasis) con UNA llamada LLM grande (spec `kag_chapter_propositions`).
+
+    `chunks`: lista de dicts {id, content, chunk_index, chapter_id} donde
+    `content` es el texto a procesar (paráfrasis o content si NULL).
+    Concatena los textos (separador \n\n---\n\n) y construye offsets por
+    chunk (patrón de _locate_span_in_batch). El LLM devuelve
+    {"propositions": [{"chunk_index": int, ...}], "entities": [...],
+    "relations": [...]}. Asignación de proposiciones a chunks: primario =
+    chunk_index declarado por el LLM (mapear chunk_index → chunk id); si
+    falta o es inválido, secundario = _locate_span_in_batch sobre el texto
+    concatenado. Si ambos fallan → la proposición se descarta (chunk_id es
+    NOT NULL en kag_propositions). `chapter_id` de cada proposición = el del
+    chunk asignado (o "" si NULL). Devuelve (propositions, entities,
+    relations). Si el LLM falla o devuelve JSON inválido → ([], [], [])
+    (degradación: la ingesta sigue).
+    """
+    if model_size not in ("small", "large"):
+        model_size = "large"
+    settings = load_settings(session)
+    retries = int(getattr(settings, "llm_retries", 3) or 3) if settings else 3
+    fallback = getattr(settings, "fallback_model", None) if settings else None
+    model_name = (
+        (
+            getattr(settings, "large_model", None)
+            if model_size == "large"
+            else getattr(settings, "small_model", None)
+        )
+        if settings
+        else None
+    )
+    system, user_template = _get_prompt_pair(
+        session,
+        model_name,
+        TASK_CHAPTER_PROPOSITIONS,
+        CHAPTER_PROPOSITIONS_SYSTEM_SHORT,
+        CHAPTER_PROPOSITIONS_USER_SHORT,
+    )
+    sep = "\n\n---\n\n"
+    batch_text = sep.join(ch["content"] for ch in chunks)
+    offsets = []
+    cursor = 0
+    for ch in chunks:
+        start = cursor
+        cursor += len(ch["content"])
+        offsets.append((ch["id"], start, cursor))
+        cursor += len(sep)
+    # Mapa chunk_index → chunk id (asignación primaria por chunk_index).
+    index_to_id = {ch["chunk_index"]: ch["id"] for ch in chunks}
+    chunk_chapters = {ch["id"]: (ch.get("chapter_id") or "") for ch in chunks}
+    paraphrases_json = json.dumps(
+        [
+            {"chunk_index": ch["chunk_index"], "paraphrase": ch["content"]}
+            for ch in chunks
+        ],
+        ensure_ascii=False,
+    )
+    # Metadata del prompt: capítulos cubiertos por el lote.
+    chapter_ids = sorted({c for c in chunk_chapters.values() if c})
+    chapter_label = ", ".join(chapter_ids) if chapter_ids else "(archivo completo)"
+    prompt = _fill_prompt(
+        user_template,
+        source_file=str(Path(doc_path)).replace("\\", "/"),
+        document_id=str(doc_id),
+        chapter_id=chapter_label,
+        paraphrases_json=paraphrases_json,
+    )
+    try:
+        text_out, _model, _used_fallback = call_with_retries(
+            session,
+            prompt=prompt,
+            system=system,
+            model_size=model_size,
+            response_format={"type": "json_object"},
+            retries=retries,
+            fallback_model=fallback,
+        )
+        data = parse_llm_output(text_out)
+    except Exception as exc:  # noqa: BLE001 — LLM no disponible: degradación
+        if verbose:
+            first_idx = chunks[0]["chunk_index"]
+            last_idx = chunks[-1]["chunk_index"]
+            label = (
+                f"{first_idx}-{last_idx}" if first_idx != last_idx else str(first_idx)
+            )
+            print(f"[KAG] ⚠ Proposiciones fallaron (lote {label}): {exc}")
+        return [], [], []
+    if not isinstance(data, dict):
+        return [], [], []
+    # Proposiciones: primario chunk_index, secundario _locate_span_in_batch.
+    out = []
+    for p in data.get("propositions") or []:
+        if not isinstance(p, dict):
+            continue
+        statement = str(p.get("statement") or "").strip()
+        if not statement:
+            continue
+        text_span = str(p.get("text_span") or "")
+        chunk_id = None
+        char_start = char_end = line_start = line_end = None
+        try:
+            idx = int(p.get("chunk_index"))
+        except (TypeError, ValueError):
+            idx = None
+        if idx is not None and idx in index_to_id:
+            chunk_id = index_to_id[idx]
+        if chunk_id is None:
+            # Fallback: localizar el span en el texto concatenado del lote.
+            chunk_id, char_start, char_end, line_start, line_end = (
+                _locate_span_in_batch(chunks, batch_text, offsets, text_span)
+            )
+        if chunk_id is None:
+            continue  # sin chunk asignable → descartar (chunk_id NOT NULL)
+        citations = p.get("citations_references") or []
+        if not isinstance(citations, list):
+            citations = []
+        out.append(
+            {
+                "doc_id": doc_id,
+                "chunk_id": chunk_id,
+                "chapter_id": chunk_chapters.get(chunk_id, ""),
+                "core_idea_id": str(p.get("core_idea_id") or "")[:50],
+                "argument_id": str(p.get("argument_id") or "")[:50],
+                "statement": statement,
+                "text_span": text_span,
+                "char_start": char_start,
+                "char_end": char_end,
+                "line_start": line_start,
+                "line_end": line_end,
+                "citations": [str(c) for c in citations],
+            }
+        )
+    # Entidades y relaciones (nivel lote/documento).
+    entities = []
+    for e in data.get("entities") or []:
+        if not isinstance(e, dict):
+            continue
+        name = str(e.get("name") or "").strip()
+        if not name:
+            continue
+        entities.append(
+            {
+                "name": name,
+                "type": str(e.get("type") or "concept"),
+                "description": str(e.get("description") or ""),
+            }
+        )
+    relations = []
+    for r in data.get("relations") or []:
+        if not isinstance(r, dict):
+            continue
+        src = str(r.get("source") or "").strip()
+        tgt = str(r.get("target") or "").strip()
+        if not src or not tgt:
+            continue
+        relations.append(
+            {
+                "source": src,
+                "target": tgt,
+                "type": str(r.get("type") or "RELACIONA"),
+                "description": str(r.get("description") or ""),
+            }
+        )
+    return out, entities, relations
 
 
 def _extract_propositions_for_doc(
@@ -1256,22 +1556,23 @@ def _extract_propositions_for_doc(
     chunking, etapa 'chunked').
 
     Agrupación jerárquica doc→capítulo: los chunks se agrupan por documento
-    (uno por .md) y luego por capítulo = section_path (ya detectado por
-    chunk_markdown) SOLO si el capítulo tiene > CHAPTER_TOKEN_THRESHOLD (30k)
-    tokens; los capítulos ≤ umbral se agrupan a nivel de archivo. Cada grupo
-    se parte en lotes por presupuesto de tokens (KAG_PROPOSITION_BATCH_SIZE,
-    default 400k); cada lote = UNA llamada LLM. Los lotes se disparan en
-    paralelo (ThreadPoolExecutor + semáforo, KAG_PROPOSITION_PARALLEL) y se
-    persisten en orden de chunk_index (determinista). Cache por content_hash
-    (0026): los chunks que ya tienen proposiciones persistidas y cuyo
-    content_hash no cambió se saltan (no re-extraer en re-ingestas).
-    `model_size` ("small" | "large", default "large" vía
-    KAG_PROPOSITION_MODEL): la respuesta de un lote es mucho mayor en
-    extensión que la de un chunk suelto, por eso el default es el LLM grande.
+    (uno por .md) y luego por capítulo = chapter_id (detectado por LLM, Fase
+    2; por ahora NULL → un único grupo a nivel de documento) SOLO si el
+    capítulo tiene > CHAPTER_TOKEN_THRESHOLD (30k) tokens; los capítulos ≤
+    umbral se agrupan a nivel de archivo. Cada grupo se parte en lotes por
+    presupuesto de tokens (KAG_PROPOSITION_BATCH_SIZE, default 400k); cada
+    lote = UNA llamada LLM. Los lotes se disparan en paralelo
+    (ThreadPoolExecutor + semáforo, KAG_PROPOSITION_PARALLEL) y se persisten
+    en orden de chunk_index (determinista). Cache por content_hash (0026):
+    los chunks que ya tienen proposiciones persistidas y cuyo content_hash no
+    cambió se saltan (no re-extraer en re-ingestas). `model_size` ("small" |
+    "large", default "large" vía KAG_PROPOSITION_MODEL): la respuesta de un
+    lote es mucho mayor en extensión que la de un chunk suelto, por eso el
+    default es el LLM grande.
     """
     rows = session.execute(
         text(
-            "SELECT id, content, chunk_index, section_path, content_hash "
+            "SELECT id, content, chunk_index, chapter_id, content_hash "
             "FROM kag_chunks WHERE doc_id = :id ORDER BY chunk_index"
         ),
         {"id": doc_id},
@@ -1295,7 +1596,7 @@ def _extract_propositions_for_doc(
                 "id": r.id,
                 "content": r.content,
                 "chunk_index": r.chunk_index,
-                "section_path": r.section_path,
+                "chapter_id": r.chapter_id,
             }
         )
     if not pending:
@@ -1304,20 +1605,20 @@ def _extract_propositions_for_doc(
         return
     # Agrupación doc→capítulo: capítulos >30k tokens = grupo propio; el resto
     # se fusiona a nivel de archivo. Cada grupo se parte en lotes por tokens.
-    units: list[tuple[str, list]] = []  # (section_path, chunks)
+    units: list[tuple[str, list]] = []  # (chapter_id, chunks)
     for group in _group_chunks_by_chapter(pending):
         for batch in _batch_chunks_by_tokens(group["chunks"], batch_size_tokens):
-            units.append((group["section_path"], batch))
+            units.append((group["chapter_id"], batch))
     # Orden de persistencia determinista: por chunk_index (aunque los lotes
     # se procesen en paralelo).
     units.sort(key=lambda u: u[1][0]["chunk_index"])
     if verbose:
-        for i, (sp, batch) in enumerate(units, 1):
+        for i, (ch_id, batch) in enumerate(units, 1):
             total = sum(estimate_tokens(c["content"]) for c in batch)
             print(
                 f"[KAG] ⚙ proposiciones: lote {i}/{len(units)} "
                 f"({len(batch)} chunks, ~{total} tokens, "
-                f"capítulo: {sp or '(archivo)'})..."
+                f"capítulo: {ch_id or '(archivo)'})..."
             )
     results = _run_proposition_batches_parallel(
         session,
@@ -1328,7 +1629,7 @@ def _extract_propositions_for_doc(
         model_size=model_size,
         max_parallel=max_parallel,
     )
-    for (_sp, batch), props in zip(units, results):
+    for (_ch_id, batch), props in zip(units, results):
         # Degradación: proposiciones sin chunk asignable (span no localizable)
         # se descartan — kag_propositions.chunk_id es NOT NULL.
         props = [p for p in props if p["chunk_id"] is not None]
@@ -1338,6 +1639,283 @@ def _extract_propositions_for_doc(
                 text("UPDATE kag_chunks SET content_hash = :h WHERE id = :id"),
                 {"h": _chunk_content_hash(ch["content"]), "id": ch["id"]},
             )
+
+
+def _extract_document_propositions(
+    session,
+    doc_id,
+    doc_path,
+    verbose,
+    batch_size_tokens,
+    embed_fn=None,
+    model_size="large",
+    max_parallel=3,
+):
+    """Extrae proposiciones + entidades + relaciones de TODOS los chunks del
+    doc (etapa 'chunked', Fase 5) usando las paráfrasis de la Fase 4.
+
+    Flujo por DOCUMENTO (decisión: proposiciones + entidades por documento,
+    tomando todas las paráfrasis de todos los capítulos):
+    1. Lee TODAS las paráfrasis de TODOS los capítulos del documento
+       (SELECT ... FROM kag_chunks WHERE doc_id = :id ORDER BY chunk_index).
+       El texto a procesar por chunk = paraphrase or content (si la
+       paráfrasis es NULL, fallback al content — degradación natural si la
+       Fase 4 no corrió).
+    2. Cache por content_hash (0026): los chunks que ya tienen proposiciones
+       persistidas y cuyo content_hash no cambió se saltan.
+    3. Agrupación por DOCUMENTO (no por capítulo >30k): todos los chunks
+       pendientes se concatenan (con sus paráfrasis) y se parten en lotes
+       por presupuesto de tokens (_batch_chunks_by_tokens,
+       KAG_PROPOSITION_BATCH_SIZE=400000). Cada lote = UNA llamada LLM.
+    4. _extract_document_batch: LLM grande con spec `kag_chapter_propositions`
+       → {"propositions": [...], "entities": [...], "relations": [...]}.
+       Asignación de proposiciones a chunks: primario = chunk_index
+       declarado por el LLM; si falta o es inválido, secundario =
+       _locate_span_in_batch. Si ambos fallan → descartar (chunk_id NOT
+       NULL).
+    5. Persistencia: proposiciones vía _store_propositions (embedding batch);
+       entidades + relaciones vía _store_entities_relations (dedup por
+       name_norm contra las de spaCy — no duplica).
+    6. Paralelismo: lotes independientes → _run_proposition_batches_parallel
+       (ThreadPoolExecutor + semáforo, batch_fn=_extract_document_batch).
+       Persistencia en orden determinista por chunk_index.
+    7. Degradación: LLM falla o JSON inválido en un lote → log + skip del
+       lote (la ingesta sigue). Entidades vacías → solo proposiciones.
+    """
+    rows = session.execute(
+        text(
+            "SELECT id, chunk_index, content, paraphrase, chapter_id, content_hash "
+            "FROM kag_chunks WHERE doc_id = :id ORDER BY chunk_index"
+        ),
+        {"id": doc_id},
+    ).fetchall()
+    if not rows:
+        return
+    cached_ids = {
+        r[0]
+        for r in session.execute(
+            text("SELECT DISTINCT chunk_id FROM kag_propositions WHERE doc_id = :id"),
+            {"id": doc_id},
+        ).fetchall()
+    }
+    pending = []
+    for r in rows:
+        h = _chunk_content_hash(r.content)
+        if r.id in cached_ids and r.content_hash == h:
+            continue  # ya extraído con hash idéntico (cache)
+        pending.append(
+            {
+                "id": r.id,
+                # Texto a procesar: paráfrasis o content si NULL (degradación
+                # natural si la Fase 4 no corrió).
+                "content": (getattr(r, "paraphrase", None) or r.content),
+                # Content original para el content_hash (cache 0026).
+                "original_content": r.content,
+                "chunk_index": r.chunk_index,
+                "chapter_id": r.chapter_id,
+            }
+        )
+    if not pending:
+        if verbose:
+            print("[KAG] ⏭ proposiciones: todos los chunks ya extraídos (cache).")
+        return
+    # Agrupación por DOCUMENTO: todos los chunks pendientes se parten en
+    # lotes por presupuesto de tokens (cada lote = UNA llamada LLM).
+    units: list[tuple[str, list]] = []  # (chapter_id, chunks)
+    for batch in _batch_chunks_by_tokens(pending, batch_size_tokens):
+        units.append(("", batch))
+    # Orden de persistencia determinista: por chunk_index (aunque los lotes
+    # se procesen en paralelo).
+    units.sort(key=lambda u: u[1][0]["chunk_index"])
+    if verbose:
+        for i, (_ch_id, batch) in enumerate(units, 1):
+            total = sum(estimate_tokens(c["content"]) for c in batch)
+            print(
+                f"[KAG] ⚙ proposiciones: lote {i}/{len(units)} "
+                f"({len(batch)} chunks, ~{total} tokens)..."
+            )
+    results = _run_proposition_batches_parallel(
+        session,
+        doc_id,
+        doc_path,
+        units,
+        verbose,
+        model_size=model_size,
+        max_parallel=max_parallel,
+        batch_fn=_extract_document_batch,
+    )
+    for (_ch_id, batch), (props, entities, relations) in zip(units, results):
+        # Degradación: proposiciones sin chunk asignable (chunk_index
+        # inválido y span no localizable) se descartan — kag_propositions.
+        # chunk_id es NOT NULL.
+        props = [p for p in props if p["chunk_id"] is not None]
+        _store_propositions(session, doc_id, props, embed_fn=embed_fn)
+        # Entidades + relaciones LLM: se persisten contra el primer chunk del
+        # lote (dedup por name_norm por doc — no duplica con las de spaCy).
+        if entities or relations:
+            _store_entities_relations(
+                session,
+                doc_id,
+                batch[0]["id"],
+                {"entities": entities, "relations": relations},
+                embed_fn=embed_fn,
+            )
+        for ch in batch:
+            session.execute(
+                text("UPDATE kag_chunks SET content_hash = :h WHERE id = :id"),
+                {"h": _chunk_content_hash(ch["original_content"]), "id": ch["id"]},
+            )
+
+
+# ---------------------------------------------------------------------
+# Paráfrasis de chunks (Fase 4, etapa 'paraphrased')
+# ---------------------------------------------------------------------
+
+
+def _paraphrase_chunks(session, doc_id, doc_path, verbose=True):
+    """Parafrasea TODOS los chunks del doc (etapa 'paraphrased', Fase 4).
+
+    Agrupación por capítulo: los chunks con chapter_id UUID forman un grupo
+    por capítulo; los NULL se agrupan en un único grupo "(sin capítulo)"
+    (chapter_id ""). Cada grupo = UNA llamada LLM grande (model_size="large")
+    con la spec `kag_chunk_paraphrase` → {"paraphrases": [{"chunk_index":
+    int, "paraphrase": str}]}. El prompt recibe `chunks_json` =
+    json.dumps([{chunk_index, content}] del grupo).
+
+    Los grupos son independientes → se disparan en paralelo
+    (ThreadPoolExecutor + semáforo, KAG_PARAPHRASE_PARALLEL default 3) y se
+    persisten en orden determinista por chunk_index. Los chunks sin
+    paraphrase en la respuesta del LLM quedan NULL. Degradación: si el LLM
+    falla o devuelve JSON inválido en un grupo → log + paraphrase NULL para
+    esos chunks (la ingesta sigue). Si no hay chunks → no hace nada.
+    """
+    rows = session.execute(
+        text(
+            "SELECT id, chunk_index, content, chapter_id FROM kag_chunks "
+            "WHERE doc_id = :id ORDER BY chunk_index"
+        ),
+        {"id": doc_id},
+    ).fetchall()
+    if not rows:
+        return
+    # Agrupación por capítulo (chapter_id UUID o "" para los NULL).
+    groups: list[tuple[str, list]] = []  # (chapter_id, chunks)
+    for r in rows:
+        ch_id = str(r.chapter_id) if r.chapter_id else ""
+        if groups and groups[-1][0] == ch_id:
+            groups[-1][1].append(
+                {"id": r.id, "chunk_index": r.chunk_index, "content": r.content}
+            )
+        else:
+            groups.append(
+                (
+                    ch_id,
+                    [{"id": r.id, "chunk_index": r.chunk_index, "content": r.content}],
+                )
+            )
+    config = resolve_config(session)
+    max_parallel = int(get_config_value(config, "KAG_PARAPHRASE_PARALLEL", 3) or 3)
+    if max_parallel < 1:
+        max_parallel = 3
+    sem = threading.BoundedSemaphore(max_parallel)
+    results: list = [None] * len(groups)
+
+    def work(i, chapter_id, group_chunks):
+        with sem:
+            return i, _paraphrase_group(
+                session, doc_id, doc_path, chapter_id, group_chunks, verbose
+            )
+
+    pool_size = min(len(groups), max_parallel * 2)
+    with ThreadPoolExecutor(max_workers=pool_size) as ex:
+        futures = [
+            ex.submit(work, i, ch_id, chs) for i, (ch_id, chs) in enumerate(groups)
+        ]
+        for fut in futures:
+            i, paraphrases = fut.result()
+            results[i] = paraphrases
+    # Persistencia determinista por chunk_index (aunque se procesen en
+    # paralelo): los chunks sin paraphrase quedan NULL.
+    for (_ch_id, group_chunks), paraphrases in zip(groups, results):
+        by_index = {int(p.get("chunk_index")): p.get("paraphrase") for p in paraphrases}
+        for ch in group_chunks:
+            paraphrase = by_index.get(ch["chunk_index"])
+            if not paraphrase:
+                continue
+            session.execute(
+                text("UPDATE kag_chunks SET paraphrase = :p WHERE id = :id"),
+                {"p": sanitize_text(str(paraphrase)), "id": ch["id"]},
+            )
+    session.commit()
+
+
+def _paraphrase_group(session, doc_id, doc_path, chapter_id, chunks, verbose=True):
+    """Parafrasea UN grupo de chunks (un capítulo) con UNA llamada LLM grande.
+
+    `chapter_id`: UUID del capítulo o "" (grupo sin capítulo). Devuelve la
+    lista de dicts {"chunk_index", "paraphrase"} del LLM; si el LLM falla o
+    devuelve JSON inválido → [] (degradación: paraphrase NULL, la ingesta
+    sigue).
+    """
+    try:
+        settings = load_settings(session)
+    except Exception:  # noqa: BLE001 — sesión falsa en tests
+        settings = None
+    retries = int(getattr(settings, "llm_retries", 3) or 3) if settings else 3
+    fallback = getattr(settings, "fallback_model", None) if settings else None
+    model_name = getattr(settings, "large_model", None) if settings else None
+    system, user_template = _get_prompt_pair(
+        session,
+        model_name,
+        TASK_CHUNK_PARAPHRASE,
+        PARAPHRASE_SYSTEM_SHORT,
+        PARAPHRASE_USER_SHORT,
+    )
+    chunks_json = json.dumps(
+        [{"chunk_index": ch["chunk_index"], "content": ch["content"]} for ch in chunks],
+        ensure_ascii=False,
+    )
+    prompt = _fill_prompt(
+        user_template,
+        source_file=str(Path(doc_path)).replace("\\", "/"),
+        document_id=str(doc_id),
+        chapter_id=chapter_id or "(sin capítulo)",
+        chunks_json=chunks_json,
+    )
+    try:
+        text_out, _model, _used_fallback = call_with_retries(
+            session,
+            prompt=prompt,
+            system=system,
+            model_size="large",
+            response_format={"type": "json_object"},
+            retries=retries,
+            fallback_model=fallback,
+        )
+        data = parse_llm_output(text_out)
+        paraphrases = data.get("paraphrases") if isinstance(data, dict) else None
+        if not isinstance(paraphrases, list):
+            return []
+        out = []
+        for p in paraphrases:
+            if not isinstance(p, dict):
+                continue
+            try:
+                idx = int(p.get("chunk_index"))
+            except (TypeError, ValueError):
+                continue
+            paraphrase = str(p.get("paraphrase") or "").strip()
+            if not paraphrase:
+                continue
+            out.append({"chunk_index": idx, "paraphrase": paraphrase})
+        return out
+    except Exception as exc:  # noqa: BLE001 — LLM no disponible: degradación
+        if verbose:
+            print(
+                f"[KAG] ⚠ Paráfrasis fallaron (capítulo {chapter_id or '(sin capítulo)'}): "
+                f"{exc}"
+            )
+        return []
 
 
 # ---------------------------------------------------------------------
@@ -1492,6 +2070,289 @@ def describe_figure(session, image_path, caption):
         return ""
 
 
+# ---------------------------------------------------------------------
+# Fase 2 — análisis documental (ficha ISO 25964 + capítulos)
+# ---------------------------------------------------------------------
+
+
+def _scope_thematic_from_thematic(ficha: dict) -> str:
+    """Deriva el scope_thematic de la ficha (preferred + non-preferred con |).
+
+    A partir de `thematic_areas_iso25964` (lista de dicts con preferred_term y
+    non_preferred_terms), produce una cadena plana para búsquedas por texto:
+    cada temática contribuye su término preferido y sus no preferidos,
+    separados por '|'. Devuelve '' si no hay temáticas.
+    """
+    areas = ficha.get("thematic_areas_iso25964") or []
+    if not isinstance(areas, list):
+        return ""
+    parts = []
+    for area in areas:
+        if not isinstance(area, dict):
+            continue
+        preferred = str(area.get("preferred_term") or "").strip()
+        if preferred:
+            parts.append(preferred)
+        non_preferred = area.get("non_preferred_terms") or []
+        if isinstance(non_preferred, list):
+            parts.extend(str(t).strip() for t in non_preferred if str(t).strip())
+    return " | ".join(parts)
+
+
+def _enrich_library_of_congress(ficha: dict, verbose: bool = True) -> dict:
+    """Enriquece la ficha con URIs de la Biblioteca del Congreso (best-effort).
+
+    Para cada término LCSH de `library_of_congress.lcsh_terms` consulta
+    `LibraryOfCongressAPITool.query_subject_heading` y añade la URI al término
+    (dict {term, uri}); para `lcc_classification` consulta
+    `query_classification_code` y añade lcc_uri. Cualquier error degrada a la
+    ficha original (nunca romper la ingesta). Import perezoso de src.kag.tools.
+    """
+    loc = ficha.get("library_of_congress") or {}
+    if not isinstance(loc, dict):
+        loc = {}
+    try:
+        from src.kag.tools import LibraryOfCongressAPITool
+
+        tool = LibraryOfCongressAPITool()
+        lcsh_terms = loc.get("lcsh_terms") or []
+        if isinstance(lcsh_terms, list):
+            enriched = []
+            for term in lcsh_terms:
+                term_str = (
+                    str(term)
+                    if not isinstance(term, dict)
+                    else str(term.get("term") or "")
+                )
+                if not term_str:
+                    continue
+                try:
+                    result = tool.query_subject_heading(term_str)
+                except Exception as exc:  # noqa: BLE001 — best-effort
+                    if verbose:
+                        print(f"[KAG] ⚠ LCSH '{term_str}' no enriquecido: {exc}")
+                    result = None
+                if result and isinstance(result, dict):
+                    enriched.append({"term": term_str, "uri": result.get("uri") or ""})
+                else:
+                    enriched.append({"term": term_str, "uri": ""})
+            if enriched:
+                loc["lcsh_terms"] = enriched
+        lcc = loc.get("lcc_classification") or {}
+        if isinstance(lcc, dict):
+            label = str(lcc.get("label") or "")
+            if label:
+                try:
+                    result = tool.query_classification_code(label)
+                except Exception as exc:  # noqa: BLE001 — best-effort
+                    if verbose:
+                        print(f"[KAG] ⚠ LCC '{label}' no enriquecido: {exc}")
+                    result = None
+                if result and isinstance(result, dict):
+                    lcc["lcc_uri"] = result.get("lcc_uri") or ""
+                    lcc["call_number"] = result.get("lcc_call_number") or lcc.get(
+                        "call_number"
+                    )
+        ficha["library_of_congress"] = loc
+    except Exception as exc:  # noqa: BLE001 — degradación natural
+        if verbose:
+            print(f"[KAG] ⚠ Enriquecimiento LCC/LCSH no disponible: {exc}")
+    return ficha
+
+
+def _index_document_analysis(
+    session, doc_id, doc_path, slice_text, verbose=True
+) -> dict:
+    """Fase 2: ficha documental + capítulos del documento (LLM grande).
+
+    Llama al LLM grande con la spec `kag_document_analysis` (esqueleto del
+    documento vía `_build_skeleton`) y persiste SIEMPRE:
+      - `kag_documents.ficha_jsonb` = el JSON completo del análisis (ficha +
+        capítulos + scope_thematic derivado).
+      - `kag_documents.sections_json` = los capítulos detectados.
+      - `kag_chapters` = una fila por capítulo (RETURNING id → UUID).
+
+    DECISIÓN DE DISEÑO: `line_start`/`line_end` de los capítulos son RELATIVOS
+    AL DOCUMENTO (slice), no al archivo — la Fase 3 segmentará el slice por
+    capítulo. Devuelve el dict {chapter_id_str: uuid} para las Fases 3/4/5.
+
+    Degradación crítica: si el LLM falla o devuelve JSON inválido, se persiste
+    una ficha con defaults (title, technical_level='intermediate',
+    thematic_areas=[], library_of_congress={}, bibtex='', key_entities=[]) y
+    UN capítulo único con todo el rango del documento (line_start=1,
+    line_end=total, has_images=False). El UPDATE de ficha_jsonb y el INSERT de
+    capítulos ocurren SIEMPRE.
+    """
+    total_lines = len(slice_text.splitlines())
+    title = _title_from_md(slice_text, doc_path)
+    try:
+        settings = load_settings(session)
+    except Exception:  # noqa: BLE001 — sesión falsa en tests
+        settings = None
+    retries = int(getattr(settings, "llm_retries", 3) or 3) if settings else 3
+    fallback = getattr(settings, "fallback_model", None) if settings else None
+    large_model = getattr(settings, "large_model", None) if settings else None
+    try:
+        source_file = str(Path(doc_path)).replace("\\", "/")
+        system, user_template = _get_prompt_pair(
+            session,
+            large_model,
+            TASK_DOCUMENT_ANALYSIS,
+            DOCUMENT_ANALYSIS_SYSTEM_SHORT,
+            DOCUMENT_ANALYSIS_USER_SHORT,
+        )
+        prompt = _fill_prompt(
+            user_template,
+            source_file=source_file,
+            document_id=str(doc_id),
+            skeleton=_build_skeleton(slice_text),
+        )
+        text_out, _model, _used_fallback = call_with_retries(
+            session,
+            prompt=prompt,
+            system=system,
+            model_size="large",
+            response_format={"type": "json_object"},
+            retries=retries,
+            fallback_model=fallback,
+        )
+        data = parse_llm_output(text_out)
+        ficha = data.get("ficha") if isinstance(data, dict) else None
+        chapters = data.get("chapters") if isinstance(data, dict) else None
+        if not isinstance(ficha, dict):
+            ficha = None
+        if not isinstance(chapters, list):
+            chapters = None
+    except Exception as exc:  # noqa: BLE001 — LLM no disponible: degradación
+        if verbose:
+            print(f"[KAG] ⚠ Análisis por LLM falló: {exc}")
+        ficha = None
+        chapters = None
+
+    # ── Ficha con defaults si el LLM falló ────────────────────────────────
+    if not ficha:
+        ficha = {
+            "title": title,
+            "technical_level": "intermediate",
+            "thematic_areas_iso25964": [],
+            "library_of_congress": {},
+            "bibtex": "",
+            "key_entities": [],
+        }
+    else:
+        ficha.setdefault("title", title)
+        ficha.setdefault("technical_level", "intermediate")
+        ficha.setdefault("thematic_areas_iso25964", [])
+        ficha.setdefault("library_of_congress", {})
+        ficha.setdefault("bibtex", "")
+        ficha.setdefault("key_entities", [])
+
+    # ── Capítulos: sanitizar rangos y clamp al slice ───────────────────────
+    if not chapters:
+        chapters = [
+            {
+                "chapter_id": "",
+                "title": title,
+                "line_start": 1,
+                "line_end": total_lines,
+                "has_images": False,
+            }
+        ]
+    seen_ids = set()
+    clean_chapters = []
+    for ch in chapters:
+        if not isinstance(ch, dict):
+            continue
+        try:
+            ls = int(ch.get("line_start") or 1)
+            le = int(ch.get("line_end") or total_lines)
+        except (TypeError, ValueError):
+            ls, le = 1, total_lines
+        if ls > le:
+            ls, le = le, ls
+        ls = max(1, min(ls, total_lines))
+        le = max(1, min(le, total_lines))
+        cid = str(ch.get("chapter_id") or "").strip()
+        if cid in seen_ids:
+            base = cid or "cap"
+            n = 2
+            while f"{base}_{n}" in seen_ids:
+                n += 1
+            cid = f"{base}_{n}"
+        seen_ids.add(cid)
+        clean_chapters.append(
+            {
+                "chapter_id": cid,
+                "title": sanitize_text(str(ch.get("title") or ""))[:300] or title,
+                "line_start": ls,
+                "line_end": le,
+                "has_images": bool(ch.get("has_images")),
+            }
+        )
+    if not clean_chapters:
+        clean_chapters = [
+            {
+                "chapter_id": "",
+                "title": title,
+                "line_start": 1,
+                "line_end": total_lines,
+                "has_images": False,
+            }
+        ]
+
+    # ── Enriquecimiento best-effort (LCC/LCSH) + scope_thematic ────────────
+    ficha = _enrich_library_of_congress(ficha, verbose=verbose)
+    ficha["scope_thematic"] = _scope_thematic_from_thematic(ficha)
+
+    # ── Persistir SIEMPRE: ficha_jsonb + sections_json + kag_chapters ─────
+    sections = [
+        {
+            "chapter_id": ch["chapter_id"],
+            "title": ch["title"],
+            "line_start": ch["line_start"],
+            "line_end": ch["line_end"],
+            "has_images": ch["has_images"],
+        }
+        for ch in clean_chapters
+    ]
+    session.execute(
+        text(
+            "UPDATE kag_documents SET ficha_jsonb = :ficha, sections_json = :sections "
+            "WHERE id = :doc_id"
+        ),
+        {
+            "ficha": json.dumps(ficha, ensure_ascii=False),
+            "sections": json.dumps(sections, ensure_ascii=False),
+            "doc_id": doc_id,
+        },
+    )
+    chapter_map: dict[str, str] = {}
+    for ch in clean_chapters:
+        row = session.execute(
+            text(
+                "INSERT INTO kag_chapters "
+                "(doc_id, chapter_id, title, line_start, line_end, has_images) "
+                "VALUES (:doc_id, :chapter_id, :title, :line_start, :line_end, "
+                ":has_images) RETURNING id"
+            ),
+            {
+                "doc_id": doc_id,
+                "chapter_id": ch["chapter_id"],
+                "title": ch["title"],
+                "line_start": ch["line_start"],
+                "line_end": ch["line_end"],
+                "has_images": ch["has_images"],
+            },
+        ).scalar()
+        chapter_map[ch["chapter_id"]] = str(row)
+    if verbose:
+        print(
+            f"[KAG] 📑 {doc_path}: {len(clean_chapters)} capítulo(s) "
+            f"y ficha documental persistidos."
+        )
+    return chapter_map
+
+
 def _find_caption(md_text: str, image_name: str) -> str:
     """Busca el alt text de `![alt](...image_name...)` en el markdown."""
     m = re.search(rf"!\[([^\]]*)\]\([^)]*{re.escape(image_name)}[^)]*\)", md_text)
@@ -1511,46 +2372,90 @@ def _find_chunk_for_image(session, doc_id, image_name):
     return row.id if row else None
 
 
-def _index_figures(session, doc_id, md_path, md_text, verbose=True) -> int:
-    """Indexa las figuras de images/[docname]/ si la carpeta existe.
+def _index_figures(
+    session, doc_id, md_path, slice_text, doc_line_start, verbose=True
+) -> int:
+    """Indexa las figuras del documento con visión condicional + FAQ Reverse HyDE.
 
-    Las figuras de un documento son independientes: se recolectan primero
-    (sin llamar al VLM) y se despachan en paralelo con ThreadPoolExecutor
-    (KAG_FIGURE_PARALLEL, default 3 hilos). La lectura base64 + complete_vision
-    no tienen dependencias entre sí. El INSERT se hace en orden determinista
-    (sorted por nombre de archivo). Si el pool falla, se degrada a secuencial
-    — nunca romper.
+    La visión SOLO se llama si al menos un capítulo del documento tiene
+    `has_images=True` (decisión del usuario): se leen los capítulos de
+    kag_chapters y si ninguno tiene imágenes, se salta (return 0).
+
+    Las imágenes se extraen con `MarkdownImageExtractorTool` (import perezoso)
+    sobre el rango físico del documento en el archivo (doc_line_start..
+    doc_line_end). Para cada imagen que existe en disco:
+      - contexto circundante ±15 líneas del slice (chunk que la referencia por
+        substring, como `_find_chunk_for_image`),
+      - data URL base64 + `complete_vision` con prompt que pide JSON
+        (image_type, dense_visual_description, epistemic_contribution,
+        faq_indexing [3-5 preguntas Reverse HyDE], associated_entities),
+      - INSERT en kag_figures con todos los campos (migración 0030).
+
+    Las imágenes son independientes → ThreadPoolExecutor (max_workers 3,
+    semáforo) como el `_index_figures` clásico; el INSERT se hace en orden
+    determinista (sorted por anchor_line). Si el pool falla → secuencial
+    (nunca romper). Degradación por imagen: description='' y faq_indexing=[]
+    si el VLM falla o el JSON es inválido.
     """
-    docname = md_path.stem
-    images_dir = IMAGES_DIR / docname
-    if not images_dir.exists():
+    # 0. Visión condicional: solo si algún capítulo tiene has_images.
+    chapters = session.execute(
+        text(
+            "SELECT id, chapter_id, line_start, line_end, has_images "
+            "FROM kag_chapters WHERE doc_id = :id ORDER BY line_start"
+        ),
+        {"id": doc_id},
+    ).fetchall()
+    if not any(getattr(ch, "has_images", False) for ch in chapters):
+        if verbose:
+            print(
+                f"[KAG] ⏭ {md_path.name}: ningún capítulo con imágenes — "
+                "visión omitida."
+            )
         return 0
-    # 1. Recolectar TODAS las figuras sin llamar al VLM (caption/chunk_id son
-    #    baratos y dependen de la sesión — se hacen en el hilo principal).
-    figures = []
-    for img in sorted(images_dir.iterdir()):
-        if img.suffix.lower() not in (".jpg", ".jpeg", ".png"):
-            continue
-        figures.append(
-            {
-                "img": img,
-                "caption": _find_caption(md_text, img.name),
-                "chunk_id": _find_chunk_for_image(session, doc_id, img.name),
-            }
+
+    # 1. Extraer imágenes del rango físico del documento en el archivo.
+    try:
+        from src.kag.tools import MarkdownImageExtractorTool
+
+        doc_line_end = doc_line_start + len(slice_text.splitlines()) - 1
+        extracted = MarkdownImageExtractorTool().extract_images_from_document(
+            str(md_path), str(doc_id), doc_line_start, doc_line_end
         )
+    except Exception as exc:  # noqa: BLE001 — degradación natural
+        if verbose:
+            print(f"[KAG] ⚠ Extracción de imágenes falló: {exc}")
+        return 0
+    figures = [
+        {
+            "image_path": f.get("file_path"),
+            "anchor_line": int(f.get("anchor_line") or 0),
+            "caption": sanitize_text(str(f.get("caption") or "")),
+        }
+        for f in extracted
+        if f.get("exists_on_disk") and f.get("file_path")
+    ]
     if not figures:
         return 0
-    # 2. Despachar describe_figure en paralelo (VLM). Orden determinista:
-    #    results[i] corresponde a figures[i] (sorted por nombre).
+    # Orden determinista por anchor_line (línea física del archivo).
+    figures.sort(key=lambda f: f["anchor_line"])
+
+    # 2. Despachar la visión en paralelo (VLM). results[i] ↔ figures[i].
     config = resolve_config(session)
     max_workers = int(get_config_value(config, "KAG_FIGURE_PARALLEL", 3) or 3)
     if max_workers < 1:
         max_workers = 3
-    results: list[str] = [""] * len(figures)
+    results: list[dict] = [{}] * len(figures)
     try:
         with ThreadPoolExecutor(max_workers=min(max_workers, len(figures))) as ex:
             futures = [
-                ex.submit(describe_figure, session, str(f["img"]), f["caption"])
+                ex.submit(
+                    _describe_figure_vision,
+                    session,
+                    f,
+                    slice_text,
+                    doc_line_start,
+                    verbose,
+                )
                 for f in figures
             ]
             for i, fut in enumerate(futures):
@@ -1559,29 +2464,126 @@ def _index_figures(session, doc_id, md_path, md_text, verbose=True) -> int:
         if verbose:
             print(f"[KAG] ⚠ Pool de figuras falló ({exc}) — secuencial.")
         results = [
-            describe_figure(session, str(f["img"]), f["caption"]) for f in figures
+            _describe_figure_vision(session, f, slice_text, doc_line_start, verbose)
+            for f in figures
         ]
-    # 3. INSERT por figura en orden determinista (como antes).
+
+    # 3. INSERT por figura en orden determinista (sorted por anchor_line).
     count = 0
-    for f, description in zip(figures, results):
+    for f, vision in zip(figures, results):
+        vision = vision or {}
         session.execute(
             text(
                 "INSERT INTO kag_figures "
-                "(doc_id, chunk_id, image_path, caption, description) "
-                "VALUES (:doc_id, :chunk_id, :image_path, :caption, :description)"
+                "(doc_id, chunk_id, image_path, caption, description, image_type, "
+                "dense_visual_description, epistemic_contribution, faq_indexing, "
+                "associated_entities, anchor_line) "
+                "VALUES (:doc_id, :chunk_id, :image_path, :caption, :description, "
+                ":image_type, :dense_visual_description, :epistemic_contribution, "
+                ":faq_indexing, :associated_entities, :anchor_line)"
             ),
             {
                 "doc_id": doc_id,
-                "chunk_id": f["chunk_id"],
-                "image_path": f"images/{docname}/{f['img'].name}",
+                "chunk_id": _find_chunk_for_image(session, doc_id, f["image_path"]),
+                "image_path": f["image_path"],
                 "caption": f["caption"],
-                "description": sanitize_text(description),
+                "description": sanitize_text(
+                    str(vision.get("dense_visual_description") or "")
+                ),
+                "image_type": sanitize_text(str(vision.get("image_type") or ""))[:50],
+                "dense_visual_description": sanitize_text(
+                    str(vision.get("dense_visual_description") or "")
+                ),
+                "epistemic_contribution": sanitize_text(
+                    str(vision.get("epistemic_contribution") or "")
+                ),
+                "faq_indexing": json.dumps(
+                    vision.get("faq_indexing") or [], ensure_ascii=False
+                ),
+                "associated_entities": json.dumps(
+                    vision.get("associated_entities") or [], ensure_ascii=False
+                ),
+                "anchor_line": f["anchor_line"],
             },
         )
         count += 1
     if verbose and count:
-        print(f"[KAG] 🖼 {count} figuras indexadas para {docname}.")
+        print(f"[KAG] 🖼 {count} figuras indexadas para {md_path.name}.")
     return count
+
+
+def _describe_figure_vision(
+    session, figure: dict, slice_text: str, doc_line_start: int, verbose: bool
+) -> dict:
+    """Describe UNA figura con el VLM (JSON estructurado + FAQ Reverse HyDE).
+
+    Prompt con contexto circundante ±15 líneas del slice (el chunk que
+    referencia la imagen por substring). `anchor_line` de la figura es la línea
+    del ARCHIVO; `doc_line_start` es la primera línea del documento en el
+    archivo, así el contexto se calcula relativo al slice. Pide JSON:
+    image_type, dense_visual_description, epistemic_contribution,
+    faq_indexing (3-5 preguntas Reverse HyDE), associated_entities.
+    Degradación: devuelve {} (description='' y faq_indexing=[] en el INSERT)
+    si el VLM falla o el JSON es inválido — nunca romper.
+    """
+    image_path = figure.get("image_path") or ""
+    try:
+        mime = "image/png" if str(image_path).lower().endswith(".png") else "image/jpeg"
+        with open(image_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+        data_url = f"data:{mime};base64,{b64}"
+        # Contexto circundante ±15 líneas del slice: la línea del archivo se
+        # convierte a índice relativo del slice restando doc_line_start.
+        context = ""
+        anchor = int(figure.get("anchor_line") or 0)
+        if anchor > 0:
+            lines = slice_text.splitlines()
+            rel = anchor - doc_line_start  # 0-based en el slice
+            start = max(0, rel - 15)
+            end = min(len(lines), rel + 15)
+            context = "\n".join(lines[start:end])
+        caption = figure.get("caption") or ""
+        prompt = (
+            "Analiza esta figura de un documento académico y devuelve JSON estricto "
+            "con este schema: "
+            '{"image_type": "diagram|chart_or_plot|flowchart|conceptual_illustration|'
+            'screenshot|table_image|photograph", "dense_visual_description": str, '
+            '"epistemic_contribution": str, "faq_indexing": [str], '
+            '"associated_entities": [str]}. '
+            "image_type: clasifica la figura en UNA de las categorías. "
+            "dense_visual_description: transcripción EXACTA de lo que se ve "
+            "(ejes, leyendas, flujos, valores, relaciones espaciales) — sin "
+            "interpretar. epistemic_contribution: qué aporta la figura al "
+            "conocimiento del documento que el texto no dice. faq_indexing: "
+            "3-5 preguntas que esta figura puede responder (Reverse HyDE, para "
+            "recuperación por pregunta). associated_entities: entidades que "
+            "aparecen en la figura."
+        )
+        if caption:
+            prompt += f" Caption: {caption}"
+        if context:
+            prompt += f"\n\nContexto circundante:\n{context}"
+        text_out = complete_vision(session, prompt, image_url=data_url)
+        data = parse_llm_output(text_out)
+        if not isinstance(data, dict):
+            return {}
+        faq = data.get("faq_indexing") or []
+        if not isinstance(faq, list):
+            faq = []
+        entities = data.get("associated_entities") or []
+        if not isinstance(entities, list):
+            entities = []
+        return {
+            "image_type": str(data.get("image_type") or ""),
+            "dense_visual_description": str(data.get("dense_visual_description") or ""),
+            "epistemic_contribution": str(data.get("epistemic_contribution") or ""),
+            "faq_indexing": [str(q) for q in faq if str(q).strip()][:5],
+            "associated_entities": [str(e) for e in entities if str(e).strip()],
+        }
+    except Exception as exc:  # noqa: BLE001 — degradación no bloqueante
+        if verbose:
+            print(f"[KAG] ⚠ VLM no disponible para {image_path}: {exc}")
+        return {}
 
 
 # ---------------------------------------------------------------------
@@ -1597,6 +2599,182 @@ def _title_from_md(text: str, doc_path: str) -> str:
     return sanitize_text(Path(doc_path).stem)[:300]
 
 
+def _build_skeleton(md_text: str, max_chars: int = 2000) -> str:
+    """Esqueleto del archivo: primeras ~2000 chars + encabezados H1/H2/H3.
+
+    Cada encabezado se lista con su número de línea REAL (1-based) en el
+    archivo fuente — es la pista estructural que usa el LLM para delimitar
+    los documentos apilados.
+    """
+    head = md_text[:max_chars]
+    headers = []
+    for i, line in enumerate(md_text.splitlines(), 1):
+        if re.match(r"^#{1,3}\s+", line):
+            headers.append(f"L{i}: {line.strip()}")
+    parts = [head]
+    if headers:
+        parts.append("Encabezados (H1/H2/H3) con número de línea:")
+        parts.extend(headers)
+    return "\n".join(parts)
+
+
+def _index_document_separation(session, md_path, md_text, verbose=True) -> list[dict]:
+    """Fase 1: separa el archivo en los documentos (libros/papers) apilados.
+
+    Devuelve SIEMPRE ≥1 documento: [{document_id, title, line_start, line_end,
+    language}]. Degradación natural (nunca romper):
+      1. LLM grande con la spec kag_document_separation (esqueleto + pistas
+         del MultibookFinderTool si detecta ≥2 documentos).
+      2. Si el LLM falla o el JSON es inválido → MultibookFinderTool.
+      3. Si tampoco → un solo documento con el archivo completo
+         (document_id="", comportamiento clásico).
+    """
+    md_path = Path(md_path)
+    total_lines = len(md_text.splitlines())
+    lang = detect_language(md_text)
+    try:
+        source_file = str(md_path.relative_to(DOCS_DIR)).replace("\\", "/")
+    except ValueError:
+        source_file = md_path.name
+
+    # Pistas del MultibookFinderTool (detección física por ISBN/separadores).
+    hints = []
+    try:
+        from src.kag.tools import MultibookFinderTool
+
+        found = MultibookFinderTool().execute(str(md_path))
+        if len(found) >= 2:
+            hints = found
+    except Exception as exc:  # noqa: BLE001 — degradación natural
+        if verbose:
+            print(f"[KAG] ⚠ MultibookFinderTool no disponible: {exc}")
+
+    prompt_extra = ""
+    if hints:
+        lines_hint = "\n".join(
+            f"- {h.get('title', '?')}: líneas {h.get('line_start')}-{h.get('line_end')}"
+            for h in hints
+        )
+        prompt_extra = (
+            "\n\nPistas de límites físicos detectados (MultibookFinderTool):\n"
+            + lines_hint
+        )
+
+    # LLM grande con la spec kag_document_separation.
+    documents = None
+    try:
+        try:
+            settings = load_settings(session)
+        except Exception:  # noqa: BLE001 — sesión falsa en tests
+            settings = None
+        retries = int(getattr(settings, "llm_retries", 3) or 3) if settings else 3
+        fallback = getattr(settings, "fallback_model", None) if settings else None
+        large_model = getattr(settings, "large_model", None) if settings else None
+        system, user_template = _get_prompt_pair(
+            session,
+            large_model,
+            TASK_DOCUMENT_SEPARATION,
+            DOCUMENT_SEPARATION_SYSTEM_SHORT,
+            DOCUMENT_SEPARATION_USER_SHORT,
+        )
+        prompt = _fill_prompt(
+            user_template,
+            source_file=source_file,
+            skeleton=_build_skeleton(md_text) + prompt_extra,
+        )
+        text_out, _model, _used_fallback = call_with_retries(
+            session,
+            prompt=prompt,
+            system=system,
+            model_size="large",
+            response_format={"type": "json_object"},
+            retries=retries,
+            fallback_model=fallback,
+        )
+        data = parse_llm_output(text_out)
+        raw = data.get("documents") if isinstance(data, dict) else None
+        if isinstance(raw, list) and raw:
+            documents = raw
+    except Exception as exc:  # noqa: BLE001 — LLM no disponible: degradación
+        if verbose:
+            print(f"[KAG] ⚠ Separación por LLM falló: {exc}")
+
+    # Sanitización de rangos (swap si line_start > line_end, clamp al archivo).
+    if documents:
+        out = []
+        seen_ids = set()
+        for d in documents:
+            if not isinstance(d, dict):
+                continue
+            try:
+                ls = int(d.get("line_start") or 1)
+                le = int(d.get("line_end") or total_lines)
+            except (TypeError, ValueError):
+                ls, le = 1, total_lines
+            if ls > le:
+                ls, le = le, ls
+            ls = max(1, min(ls, total_lines))
+            le = max(1, min(le, total_lines))
+            did = str(d.get("document_id") or "")
+            if did in seen_ids:
+                # Evitar violación del UNIQUE (doc_path, document_id) si el LLM
+                # repite ids: sufijo numérico determinista.
+                base = did or "doc"
+                n = 2
+                while f"{base}_{n}" in seen_ids:
+                    n += 1
+                did = f"{base}_{n}"
+            seen_ids.add(did)
+            out.append(
+                {
+                    "document_id": did,
+                    "title": (
+                        sanitize_text(str(d.get("title") or ""))[:300]
+                        or _title_from_md(md_text, source_file)
+                    ),
+                    "line_start": ls,
+                    "line_end": le,
+                    "language": str(d.get("language") or lang) or lang,
+                }
+            )
+        if out:
+            return out
+
+    # Degradación: MultibookFinderTool (detección física, sin LLM).
+    if hints:
+        out = []
+        for h in hints:
+            ls = max(1, int(h.get("line_start") or 1))
+            le = min(total_lines, int(h.get("line_end") or total_lines))
+            if ls > le:
+                ls, le = le, ls
+            out.append(
+                {
+                    "document_id": str(h.get("document_id") or ""),
+                    "title": (
+                        sanitize_text(str(h.get("title") or ""))[:300]
+                        or _title_from_md(md_text, source_file)
+                    ),
+                    "line_start": ls,
+                    "line_end": le,
+                    "language": lang,
+                }
+            )
+        if out:
+            return out
+
+    # Degradación final: un solo documento con el archivo completo.
+    return [
+        {
+            "document_id": "",
+            "title": _title_from_md(md_text, source_file),
+            "line_start": 1,
+            "line_end": total_lines,
+            "language": lang,
+        }
+    ]
+
+
 def index_document(
     session,
     md_path,
@@ -1606,9 +2784,12 @@ def index_document(
     llm_entities=False,
     extract_propositions=True,
 ):
-    """Indexa un documento .md en el KAG (flujo §2.3 del diseño).
+    """Indexa un archivo .md en el KAG (flujo §2.3 del diseño).
 
-    Idempotente por content_hash; --force re-indexa. Devuelve dict resumen.
+    Fase 1: separa el archivo en los documentos apilados (libros, papers,
+    artículos) y indexa CADA documento como UNA fila de kag_documents
+    (idempotente por (doc_path, document_id) + content_hash del slice;
+    --force re-indexa). Devuelve dict resumen AGREGADO del archivo.
 
     Atomicidad POR ETAPA (máquina de estados, src/kag/stages.py):
       pending -> segmented -> chunked -> figures -> ready
@@ -1623,8 +2804,9 @@ def index_document(
     `extract_propositions=True` (default) extrae y persiste proposiciones
     atómicas en `kag_propositions` (capa micro, migración 0024). La
     extracción es un paso APARTE del chunking (etapa 'chunked', sobre TODOS
-    los chunks ya persistidos): agrupación doc→capítulo (section_path ya
-    detectado; capítulos >30k tokens = grupo propio, el resto a nivel de
+    los chunks ya persistidos): agrupación doc→capítulo (chapter_id
+    detectado por LLM, Fase 2; por ahora NULL → un único grupo a nivel de
+    documento; capítulos >30k tokens = grupo propio, el resto a nivel de
     archivo), batching por tokens (KAG_PROPOSITION_BATCH_SIZE, default 400k)
     con UNA llamada LLM por lote, llamadas en paralelo (semáforo,
     KAG_PROPOSITION_PARALLEL) y cache por content_hash (0026) — los chunks
@@ -1645,20 +2827,121 @@ def index_document(
     # text() de SQLAlchemy — un bug previo rompía la ingesta con
     # "'str' object is not callable" en el primer SELECT.
     md_text = sanitize_text(md_path.read_text(encoding="utf-8"))
-    content_hash = hashlib.sha256(md_text.encode("utf-8")).hexdigest()
-    token_estimate = estimate_tokens(md_text)
-    doc_type = "long" if token_estimate >= LONG_DOC_THRESHOLD else "short"
+    # Hash del ARCHIVO completo: el slice de un documento único (document_id="")
+    # que cubre todo el archivo coincide con md_text, así que su content_hash
+    # ES este hash (se evita re-hashear el slice completo).
+    file_hash = hashlib.sha256(md_text.encode("utf-8")).hexdigest()
+
+    # ── Fase 1: separación del archivo en documentos ────────────────────────
+    doc_specs = _index_document_separation(session, md_path, md_text, verbose)
+    if not doc_specs:  # defensivo: la separación SIEMPRE devuelve ≥1
+        doc_specs = [
+            {
+                "document_id": "",
+                "title": _title_from_md(md_text, doc_path),
+                "line_start": 1,
+                "line_end": len(md_text.splitlines()),
+                "language": detect_language(md_text),
+            }
+        ]
+
+    results = []
+    for spec in doc_specs:
+        results.append(
+            _index_document_slice(
+                session,
+                md_path,
+                doc_path,
+                md_text,
+                file_hash,
+                spec,
+                force=force,
+                no_summary=no_summary,
+                verbose=verbose,
+                llm_entities=llm_entities,
+                extract_propositions=extract_propositions,
+                prop_batch_size=prop_batch_size,
+                prop_model_size=prop_model_size,
+                prop_max_parallel=prop_max_parallel,
+            )
+        )
+
+    indexed = sum(1 for r in results if r.get("status") == "indexed")
+    skipped = sum(1 for r in results if r.get("status") == "skipped")
+    if verbose:
+        print(
+            f"[KAG] 📚 {doc_path}: {len(doc_specs)} documento(s) — "
+            f"{indexed} indexado(s), {skipped} omitido(s)."
+        )
+    return {
+        "status": (
+            "indexed" if indexed else (results[0]["status"] if results else "skipped")
+        ),
+        "doc_path": doc_path,
+        "document_count": len(doc_specs),
+        "chunk_count": sum(r.get("chunk_count", 0) for r in results),
+        "entity_count": sum(r.get("entity_count", 0) for r in results),
+        "relation_count": sum(r.get("relation_count", 0) for r in results),
+        "figure_count": sum(r.get("figure_count", 0) for r in results),
+    }
+
+
+def _index_document_slice(
+    session,
+    md_path,
+    doc_path,
+    md_text,
+    file_hash,
+    spec,
+    force=False,
+    no_summary=False,
+    verbose=True,
+    llm_entities=False,
+    extract_propositions=True,
+    prop_batch_size=400000,
+    prop_model_size="large",
+    prop_max_parallel=3,
+):
+    """Indexa UN documento (slice del archivo) en el KAG (flujo §2.3).
+
+    Idempotente por (doc_path, document_id) + content_hash del slice;
+    --force re-indexa. Devuelve dict resumen del documento.
+    """
+    document_id = str(spec.get("document_id") or "")
+    total_lines = len(md_text.splitlines())
+    line_start = int(spec.get("line_start") or 1)
+    line_end = int(spec.get("line_end") or total_lines)
+    if line_start > line_end:
+        line_start, line_end = line_end, line_start
+    line_start = max(1, min(line_start, total_lines))
+    line_end = max(1, min(line_end, total_lines))
+
+    # Slice del archivo para este documento. Un documento único (document_id="")
+    # que cubre todo el archivo usa md_text completo (y su hash = file_hash).
+    if document_id == "" and line_start == 1 and line_end >= total_lines:
+        slice_text = md_text
+        slice_hash = file_hash
+    else:
+        slice_text = "\n".join(md_text.splitlines()[line_start - 1 : line_end])
+        slice_hash = hashlib.sha256(slice_text.encode("utf-8")).hexdigest()
+    slice_tokens = estimate_tokens(slice_text)
+    doc_type = "long" if slice_tokens >= LONG_DOC_THRESHOLD else "short"
+    lang = detect_language(slice_text)
+    title = sanitize_text(str(spec.get("title") or ""))[:300] or _title_from_md(
+        slice_text, doc_path
+    )
+    label = f"{doc_path} [{document_id}]" if document_id else doc_path
 
     existing = session.execute(
         text(
             "SELECT id, content_hash, status, stage FROM kag_documents "
-            "WHERE doc_path = :p"
+            "WHERE doc_path = :p AND document_id = :d"
         ),
-        {"p": doc_path},
+        {"p": doc_path, "d": document_id},
     ).first()
 
     # ── Idempotencia / reanudación ─────────────────────────────────────────
-    if existing and existing.content_hash == content_hash and not force:
+    if existing and existing.content_hash == slice_hash and not force:
         if existing.status == "ready":
             null_emb = session.execute(
                 text(
@@ -1669,13 +2952,13 @@ def index_document(
             ).scalar()
             if null_emb == 0:
                 if verbose:
-                    print(f"[KAG] ⏭ {doc_path} ya indexado (hash idéntico).")
+                    print(f"[KAG] ⏭ {label} ya indexado (hash idéntico).")
                 return {"status": "skipped", "doc_path": doc_path}
             # ready pero con embeddings incompletos → re-embeder solo los que
             # faltan (sin re-segmentar ni re-extraer entidades).
             if verbose:
                 print(
-                    f"[KAG] ♻ {doc_path} ready pero {null_emb} chunks sin "
+                    f"[KAG] ♻ {label} ready pero {null_emb} chunks sin "
                     "embedding — re-embebiendo..."
                 )
             rows = session.execute(
@@ -1709,7 +2992,7 @@ def index_document(
         resume = resume_from(KAG_INGEST_STAGES, existing.stage or "pending")
         if verbose:
             print(
-                f"[KAG] ♻ {doc_path} en stage '{existing.stage}' — reanudando "
+                f"[KAG] ♻ {label} en stage '{existing.stage}' — reanudando "
                 f"desde '{resume}'..."
             )
     else:
@@ -1721,10 +3004,6 @@ def index_document(
             session.commit()
         resume = "pending"
 
-    title = _title_from_md(md_text, doc_path)
-    # lang se calcula UNA vez: lo necesitan el INSERT (columna language), la
-    # segmentación y la extracción determinista de entidades (nlp).
-    lang = detect_language(md_text)
     doc_id = None
     try:
         if resume == "pending":
@@ -1734,17 +3013,21 @@ def index_document(
             doc_id = session.execute(
                 text(
                     "INSERT INTO kag_documents "
-                    "(doc_path, title, doc_type, status, content_hash, token_estimate, "
-                    "stage, language) "
-                    "VALUES (:doc_path, :title, :doc_type, 'pending', :content_hash, "
-                    ":token_estimate, 'pending', :language) RETURNING id"
+                    "(doc_path, document_id, line_start, line_end, title, doc_type, "
+                    "status, content_hash, token_estimate, stage, language) "
+                    "VALUES (:doc_path, :document_id, :line_start, :line_end, :title, "
+                    ":doc_type, 'pending', :content_hash, :token_estimate, 'pending', "
+                    ":language) RETURNING id"
                 ),
                 {
                     "doc_path": doc_path,
+                    "document_id": document_id,
+                    "line_start": line_start,
+                    "line_end": line_end,
                     "title": title,
                     "doc_type": doc_type,
-                    "content_hash": content_hash,
-                    "token_estimate": token_estimate,
+                    "content_hash": slice_hash,
+                    "token_estimate": slice_tokens,
                     "language": lang,
                 },
             ).scalar()
@@ -1752,15 +3035,26 @@ def index_document(
         else:
             doc_id = existing.id
 
+        # ── Etapa: analysis (ficha documental + capítulos, Fase 2) ─────────
+        # El LLM grande detecta la ficha ISO 25964 y los capítulos del
+        # documento; se persisten en kag_documents.ficha_jsonb/sections_json y
+        # kag_chapters. Los capítulos los usan las Fases 3/4/5.
+        if resume in ("pending", "analysis"):
+            if resume == "analysis":
+                # Re-ejecutar la etapa: limpiar capítulos y ficha previos.
+                cleanup_stage(session, "kag_documents", doc_id, "analysis")
+            _index_document_analysis(session, doc_id, doc_path, slice_text, verbose)
+            set_stage(session, "kag_documents", doc_id, "analysis")
+
         # ── Etapa: segmented (segmentación + chunks sin embedding) ──────────
         # La segmentación es la etapa LENTA (torch/spacy). Se persisten los
         # chunks con embedding NULL ANTES de embeker: si se interrumpe aquí,
         # al reanudar NO se re-segmenta.
         if verbose:
             print(
-                f"[KAG] 📄 {doc_path} | {doc_type} | ~{token_estimate} tokens | idioma {lang}"
+                f"[KAG] 📄 {label} | {doc_type} | ~{slice_tokens} tokens | idioma {lang}"
             )
-        if resume in ("pending", "segmented"):
+        if resume in ("pending", "analysis", "segmented"):
             if resume == "segmented":
                 # Re-ejecutar la etapa: limpiar chunks parciales primero.
                 cleanup_stage(session, "kag_documents", doc_id, "segmented")
@@ -1770,12 +3064,34 @@ def index_document(
             # Coref Stanza: docs cortos lo usan (costo acotado); book stacks lo
             # omiten (prohibitivo: ~11s por segmento).
             use_coref = doc_type == "short"
+            # Fase 3: segmentar DENTRO de cada capítulo (kag_chapters, Fase 2).
+            # Los capítulos se leen con líneas RELATIVAS al slice (1-based). Si
+            # no hay capítulos (degradación de A3), chapters=None → el
+            # comportamiento clásico (chapter_id=None).
+            capitulos = None
+            chapter_rows = session.execute(
+                text(
+                    "SELECT id, chapter_id, line_start, line_end FROM kag_chapters "
+                    "WHERE doc_id = :id ORDER BY line_start"
+                ),
+                {"id": doc_id},
+            ).fetchall()
+            if chapter_rows:
+                capitulos = [
+                    {
+                        "chapter_id": str(r.id),
+                        "line_start": r.line_start,
+                        "line_end": r.line_end,
+                    }
+                    for r in chapter_rows
+                ]
             chunks = chunk_markdown(
-                md_text,
+                slice_text,
                 doc_type,
                 segmenter,
                 max_tokens=CHUNK_MAX_TOKENS,
                 use_coref=use_coref,
+                chapters=capitulos,
             )
 
             chunk_count = 0
@@ -1783,14 +3099,14 @@ def index_document(
                 session.execute(
                     text(
                         "INSERT INTO kag_chunks "
-                        "(doc_id, chunk_index, section_path, content, token_estimate, "
+                        "(doc_id, chunk_index, chapter_id, content, token_estimate, "
                         "content_hash, embedding) VALUES (:doc_id, :chunk_index, "
-                        ":section_path, :content, :token_estimate, :content_hash, NULL) "
+                        ":chapter_id, :content, :token_estimate, :content_hash, NULL) "
                     ),
                     {
                         "doc_id": doc_id,
                         "chunk_index": i,
-                        "section_path": chunk["section_path"],
+                        "chapter_id": chunk.get("chapter_id"),
                         "content": chunk["content"],
                         "token_estimate": chunk["token_estimate"],
                         "content_hash": _chunk_content_hash(chunk["content"]),
@@ -1800,10 +3116,21 @@ def index_document(
             _maintain_word_freq(session, doc_id)
             set_stage(session, "kag_documents", doc_id, "segmented")
             if verbose:
-                print(f"[KAG] ✂ {doc_path}: {chunk_count} chunks segmentados.")
+                print(f"[KAG] ✂ {label}: {chunk_count} chunks segmentados.")
+
+        # ── Etapa: paraphrased (paráfrasis de chunks, Fase 4) ───────────────
+        # Una llamada LLM grande por capítulo (grupo de chunks); los chunks
+        # sin paraphrase (LLM falló o no los devolvió) quedan NULL y la
+        # ingesta sigue (degradación natural).
+        if resume in ("pending", "analysis", "segmented", "paraphrased"):
+            if resume == "paraphrased":
+                # Re-ejecutar la etapa: limpiar paráfrasis parciales primero.
+                cleanup_stage(session, "kag_documents", doc_id, "paraphrased")
+            _paraphrase_chunks(session, doc_id, doc_path, verbose)
+            set_stage(session, "kag_documents", doc_id, "paraphrased")
 
         # ── Etapa: chunked (embeddings + entidades + relaciones) ────────────
-        if resume in ("pending", "segmented", "chunked"):
+        if resume in ("pending", "analysis", "segmented", "paraphrased", "chunked"):
             if resume == "chunked":
                 cleanup_stage(session, "kag_documents", doc_id, "chunked")
             # Import perezoso: src.embeddings importa src.db.session (que lee
@@ -1833,7 +3160,7 @@ def index_document(
             entity_n_process = max(entity_n_process, 1)
             chunk_rows = session.execute(
                 text(
-                    "SELECT id, content, chunk_index, section_path FROM kag_chunks "
+                    "SELECT id, content, chunk_index, chapter_id FROM kag_chunks "
                     "WHERE doc_id = :id ORDER BY chunk_index"
                 ),
                 {"id": doc_id},
@@ -1893,14 +3220,16 @@ def index_document(
                     _store_entities_relations(
                         session, doc_id, row.id, data, embed_fn=embed_texts
                     )
-            # ── Paso APARTE del chunking: proposiciones atómicas ──────────
+            # ── Paso APARTE del chunking: proposiciones + entidades por
+            # documento (Fase 5) ────────────────────────────────────────────
             # Opera sobre TODOS los chunks ya persistidos (no chunk por chunk
-            # en el bucle de embeddings). Batching por tokens
-            # (KAG_PROPOSITION_BATCH_SIZE, default 250k) con UNA llamada LLM
-            # por lote + cache por content_hash (0026): los chunks ya
-            # extraídos con hash idéntico se saltan en re-ingestas.
+            # en el bucle de embeddings). Toma las paráfrasis de la Fase 4
+            # (paraphrase or content si NULL) y las agrupa por documento en
+            # lotes por tokens (KAG_PROPOSITION_BATCH_SIZE, default 400k) con
+            # UNA llamada LLM por lote + cache por content_hash (0026): los
+            # chunks ya extraídos con hash idéntico se saltan en re-ingestas.
             if extract_propositions:
-                _extract_propositions_for_doc(
+                _extract_document_propositions(
                     session,
                     doc_id,
                     doc_path,
@@ -1922,16 +3251,33 @@ def index_document(
         ).scalar()
 
         # ── Etapa: figures ──────────────────────────────────────────────────
-        if resume in ("pending", "segmented", "chunked", "figures"):
+        if resume in (
+            "pending",
+            "analysis",
+            "segmented",
+            "paraphrased",
+            "chunked",
+            "figures",
+        ):
             if resume == "figures":
                 cleanup_stage(session, "kag_documents", doc_id, "figures")
             if verbose:
                 print(f"[KAG] 🖼 figures: indexando figuras de {md_path.name}...")
-            figure_count = _index_figures(session, doc_id, md_path, md_text, verbose)
+            figure_count = _index_figures(
+                session, doc_id, md_path, slice_text, line_start, verbose
+            )
             set_stage(session, "kag_documents", doc_id, "figures")
 
         # ── Etapa: ready (resumen + cierre) ─────────────────────────────────
-        if resume in ("pending", "segmented", "chunked", "figures", "ready"):
+        if resume in (
+            "pending",
+            "analysis",
+            "segmented",
+            "paraphrased",
+            "chunked",
+            "figures",
+            "ready",
+        ):
             # Si se reanuda desde una etapa posterior, los contadores locales
             # no se definieron en esta ejecución: leerlos de la DB.
             if "chunk_count" not in locals():
@@ -1950,7 +3296,9 @@ def index_document(
                     print(
                         "[KAG] 📝 ready: generando resumen jerárquico (Qwen local)..."
                     )
-                summary = sanitize_text(summarize_document(session, md_text, doc_type))
+                summary = sanitize_text(
+                    summarize_document(session, slice_text, doc_type)
+                )
                 if verbose:
                     print("[KAG] 📝 ready: resumen listo.")
 
@@ -1973,13 +3321,14 @@ def index_document(
 
         if verbose:
             print(
-                f"[KAG] ✅ {doc_path} indexado: {chunk_count} chunks, "
+                f"[KAG] ✅ {label} indexado: {chunk_count} chunks, "
                 f"{entity_count} entidades, {relation_count} relaciones, "
                 f"{figure_count} figuras."
             )
         return {
             "status": "indexed",
             "doc_path": doc_path,
+            "document_id": document_id,
             "chunk_count": chunk_count,
             "entity_count": entity_count,
             "relation_count": relation_count,
@@ -1993,19 +3342,22 @@ def index_document(
             session.execute(
                 text(
                     "INSERT INTO kag_documents "
-                    "(doc_path, title, doc_type, status, content_hash, "
-                    "token_estimate, error) "
-                    "VALUES (:doc_path, :title, :doc_type, 'failed', "
-                    ":content_hash, :token_estimate, :err) "
-                    "ON CONFLICT (doc_path) DO UPDATE SET status = 'failed', "
+                    "(doc_path, document_id, line_start, line_end, title, doc_type, "
+                    "status, content_hash, token_estimate, error) "
+                    "VALUES (:doc_path, :document_id, :line_start, :line_end, :title, "
+                    ":doc_type, 'failed', :content_hash, :token_estimate, :err) "
+                    "ON CONFLICT (doc_path, document_id) DO UPDATE SET status = 'failed', "
                     "error = :err, updated_at = now()"
                 ),
                 {
                     "doc_path": doc_path,
+                    "document_id": document_id,
+                    "line_start": line_start,
+                    "line_end": line_end,
                     "title": title,
                     "doc_type": doc_type,
-                    "content_hash": content_hash,
-                    "token_estimate": token_estimate,
+                    "content_hash": slice_hash,
+                    "token_estimate": slice_tokens,
                     "err": str(exc)[:500],
                 },
             )
@@ -2013,7 +3365,7 @@ def index_document(
         except Exception:  # noqa: BLE001 — no bloquea el re-lanzamiento
             pass
         if verbose:
-            print(f"[KAG] ❌ Error indexando {doc_path}: {exc}")
+            print(f"[KAG] ❌ Error indexando {label}: {exc}")
             import traceback
 
             traceback.print_exc(file=sys.stdout)

@@ -26,7 +26,9 @@ from src.kag.stages import (
 def test_kag_ingest_stages_order():
     assert KAG_INGEST_STAGES == [
         "pending",
+        "analysis",
         "segmented",
+        "paraphrased",
         "chunked",
         "figures",
         "ready",
@@ -51,8 +53,10 @@ def test_resume_from_unknown_stage():
 
 def test_resume_from_intermediate_stage():
     # Stage completado -> la SIGUIENTE (la actual ya está hecha).
-    assert resume_from(KAG_INGEST_STAGES, "pending") == "segmented"
-    assert resume_from(KAG_INGEST_STAGES, "segmented") == "chunked"
+    assert resume_from(KAG_INGEST_STAGES, "pending") == "analysis"
+    assert resume_from(KAG_INGEST_STAGES, "analysis") == "segmented"
+    assert resume_from(KAG_INGEST_STAGES, "segmented") == "paraphrased"
+    assert resume_from(KAG_INGEST_STAGES, "paraphrased") == "chunked"
     assert resume_from(KAG_INGEST_STAGES, "chunked") == "figures"
     assert resume_from(KAG_INGEST_STAGES, "figures") == "ready"
 
@@ -68,7 +72,7 @@ def test_resume_from_ready():
 
 
 def test_next_stage():
-    assert next_stage(KAG_INGEST_STAGES, "pending") == "segmented"
+    assert next_stage(KAG_INGEST_STAGES, "pending") == "analysis"
     assert next_stage(KAG_INGEST_STAGES, "figures") == "ready"
     assert next_stage(KAG_INGEST_STAGES, "ready") is None
     assert next_stage(KAG_INGEST_STAGES, "bogus") is None

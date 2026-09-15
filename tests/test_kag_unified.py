@@ -140,7 +140,7 @@ def test_assemble_context_with_propositions_section_position():
     chunks = [
         {
             "doc_path": "a.md",
-            "section_path": "## Intro",
+            "chapter_title": "## Intro",
             "chunk_index": 0,
             "content": "contenido a",
         }

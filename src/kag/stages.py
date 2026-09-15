@@ -30,7 +30,9 @@ from sqlalchemy import text
 # Pipeline clásico (src/kag_ingest.py) — tabla kag_documents.
 KAG_INGEST_STAGES = [
     "pending",  # fila insertada, nada persistido
+    "analysis",  # ficha documental + capítulos detectados por LLM (Fase 2)
     "segmented",  # chunks insertados (embedding NULL) — segmentación persistida
+    "paraphrased",  # paráfrasis de chunks por capítulo (Fase 4)
     "chunked",  # embeddings + entidades + relaciones
     "figures",  # figuras indexadas
     "ready",  # resumen + status='ready'
@@ -109,6 +111,12 @@ def cleanup_stage(session, table: str, doc_id: int, stage: str) -> None:
 CLEANUP_SQL: dict[str, dict[str, list[str]]] = {
     # Pipeline clásico — kag_documents
     "kag_documents": {
+        "analysis": [
+            # Re-análisis (Fase 2): borra capítulos y la ficha/esqueleto del doc.
+            "DELETE FROM kag_chapters WHERE doc_id = :doc_id",
+            "UPDATE kag_documents SET ficha_jsonb = NULL, sections_json = NULL "
+            "WHERE id = :doc_id",
+        ],
         "segmented": [
             # Re-segmentar: borra chunks (cascada a entidades/relaciones/figuras
             # vía ON DELETE CASCADE de chunk_id; las de doc_id también).
@@ -119,6 +127,10 @@ CLEANUP_SQL: dict[str, dict[str, list[str]]] = {
             # Las proposiciones se borran con los chunks (CASCADE); el DELETE
             # explícito es redundante pero inofensivo.
             "DELETE FROM kag_propositions WHERE doc_id = :doc_id",
+        ],
+        "paraphrased": [
+            # Re-parafrasear: borra las paráfrasis (los chunks ya están).
+            "UPDATE kag_chunks SET paraphrase = NULL WHERE doc_id = :doc_id",
         ],
         "chunked": [
             # Re-embeder/entidades: borra entidades y relaciones (los chunks ya

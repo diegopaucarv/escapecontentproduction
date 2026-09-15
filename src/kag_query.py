@@ -1080,7 +1080,7 @@ def chunks_for_entities(session, entity_ids, top_n):
         return []
     rows = session.execute(
         text(
-            "SELECT c.id, c.doc_id, c.section_path, c.content, d.doc_path, "
+            "SELECT c.id, c.doc_id, c.chapter_id, c.content, d.doc_path, "
             "COUNT(*) AS mentions "
             "FROM kag_chunks c "
             "JOIN kag_entities e ON e.chunk_id = c.id "
@@ -1095,7 +1095,7 @@ def chunks_for_entities(session, entity_ids, top_n):
         {
             "chunk_id": r.id,
             "doc_id": r.doc_id,
-            "section_path": r.section_path,
+            "chapter_id": r.chapter_id,
             "content": r.content,
             "doc_path": r.doc_path,
         }
@@ -1116,7 +1116,7 @@ def chunks_by_ids(session, chunk_ids):
     ids = list(dict.fromkeys(chunk_ids))
     rows = session.execute(
         text(
-            "SELECT c.id, c.doc_id, c.section_path, c.content, c.chunk_index, "
+            "SELECT c.id, c.doc_id, c.chapter_id, c.content, c.chunk_index, "
             "d.doc_path FROM kag_chunks c "
             "JOIN kag_documents d ON d.id = c.doc_id "
             "WHERE c.id = ANY(:ids) AND d.status = 'ready' "
@@ -1134,7 +1134,7 @@ def chunks_by_ids(session, chunk_ids):
             {
                 "chunk_id": r.id,
                 "doc_id": r.doc_id,
-                "section_path": r.section_path,
+                "chapter_id": r.chapter_id,
                 "content": r.content,
                 "chunk_index": r.chunk_index,
                 "doc_path": r.doc_path,
@@ -1219,10 +1219,12 @@ def propositions_for_chunks(session, chunk_ids, per_chunk=6, max_total=120):
                 "SELECT p.id AS prop_id, p.chunk_id, p.statement, p.text_span, "
                 "p.char_start, p.char_end, p.citation_references, "
                 "p.doc_id AS document_id, "
-                "d.title AS doc_title, c.section_path AS chapter_title "
+                "d.title AS doc_title, "
+                "COALESCE(kc.title, '') AS chapter_title "
                 "FROM kag_propositions p "
                 "JOIN kag_documents d ON p.doc_id = d.id "
                 "JOIN kag_chunks c ON p.chunk_id = c.id "
+                "LEFT JOIN kag_chapters kc ON kc.id = c.chapter_id "
                 "WHERE p.chunk_id = ANY(:ids) "
                 "ORDER BY p.chunk_id, p.id"
             ),
@@ -1298,11 +1300,11 @@ def expand_chunk_window(session, chunk, window=CONTEXT_WINDOW):
 
     Devuelve lista de dicts (ancla primero, luego vecinos por chunk_index)
     con la misma forma que los chunks de ask(): chunk_id, doc_id,
-    section_path, content, chunk_index, doc_path, score, is_anchor.
+    chapter_id, content, chunk_index, doc_path, score, is_anchor.
     """
     rows = session.execute(
         text(
-            "SELECT c.id, c.doc_id, c.section_path, c.content, c.chunk_index, "
+            "SELECT c.id, c.doc_id, c.chapter_id, c.content, c.chunk_index, "
             "d.doc_path FROM kag_chunks c "
             "JOIN kag_documents d ON d.id = c.doc_id "
             "WHERE c.doc_id = :doc AND c.chunk_index BETWEEN :lo AND :hi "
@@ -1320,7 +1322,7 @@ def expand_chunk_window(session, chunk, window=CONTEXT_WINDOW):
             {
                 "chunk_id": r.id,
                 "doc_id": r.doc_id,
-                "section_path": r.section_path,
+                "chapter_id": r.chapter_id,
                 "content": r.content,
                 "chunk_index": r.chunk_index,
                 "doc_path": r.doc_path,
@@ -1809,12 +1811,12 @@ def assemble_context(
     if chunks:
         for i, c in enumerate(chunks, start=1):
             doc = c.get("doc_path", "?")
-            section = c.get("section_path", "") or "(sin sección)"
+            section = c.get("chapter_title", "") or "(sin capítulo)"
             idx = c.get("chunk_index", "?")
             score = c.get("score", 0.0)
             marker = "RESULTADO" if c.get("is_anchor", True) else "contexto"
             parts.append(
-                f"[{i}] {marker} | doc: {doc} | sección: {section} | "
+                f"[{i}] {marker} | doc: {doc} | capítulo: {section} | "
                 f"chunk {idx} | score: {score:.4f}"
             )
             parts.append(c.get("content", ""))
@@ -2392,10 +2394,12 @@ def _verify_grounding(session, facts, verbose=False) -> list:
             row = session.execute(
                 text(
                     "SELECT p.text_span, p.citation_references, p.doc_id, "
-                    "d.title AS doc_title, c.section_path AS chapter_title "
+                    "d.title AS doc_title, "
+                    "COALESCE(kc.title, '') AS chapter_title "
                     "FROM kag_propositions p "
                     "JOIN kag_documents d ON p.doc_id = d.id "
                     "JOIN kag_chunks c ON p.chunk_id = c.id "
+                    "LEFT JOIN kag_chapters kc ON kc.id = c.chapter_id "
                     "WHERE p.id = :cid"
                 ),
                 {"cid": chunk_id},
@@ -2506,12 +2510,14 @@ def _branch_b_expand(
                 text(
                     "SELECT p.id AS prop_id, p.chunk_id, p.statement, p.text_span, "
                     "p.char_start, p.char_end, p.citation_references, "
-                    "d.title AS doc_title, c.section_path AS chapter_title, "
+                    "d.title AS doc_title, "
+                    "COALESCE(kc.title, '') AS chapter_title, "
                     "ts_rank_cd(to_tsvector('simple', p.statement), "
                     "to_tsquery('simple', :tsq)) AS score "
                     "FROM kag_propositions p "
                     "JOIN kag_documents d ON p.doc_id = d.id "
                     "JOIN kag_chunks c ON p.chunk_id = c.id "
+                    "LEFT JOIN kag_chapters kc ON kc.id = c.chapter_id "
                     "WHERE to_tsvector('simple', p.statement) @@ "
                     "to_tsquery('simple', :tsq) "
                     "ORDER BY score DESC LIMIT 5"

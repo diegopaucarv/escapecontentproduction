@@ -23,11 +23,16 @@ EXPECTED_TASK_KEYS = {
     "kag_qwen_summary",
     # C. src/kag_ingest.py (expansión proposicional, Agente B)
     "kag_proposition_chunking",
+    # E. Pipeline documental nuevo (Fases 1-5)
+    "kag_document_separation",
+    "kag_document_analysis",
+    "kag_chunk_paraphrase",
+    "kag_chapter_propositions",
 }
 
 
 def test_kag_templates_has_11_specs():
-    assert len(KAG_TEMPLATES) == 11
+    assert len(KAG_TEMPLATES) == 15
 
 
 def test_kag_templates_task_keys_match_expected():

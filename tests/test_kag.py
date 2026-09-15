@@ -6,6 +6,7 @@ y src/kag_query.py con sesiones falsas y monkeypatch (patrón de
 tests/test_embeddings.py).
 """
 
+import json
 import re
 from types import SimpleNamespace
 
@@ -136,12 +137,10 @@ def test_chunk_markdown_short_splits_by_headers():
     seg = _FakeSegmenter()
     chunks = chunk_markdown(md, "short", seg, max_tokens=800)
 
-    # 3 secciones × 2 segmentos, pero los segmentos son diminutos y se
-    # fusionan hasta max_tokens → 1 chunk por sección.
-    assert len(chunks) == 3
-    assert chunks[0]["section_path"] == "# Introducción"
-    assert chunks[1]["section_path"] == "# Introducción > ## Métodos"
-    assert chunks[2]["section_path"] == "# Introducción > ## Métodos > ### Sub"
+    # Sin jerarquía de headers: el texto completo se segmenta directamente.
+    # 2 segmentos diminutos fusionados → 1 chunk.
+    assert len(chunks) == 1
+    assert chunks[0]["chapter_id"] is None
     assert chunks[0]["token_estimate"] == estimate_tokens(chunks[0]["content"])
     assert "seg0:" in chunks[0]["content"]
     assert "seg1:" in chunks[0]["content"]  # fusionado
@@ -168,20 +167,20 @@ def test_chunk_markdown_long_presegments_h1_h2():
     seg = _FakeSegmenter()
     chunks = chunk_markdown(md, "long", seg, max_tokens=800)
 
-    # long: solo H1/H2 parten; ### queda dentro del contenido de la sección.
-    # 2 secciones × 2 segmentos diminutos → 1 chunk por sección (fusionados).
-    assert len(chunks) == 2
-    assert chunks[0]["section_path"] == "# Cap 1"
-    # El texto pasado al segmenter para la sección 1 incluye el ### (no parte).
+    # Sin pre-segmentación por headers: el texto completo se segmenta.
+    # 2 segmentos diminutos → 1 chunk (fusionados).
+    assert len(chunks) == 1
+    assert chunks[0]["chapter_id"] is None
+    # El texto completo (incluidos los headers) llega al segmenter.
     assert "Sub detalle" in seg.calls[0][0]
-    assert chunks[1]["section_path"] == "# Cap 1 > ## Cap 2"
+    assert "Cap 2" in seg.calls[0][0]
 
 
 def test_chunk_markdown_without_headers_uses_whole_text():
     seg = _FakeSegmenter()
     chunks = chunk_markdown("Solo texto sin encabezados.", "short", seg)
     assert len(chunks) == 1  # 2 segmentos diminutos fusionados
-    assert chunks[0]["section_path"] == ""
+    assert chunks[0]["chapter_id"] is None
 
 
 def test_chunk_markdown_use_coref_false_disables_coref():
@@ -510,7 +509,7 @@ def test_chunks_by_ids_single_query_preserves_order():
         10: SimpleNamespace(
             id=10,
             doc_id=1,
-            section_path="## A",
+            chapter_id=None,
             content="diez",
             chunk_index=0,
             doc_path="a.md",
@@ -518,7 +517,7 @@ def test_chunks_by_ids_single_query_preserves_order():
         20: SimpleNamespace(
             id=20,
             doc_id=1,
-            section_path="## B",
+            chapter_id=None,
             content="veinte",
             chunk_index=1,
             doc_path="a.md",
@@ -526,7 +525,7 @@ def test_chunks_by_ids_single_query_preserves_order():
         30: SimpleNamespace(
             id=30,
             doc_id=2,
-            section_path="## C",
+            chapter_id=None,
             content="treinta",
             chunk_index=0,
             doc_path="b.md",
@@ -570,7 +569,7 @@ def test_chunks_by_ids_empty_and_missing():
             1: SimpleNamespace(
                 id=1,
                 doc_id=1,
-                section_path="",
+                chapter_id=None,
                 content="uno",
                 chunk_index=0,
                 doc_path="a.md",
@@ -611,7 +610,7 @@ def test_chunks_by_ids_dedups_input():
             5: SimpleNamespace(
                 id=5,
                 doc_id=1,
-                section_path="",
+                chapter_id=None,
                 content="cinco",
                 chunk_index=0,
                 doc_path="a.md",
@@ -632,7 +631,7 @@ def test_assemble_context_contains_sections():
     chunks = [
         {
             "doc_path": "a.md",
-            "section_path": "## Intro",
+            "chapter_title": "## Intro",
             "chunk_index": 0,
             "content": "contenido a",
         }
@@ -665,7 +664,7 @@ def test_assemble_context_with_history():
     chunks = [
         {
             "doc_path": "a.md",
-            "section_path": "## Intro",
+            "chapter_title": "## Intro",
             "chunk_index": 0,
             "content": "contenido a",
             "is_anchor": True,
@@ -1997,13 +1996,13 @@ def test_assemble_context_deterministic_order_for_caching():
     chunks = [
         {
             "doc_path": "b.md",
-            "section_path": "",
+            "chapter_title": "",
             "chunk_index": 0,
             "content": "chunk b",
         },
         {
             "doc_path": "a.md",
-            "section_path": "",
+            "chapter_title": "",
             "chunk_index": 0,
             "content": "chunk a",
         },
@@ -2226,24 +2225,39 @@ def test_maintain_word_freq_deletes_and_inserts():
 
 
 # ---------------------------------------------------------------------
-# _index_figures — procesamiento paralelo de figuras (VLM)
+# _index_figures — visión condicional + FAQ Reverse HyDE (Fase 2b)
 # ---------------------------------------------------------------------
 
 
 class _FiguresSession:
     """Sesión falsa para _index_figures: captura los INSERTs en orden.
 
-    `_find_chunk_for_image` hace un SELECT con LIKE → devuelve un chunk_id
-    derivado del nombre de la imagen (determinista).
+    El SELECT de kag_chapters devuelve capítulos con has_images según
+    `has_images_rows`; `_find_chunk_for_image` (SELECT con LIKE) devuelve un
+    chunk_id derivado del nombre de la imagen (determinista).
     """
 
-    def __init__(self):
+    def __init__(self, has_images_rows=(True,)):
         self.inserts = []
+        self._has_images_rows = has_images_rows
 
     def execute(self, stmt, params=None):
         sql = str(stmt)
         if "INSERT INTO kag_figures" in sql:
             self.inserts.append(dict(params))
+        elif "FROM kag_chapters" in sql:
+            return SimpleNamespace(
+                fetchall=lambda: [
+                    SimpleNamespace(
+                        id=f"ch-{i}",
+                        chapter_id=f"cap{i}",
+                        line_start=1,
+                        line_end=10,
+                        has_images=self._has_images_rows[i],
+                    )
+                    for i in range(len(self._has_images_rows))
+                ]
+            )
         elif "kag_chunks" in sql:
 
             class _Result:
@@ -2254,55 +2268,65 @@ class _FiguresSession:
         return None
 
 
-def _make_figures_dir(tmp_path, names):
-    """Crea images/<docname>/ con archivos de imagen (contenido dummy)."""
-    images_dir = tmp_path / "images" / "doc"
-    images_dir.mkdir(parents=True)
+def _make_figures_md(tmp_path, names):
+    """Crea el .md con referencias a imágenes y los archivos en disco."""
+    lines = ["# Título", ""]
     for name in names:
-        (images_dir / name).write_bytes(b"\x89PNG\r\n")
-    return images_dir
+        (tmp_path / name).write_bytes(b"\x89PNG\r\n")
+        lines.append(f"![fig {name}]({name})")
+    md_path = tmp_path / "doc.md"
+    md_path.write_text("\n".join(lines), encoding="utf-8")
+    return md_path
 
 
 def test_index_figures_parallel_deterministic_order(monkeypatch, tmp_path):
-    """describe_figure se llama por cada figura (en paralelo) y el INSERT
-    mantiene el orden determinista (sorted por nombre de archivo)."""
+    """_describe_figure_vision se llama por cada figura (en paralelo) y el
+    INSERT mantiene el orden determinista (sorted por anchor_line)."""
     import src.kag_ingest as ki
 
-    _make_figures_dir(tmp_path, ["b.png", "a.png", "c.png"])
-    md_path = tmp_path / "doc.md"
-    md_path.write_text("![fig a](images/doc/a.png)\n![fig b](images/doc/b.png)")
-
+    md_path = _make_figures_md(tmp_path, ["b.png", "a.png", "c.png"])
     calls = []
 
-    def fake_describe(session, image_path, caption):
-        calls.append((image_path, caption))
-        return f"descripción de {image_path}"
+    def fake_vision(session, figure, slice_text, doc_line_start, verbose):
+        calls.append(figure["image_path"])
+        return {
+            "image_type": "photograph",
+            "dense_visual_description": f"descripción de {figure['image_path']}",
+            "epistemic_contribution": "aporte",
+            "faq_indexing": ["¿Qué muestra?"],
+            "associated_entities": [],
+        }
 
-    monkeypatch.setattr(ki, "describe_figure", fake_describe)
-    monkeypatch.setattr(ki, "IMAGES_DIR", tmp_path / "images")
+    monkeypatch.setattr(ki, "_describe_figure_vision", fake_vision)
 
     session = _FiguresSession()
     count = ki._index_figures(
-        session, doc_id=1, md_path=md_path, md_text=md_path.read_text()
+        session,
+        doc_id=1,
+        md_path=md_path,
+        slice_text=md_path.read_text(encoding="utf-8"),
+        doc_line_start=1,
     )
 
     assert count == 3
-    # describe_figure se llamó para las 3 figuras.
+    # _describe_figure_vision se llamó para las 3 figuras.
     assert len(calls) == 3
-    # INSERT en orden determinista (sorted por nombre: a, b, c).
+    # INSERT en orden determinista (sorted por anchor_line = orden en el
+    # archivo: b, a, c).
     assert [i["image_path"] for i in session.inserts] == [
-        "images/doc/a.png",
-        "images/doc/b.png",
-        "images/doc/c.png",
+        str(tmp_path / "b.png"),
+        str(tmp_path / "a.png"),
+        str(tmp_path / "c.png"),
     ]
     # Captions correctos.
-    assert session.inserts[0]["caption"] == "fig a"
-    assert session.inserts[1]["caption"] == "fig b"
-    assert session.inserts[2]["caption"] == ""
-    # Descripciones sanitizadas.
+    assert session.inserts[0]["caption"] == "fig b.png"
+    assert session.inserts[1]["caption"] == "fig a.png"
+    assert session.inserts[2]["caption"] == "fig c.png"
+    # Descripciones sanitizadas + FAQ persistido.
     assert session.inserts[0]["description"] == "descripción de " + str(
-        tmp_path / "images" / "doc" / "a.png"
+        tmp_path / "b.png"
     )
+    assert json.loads(session.inserts[0]["faq_indexing"]) == ["¿Qué muestra?"]
 
 
 def test_index_figures_pool_failure_degrades_to_sequential(monkeypatch, tmp_path):
@@ -2310,18 +2334,20 @@ def test_index_figures_pool_failure_degrades_to_sequential(monkeypatch, tmp_path
     secuencial — nunca romper, mismo resultado."""
     import src.kag_ingest as ki
 
-    _make_figures_dir(tmp_path, ["a.png", "b.png"])
-    md_path = tmp_path / "doc.md"
-    md_path.write_text("![fig a](images/doc/a.png)")
-
+    md_path = _make_figures_md(tmp_path, ["a.png", "b.png"])
     calls = []
 
-    def fake_describe(session, image_path, caption):
-        calls.append(image_path)
-        return f"desc {image_path}"
+    def fake_vision(session, figure, slice_text, doc_line_start, verbose):
+        calls.append(figure["image_path"])
+        return {
+            "image_type": "photograph",
+            "dense_visual_description": f"desc {figure['image_path']}",
+            "epistemic_contribution": "",
+            "faq_indexing": [],
+            "associated_entities": [],
+        }
 
-    monkeypatch.setattr(ki, "describe_figure", fake_describe)
-    monkeypatch.setattr(ki, "IMAGES_DIR", tmp_path / "images")
+    monkeypatch.setattr(ki, "_describe_figure_vision", fake_vision)
 
     class _BrokenPool:
         def __init__(self, *args, **kwargs):
@@ -2331,26 +2357,44 @@ def test_index_figures_pool_failure_degrades_to_sequential(monkeypatch, tmp_path
 
     session = _FiguresSession()
     count = ki._index_figures(
-        session, doc_id=1, md_path=md_path, md_text=md_path.read_text()
+        session,
+        doc_id=1,
+        md_path=md_path,
+        slice_text=md_path.read_text(encoding="utf-8"),
+        doc_line_start=1,
     )
 
     assert count == 2
     assert len(calls) == 2  # secuencial: ambas figuras procesadas
     assert [i["image_path"] for i in session.inserts] == [
-        "images/doc/a.png",
-        "images/doc/b.png",
+        str(tmp_path / "a.png"),
+        str(tmp_path / "b.png"),
     ]
 
 
-def test_index_figures_no_images_dir_returns_zero(monkeypatch, tmp_path):
+def test_index_figures_sin_capitulos_con_imagenes_skip(monkeypatch, tmp_path):
+    """Ningún capítulo con has_images → la visión se omite (return 0)."""
     import src.kag_ingest as ki
 
     md_path = tmp_path / "doc.md"
-    md_path.write_text("sin figuras")
-    monkeypatch.setattr(ki, "IMAGES_DIR", tmp_path / "images")
+    md_path.write_text("sin figuras", encoding="utf-8")
 
-    session = _FiguresSession()
-    assert ki._index_figures(session, doc_id=1, md_path=md_path, md_text="") == 0
+    def fake_vision(session, figure, slice_text, doc_line_start, verbose):
+        raise AssertionError("la visión no debe llamarse sin capítulos con imágenes")
+
+    monkeypatch.setattr(ki, "_describe_figure_vision", fake_vision)
+
+    session = _FiguresSession(has_images_rows=(False, False))
+    assert (
+        ki._index_figures(
+            session,
+            doc_id=1,
+            md_path=md_path,
+            slice_text="sin figuras",
+            doc_line_start=1,
+        )
+        == 0
+    )
     assert session.inserts == []
 
 
