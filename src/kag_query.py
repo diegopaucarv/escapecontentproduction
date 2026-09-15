@@ -17,6 +17,7 @@ Uso:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -44,6 +45,11 @@ TASK_GROUNDED_ENTITIES = "kag_grounded_entities"
 TASK_CRITIC_REGEX = "kag_critic_regex"
 TASK_CRITIC_LINKING = "kag_critic_linking"
 TASK_QUERY_ANSWER = "kag_query_answer"
+# Auditoría epistémica (modo audited) — specs en src/db/seed_kag_prompts.py.
+TASK_SYNTHESIS = "kag_synthesis"
+TASK_CONTRADICTIONS = "kag_contradictions"
+TASK_SUFFICIENCY = "kag_sufficiency"
+TASK_ANSWER = "kag_answer"
 
 # System prompts cortos actuales — fallback EXACTO de hoy cuando no hay
 # artefacto compilado (tests sin DB: get_active_prompt devuelve None).
@@ -57,6 +63,16 @@ ANSWER_SYSTEM_SHORT = (
     "usando SOLO el contexto proporcionado. Si el contexto no contiene la "
     "respuesta, dilo claramente. Cita los documentos cuando sea posible. "
     "Responde en el idioma de la pregunta."
+)
+# Fallbacks del modo audited (mismos textos que src/kag_agents.py — el
+# artefacto compilado los reemplaza si existe).
+SYNTHESIS_SYSTEM_SHORT = "Eres un agente de consolidación fáctica de alta precisión."
+CONTRADICTION_SYSTEM_SHORT = "Eres un analista epistemológico."
+SUFFICIENCY_SYSTEM_SHORT = (
+    "Eres el Agente Auditor Epistemológico de un sistema de recuperación avanzada."
+)
+AUDITED_ANSWER_SYSTEM_SHORT = (
+    "Eres un asistente de conocimiento con estándares epistémicos estrictos."
 )
 
 
@@ -1068,6 +1084,57 @@ def doc_summaries(session, doc_ids):
     return [{"doc_path": r.doc_path, "summary": r.summary} for r in rows]
 
 
+def propositions_for_chunks(session, chunk_ids, per_chunk=6, max_total=120):
+    """Proposiciones atómicas de los chunks dados (capa micro, kag_propositions).
+
+    Devuelve lista de dicts con la proposición, su span verbatim y el contexto
+    de documento/sección. Degradación natural: si la tabla no existe (migración
+    0024 no aplicada) o no hay proposiciones, devuelve [] sin romper.
+    """
+    if not chunk_ids:
+        return []
+    ids = list(dict.fromkeys(chunk_ids))
+    try:
+        rows = session.execute(
+            text(
+                "SELECT p.id AS prop_id, p.chunk_id, p.statement, p.text_span, "
+                "p.char_start, p.char_end, p.citation_references, "
+                "p.doc_id AS document_id, "
+                "d.title AS doc_title, c.section_path AS chapter_title "
+                "FROM kag_propositions p "
+                "JOIN kag_documents d ON p.doc_id = d.id "
+                "JOIN kag_chunks c ON p.chunk_id = c.id "
+                "WHERE p.chunk_id = ANY(:ids) "
+                "ORDER BY p.chunk_id, p.id"
+            ),
+            {"ids": ids},
+        ).fetchall()
+    except Exception:  # noqa: BLE001 — tabla ausente (migración no aplicada)
+        return []
+    out = []
+    per_chunk_count: dict[int, int] = {}
+    for r in rows:
+        if per_chunk_count.get(r.chunk_id, 0) >= per_chunk:
+            continue
+        per_chunk_count[r.chunk_id] = per_chunk_count.get(r.chunk_id, 0) + 1
+        out.append(
+            {
+                "chunk_id": r.prop_id,
+                "document_id": r.document_id,
+                "statement": r.statement,
+                "text_span": r.text_span,
+                "char_start": r.char_start,
+                "char_end": r.char_end,
+                "citation_references": r.citation_references or [],
+                "doc_title": r.doc_title,
+                "chapter_title": r.chapter_title,
+            }
+        )
+        if len(out) >= max_total:
+            break
+    return out
+
+
 # ---------------------------------------------------------------------
 # Threshold de relevancia + ventana de contexto
 # ---------------------------------------------------------------------
@@ -1570,7 +1637,9 @@ def critic_and_linking(session, query, top_k=10, verbose=False):
 # ---------------------------------------------------------------------
 
 
-def assemble_context(chunks, triples, figures, summaries, query, history=None):
+def assemble_context(
+    chunks, triples, figures, summaries, query, history=None, propositions=None
+):
     """Ensambla el bloque de contexto para la respuesta final.
 
     Los chunks llegan ya agrupados con su ventana (ancla + vecinos) y
@@ -1578,7 +1647,10 @@ def assemble_context(chunks, triples, figures, summaries, query, history=None):
     (doc, sección, chunk_index) y si es resultado directo o contexto
     adyacente. `history` (opcional) es una lista de dicts {"role",
     "content"} del historial de conversación — se incluye como sección
-    informativa (preparado, aún sin probar con Docker).
+    informativa (preparado, aún sin probar con Docker). `propositions`
+    (opcional) es la capa micro: proposiciones atómicas de los chunks
+    ganadores (kag_propositions) — se muestran DESPUÉS de los fragmentos
+    y ANTES de las figuras.
 
     ORDEN PARA PROMPT CACHING: el subgrafo y los resúmenes (bloques
     semi-estáticos, ordenados de forma determinista por doc) van ANTES de
@@ -1631,6 +1703,21 @@ def assemble_context(chunks, triples, figures, summaries, query, history=None):
     else:
         parts.append("(sin fragmentos recuperados)")
         parts.append("")
+    if propositions is not None:
+        parts.append("--- PROPOSICIONES ATÓMICAS (capa micro) ---")
+        if propositions:
+            for i, p in enumerate(propositions, start=1):
+                doc = p.get("doc_title", "?")
+                section = p.get("chapter_title", "") or "(sin sección)"
+                line = f"[n] doc: {doc} | sección: {section} | {p.get('statement', '')}"
+                span = p.get("text_span") or ""
+                if span:
+                    line += f" (cita: {span})"
+                parts.append(line)
+                parts.append("")
+        else:
+            parts.append("(sin proposiciones)")
+            parts.append("")
     parts.append("--- FIGURAS ---")
     if figures:
         for f in figures:
@@ -1653,6 +1740,46 @@ ANSWER_PROMPT = """Contexto:
 Pregunta: {query}
 
 Responde con precisión basándote en el contexto."""
+
+# ---------------------------------------------------------------------
+# Prompts del modo audited (fallback EXACTO de src/kag_agents.py — el
+# artefacto compilado los reemplaza si existe).
+# ---------------------------------------------------------------------
+
+SYNTHESIS_PROMPT = """Consulta del usuario: "{query}"
+
+Fragmentos recuperados para análisis:
+{candidate_chunks_json}
+
+Devuelve el JSON: {{"query": str, "total_chunks_processed": int, "synthesized_facts": [{{"chunk_id": str, "document_id": str, "source_file": str, "relevance_level": "direct_answer|supporting_evidence|contextual_background|irrelevant", "atomic_summary": str, "verbatim_evidence": str, "academic_citations": [str]}}]}}"""
+
+CONTRADICTION_PROMPT = """Consulta: "{query}"
+
+Hechos sintetizados:
+{synthesized_facts_json}
+
+Devuelve el JSON: {{"contradictions_detected": bool, "analysis_cases": [{{"conflict_type": "paradigmatic_theoretical_divergence|empirical_contextual_boundary|temporal_diachronic_shift|terminological_homonymy", "divergence_summary": str, "thesis_a": {{"proposition_id": str, "document_id": str, "claim": str, "author_or_framework": str, "empirical_context": str}}, "thesis_b": {{"proposition_id": str, "document_id": str, "claim": str, "author_or_framework": str, "empirical_context": str}}, "epistemic_reconciliation": str}}]}}"""
+
+SUFFICIENCY_PROMPT = """Consulta: "{query}"
+
+Metadatos del Corpus Disponible (Descriptores ISO 25964 y LCC presentes en DB):
+{active_corpus_metadata}
+
+Proposiciones recuperadas (Nivel 1):
+{synthesized_propositions_json}
+
+Contextos escalados (Nivel 2, si aplicó):
+{parent_contexts_json}
+
+Emite tu evaluación formal: {{"verdict": "SUFFICIENT_FOR_SYNTHESIS|INSUFFICIENT_TRIGGER_BRANCH_B|NEGATIVE_REJECTION", "confidence_score": float, "negative_rejection_details": {{"reason": "out_of_thematic_scope_iso25964|classification_mismatch_lcc|total_absence_in_knowledge_graph|unsupported_technical_granularity", "closest_available_topics": [str], "formal_abstention_statement": str}}, "branch_b_instructions": {{"unresolved_subqueries": [str], "target_thesaurus_concepts": [str]}}}}"""
+
+AUDITED_ANSWER_PROMPT = """Consulta del usuario: "{query}"
+
+Evidencia verificada (grounded_evidence):
+{grounded_evidence_json}
+
+Tensiones epistémicas (epistemic_tensions):
+{epistemic_tensions_json}"""
 
 
 def generate_answer(session, context, query):
@@ -1683,18 +1810,645 @@ def generate_answer(session, context, query):
 
 
 # ---------------------------------------------------------------------
+# Modo audited — auditoría epistémica (portado de src/kag_agents.py,
+# adaptado a kag_propositions). Se eliminará src/kag_agents.py al final.
+# ---------------------------------------------------------------------
+
+
+def _json_dumps(obj) -> str:
+    """json.dumps con ensure_ascii=False y fallback a repr si serializar falla."""
+    try:
+        return json.dumps(obj, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return repr(obj)
+
+
+def _safe_rollback(session):
+    """Rollback defensivo: sesiones reales siempre lo tienen; fakes en tests no."""
+    rollback = getattr(session, "rollback", None)
+    if callable(rollback):
+        rollback()
+
+
+def _fts_tsquery(terms: list) -> str:
+    """Construye un tsquery 'simple' con comillas DOBLES siempre.
+
+    El `-` es el operador NOT de tsquery, así que cada término se escapa
+    duplicando las comillas dobles y se envuelve en comillas dobles.
+    """
+    parts = []
+    for term in terms:
+        t = str(term).strip()
+        if not t:
+            continue
+        t = t.replace('"', '""')
+        parts.append(f'"{t}"')
+    return " | ".join(parts)
+
+
+def _settings_retries(session) -> tuple:
+    """Lee llm_retries y fallback_model de session_settings (defaults seguros)."""
+    try:
+        settings = load_settings(session)
+    except Exception:  # noqa: BLE001 — degradación natural
+        settings = None
+    if settings is None:
+        return 3, None
+    retries = int(getattr(settings, "llm_retries", 3) or 3)
+    fallback = getattr(settings, "fallback_model", None)
+    return retries, fallback
+
+
+def _settings_models(session) -> tuple:
+    """Lee small_model y large_model de session_settings (defaults None)."""
+    try:
+        settings = load_settings(session)
+    except Exception:  # noqa: BLE001 — degradación natural
+        settings = None
+    if settings is None:
+        return None, None
+    return getattr(settings, "small_model", None), getattr(
+        settings, "large_model", None
+    )
+
+
+def _synthesize_facts(session, query, propositions, verbose=False) -> list:
+    """Sintetiza las proposiciones recuperadas en hechos atómicos (LLM pequeño).
+
+    Degradación: cada proposición como supporting_evidence con
+    atomic_summary=statement truncado y verbatim_evidence=text_span.
+    """
+    if not propositions:
+        return []
+    retries, fallback = _settings_retries(session)
+    small_model, _large_model = _settings_models(session)
+    system, user_template = _get_prompt_pair(
+        session, small_model, TASK_SYNTHESIS, SYNTHESIS_SYSTEM_SHORT, SYNTHESIS_PROMPT
+    )
+    prompt = user_template.format(
+        query=query, candidate_chunks_json=_json_dumps(propositions)
+    )
+    try:
+        text_out, _model, _used_fallback = call_with_retries(
+            session,
+            prompt=prompt,
+            system=system,
+            model_size="small",
+            response_format={"type": "json_object"},
+            retries=retries,
+            fallback_model=fallback,
+        )
+        data = parse_llm_output(text_out)
+        facts = data.get("synthesized_facts") or []
+        if isinstance(facts, list) and facts:
+            if verbose:
+                print(
+                    f"[KAG] Síntesis: {len(facts)} hechos (fallback={_used_fallback})"
+                )
+            return facts
+    except Exception as exc:  # noqa: BLE001 — degradación natural
+        _safe_rollback(session)
+        if verbose:
+            print(f"[KAG] ⚠ Síntesis LLM falló ({exc}); degradando.")
+    degraded = []
+    for p in propositions:
+        statement = (p.get("statement") or "").strip()
+        text_span = (p.get("text_span") or "").strip()
+        degraded.append(
+            {
+                "chunk_id": str(p.get("chunk_id", "")),
+                "document_id": str(p.get("document_id") or ""),
+                "source_file": str(p.get("doc_title", "")),
+                "relevance_level": "supporting_evidence",
+                "atomic_summary": statement[:500],
+                "verbatim_evidence": text_span[:1000],
+                "academic_citations": p.get("citation_references") or [],
+            }
+        )
+    if verbose:
+        print(f"[KAG] Síntesis degradada: {len(degraded)} hechos.")
+    return degraded
+
+
+def _resolve_contradictions(session, query, facts, verbose=False) -> dict:
+    """Tipifica contradicciones entre hechos sintetizados (LLM pequeño).
+
+    Degradación: contradictions_detected=False, analysis_cases=[].
+    """
+    if not facts:
+        return {"contradictions_detected": False, "analysis_cases": []}
+    retries, fallback = _settings_retries(session)
+    small_model, _large_model = _settings_models(session)
+    system, user_template = _get_prompt_pair(
+        session,
+        small_model,
+        TASK_CONTRADICTIONS,
+        CONTRADICTION_SYSTEM_SHORT,
+        CONTRADICTION_PROMPT,
+    )
+    prompt = user_template.format(
+        query=query, synthesized_facts_json=_json_dumps(facts)
+    )
+    try:
+        text_out, _model, _used_fallback = call_with_retries(
+            session,
+            prompt=prompt,
+            system=system,
+            model_size="small",
+            response_format={"type": "json_object"},
+            retries=retries,
+            fallback_model=fallback,
+        )
+        data = parse_llm_output(text_out)
+        report = {
+            "contradictions_detected": bool(data.get("contradictions_detected", False)),
+            "analysis_cases": data.get("analysis_cases") or [],
+        }
+        if verbose:
+            print(
+                f"[KAG] Contradicciones: {report['contradictions_detected']} "
+                f"({len(report['analysis_cases'])} casos)"
+            )
+        return report
+    except Exception as exc:  # noqa: BLE001 — degradación natural
+        _safe_rollback(session)
+        if verbose:
+            print(f"[KAG] ⚠ Análisis de contradicciones falló ({exc}).")
+        return {"contradictions_detected": False, "analysis_cases": []}
+
+
+def _evaluate_sufficiency(
+    session, query, facts, corpus_metadata, verbose=False
+) -> dict:
+    """Dictamina si la recuperación basta para responder (LLM pequeño).
+
+    Degradación: verdict='SUFFICIENT_FOR_SYNTHESIS' si hay ≥1 fact con
+    relevance_level direct_answer/supporting_evidence; si no,
+    'INSUFFICIENT_TRIGGER_BRANCH_B'.
+    """
+    retries, fallback = _settings_retries(session)
+    small_model, _large_model = _settings_models(session)
+    system, user_template = _get_prompt_pair(
+        session,
+        small_model,
+        TASK_SUFFICIENCY,
+        SUFFICIENCY_SYSTEM_SHORT,
+        SUFFICIENCY_PROMPT,
+    )
+    prompt = user_template.format(
+        query=query,
+        active_corpus_metadata=_json_dumps(corpus_metadata),
+        synthesized_propositions_json=_json_dumps(facts),
+        parent_contexts_json="[]",
+    )
+    try:
+        text_out, _model, _used_fallback = call_with_retries(
+            session,
+            prompt=prompt,
+            system=system,
+            model_size="small",
+            response_format={"type": "json_object"},
+            retries=retries,
+            fallback_model=fallback,
+        )
+        data = parse_llm_output(text_out)
+        verdict = data.get("verdict")
+        if verdict in (
+            "SUFFICIENT_FOR_SYNTHESIS",
+            "INSUFFICIENT_TRIGGER_BRANCH_B",
+            "NEGATIVE_REJECTION",
+        ):
+            if verbose:
+                print(
+                    f"[KAG] Suficiencia: {verdict} "
+                    f"(confianza={data.get('confidence_score')})"
+                )
+            return data
+    except Exception as exc:  # noqa: BLE001 — degradación natural
+        _safe_rollback(session)
+        if verbose:
+            print(f"[KAG] ⚠ Auditoría de suficiencia falló ({exc}).")
+    relevant = [
+        f
+        for f in facts
+        if f.get("relevance_level") in ("direct_answer", "supporting_evidence")
+    ]
+    verdict = (
+        "SUFFICIENT_FOR_SYNTHESIS" if relevant else "INSUFFICIENT_TRIGGER_BRANCH_B"
+    )
+    if verbose:
+        print(f"[KAG] Suficiencia degradada: {verdict}.")
+    return {"verdict": verdict, "confidence_score": 0.5}
+
+
+def _verify_grounding(session, facts, verbose=False) -> list:
+    """Verifica el grounding verbatim de cada fact (rapidfuzz partial_ratio ≥95).
+
+    Descarta los hechos que no pasan. Enriquecen con metadatos del doc.
+    """
+    if not facts:
+        return []
+    try:
+        from rapidfuzz import fuzz
+    except Exception:  # noqa: BLE001 — sin rapidfuzz: grounding por substring
+        fuzz = None
+    verified = []
+    for f in facts:
+        if f.get("relevance_level") not in ("direct_answer", "supporting_evidence"):
+            continue
+        chunk_id = f.get("chunk_id")
+        verbatim = f.get("verbatim_evidence") or ""
+        if not chunk_id or not verbatim:
+            continue
+        try:
+            row = session.execute(
+                text(
+                    "SELECT p.text_span, p.citation_references, p.doc_id, "
+                    "d.title AS doc_title, c.section_path AS chapter_title "
+                    "FROM kag_propositions p "
+                    "JOIN kag_documents d ON p.doc_id = d.id "
+                    "JOIN kag_chunks c ON p.chunk_id = c.id "
+                    "WHERE p.id = :cid"
+                ),
+                {"cid": chunk_id},
+            ).fetchone()
+        except Exception as exc:  # noqa: BLE001 — degradación natural
+            _safe_rollback(session)
+            if verbose:
+                print(f"[KAG] ⚠ Grounding falló para chunk {chunk_id}: {exc}")
+            continue
+        if not row:
+            continue
+        db_span = row.text_span or ""
+        if verbatim in db_span:
+            match_score = 100.0
+        elif fuzz is not None:
+            match_score = float(fuzz.partial_ratio(verbatim, db_span))
+        else:
+            match_score = 0.0
+        if match_score < 95.0:
+            if verbose:
+                print(
+                    f"[KAG] Grounding rechazado: chunk {chunk_id} "
+                    f"(score {match_score:.1f})."
+                )
+            continue
+        verified.append(
+            {
+                "claim_id": str(chunk_id),
+                "verified_fact": f.get("atomic_summary") or f.get("statement", ""),
+                "verbatim_quote": verbatim,
+                "document_id": row.doc_id,
+                "document_title": row.doc_title,
+                "chapter_title": row.chapter_title,
+                "bibtex_citation_key": None,
+                "academic_citations": row.citation_references or [],
+            }
+        )
+    return verified
+
+
+def _branch_b_expand(
+    session, query, entity_ids, visited_chunks, top_k=8, verbose=False
+) -> list:
+    """Expansión Branch B: FTS sobre kag_propositions + vecinos del grafo.
+
+    Devuelve proposiciones nuevas (misma forma que propositions_for_chunks)
+    deduplicadas contra visited_chunks.
+    """
+    new_props: list = []
+    seen: set = set(visited_chunks or [])
+    terms: list = []
+    # (a) Términos del crítico (regex/FTS) para subconsultas ortogonales.
+    try:
+        _regex_hits, regex_terms, _names = critic_and_linking(
+            session, query, top_k=top_k, verbose=False
+        )
+        terms = list(regex_terms or [])
+    except Exception as exc:  # noqa: BLE001 — degradación natural
+        _safe_rollback(session)
+        if verbose:
+            print(f"[KAG] ⚠ Branch B crítico falló: {exc}")
+    # (b) Vecinos del grafo (entidades semilla).
+    if entity_ids:
+        try:
+            rows = session.execute(
+                text(
+                    "SELECT e.name FROM kag_relations r "
+                    "JOIN kag_entities e ON r.target_entity_id = e.id "
+                    "WHERE r.source_entity_id = ANY(:entity_ids) "
+                    "ORDER BY r.id DESC LIMIT 10"
+                ),
+                {"entity_ids": list(entity_ids)},
+            ).fetchall()
+            terms = list(dict.fromkeys(terms + [r.name for r in rows]))
+        except Exception as exc:  # noqa: BLE001 — degradación natural
+            _safe_rollback(session)
+            if verbose:
+                print(f"[KAG] ⚠ Branch B grafo falló: {exc}")
+    # (c) FTS sobre kag_propositions con los términos.
+    for term in terms:
+        if not term or not str(term).strip():
+            continue
+        tokens = [t for t in re.split(r"[\s,;]+", str(term).strip()) if t]
+        if not tokens:
+            continue
+        tsq = _fts_tsquery(tokens)
+        try:
+            rows = session.execute(
+                text(
+                    "SELECT p.id AS prop_id, p.chunk_id, p.statement, p.text_span, "
+                    "p.char_start, p.char_end, p.citation_references, "
+                    "d.title AS doc_title, c.section_path AS chapter_title, "
+                    "ts_rank_cd(to_tsvector('simple', p.statement), "
+                    "to_tsquery('simple', :tsq)) AS score "
+                    "FROM kag_propositions p "
+                    "JOIN kag_documents d ON p.doc_id = d.id "
+                    "JOIN kag_chunks c ON p.chunk_id = c.id "
+                    "WHERE to_tsvector('simple', p.statement) @@ "
+                    "to_tsquery('simple', :tsq) "
+                    "ORDER BY score DESC LIMIT 5"
+                ),
+                {"tsq": tsq},
+            ).fetchall()
+        except Exception as exc:  # noqa: BLE001 — degradación natural
+            _safe_rollback(session)
+            if verbose:
+                print(f"[KAG] ⚠ Branch B FTS falló: {exc}")
+            continue
+        for r in rows:
+            if r.prop_id in seen:
+                continue
+            seen.add(r.prop_id)
+            new_props.append(
+                {
+                    "chunk_id": r.prop_id,
+                    "document_id": None,
+                    "statement": r.statement,
+                    "text_span": r.text_span,
+                    "char_start": r.char_start,
+                    "char_end": r.char_end,
+                    "citation_references": r.citation_references or [],
+                    "doc_title": r.doc_title,
+                    "chapter_title": r.chapter_title,
+                }
+            )
+    return new_props
+
+
+def _ask_audited(session, query, top_k=8, global_top_k=20, verbose=False) -> dict:
+    """Flujo audited completo: recuperación clásica → proposiciones → síntesis
+    → contradicciones → suficiencia → Branch B → grounding → respuesta.
+
+    Devuelve dict: {"answer", "verdict", "grounded_evidence",
+    "epistemic_tensions", "used_fallback"}.
+    """
+    if verbose:
+        print(f"\n🔎 Pregunta (audited): {query}")
+
+    # 1. Recuperación clásica (misma lógica que ask fast).
+    qtype = classify_query(query)
+    k = global_top_k if qtype == "global" else top_k
+    q_emb = None
+    try:
+        from src.embeddings import embed_text
+
+        q_emb = embed_text(query, input_type="query")
+    except Exception as exc:  # noqa: BLE001 — degradación natural
+        _safe_rollback(session)
+        if verbose:
+            print(f"[KAG] ⚠ Embeddings no disponibles ({exc}); solo FTS.")
+    try:
+        vec_hits = hybrid_search(session, query, q_emb, k, verbose=verbose)
+    except Exception as exc:  # noqa: BLE001 — degradación natural
+        _safe_rollback(session)
+        if verbose:
+            print(f"[KAG] ⚠ Búsqueda híbrida falló: {exc}")
+        vec_hits = []
+    vec_hits = apply_relevance_threshold(vec_hits, verbose=verbose)
+    regex_hits, regex_terms, names = [], [], []
+    try:
+        regex_hits, regex_terms, names = critic_and_linking(
+            session, query, top_k=k, verbose=verbose
+        )
+    except Exception as exc:  # noqa: BLE001 — degradación natural
+        _safe_rollback(session)
+        if verbose:
+            print(f"[KAG] ⚠ CRIT+EL fusionado falló: {exc}")
+    embed_fn = None
+    try:
+        from src.embeddings import embed_texts as _embed_texts
+
+        embed_fn = _embed_texts
+    except Exception:  # noqa: BLE001 — sin modelo de embeddings: solo léxico
+        pass
+    groups = match_entities_candidates(session, names, embed_fn=embed_fn)
+    adj = build_adjacency(session) if groups else {}
+    entity_ids = disambiguate_by_cooccurrence(
+        session,
+        groups,
+        adjacency=adj,
+        min_overlap=DISAMBIG_MIN_OVERLAP,
+        margin=DISAMBIG_MARGIN,
+        verbose=verbose,
+    )
+    ppr_scores = {}
+    if entity_ids:
+        sub = ego_network(adj, entity_ids, hops=2)
+        ppr_scores = personalized_pagerank(sub, entity_ids)
+    ppr_entities = ppr_entity_selection(ppr_scores, verbose=verbose)
+    ppr_chunks = (
+        chunks_for_entities(session, ppr_entities, top_n=10) if ppr_entities else []
+    )
+    merged_hits = rrf_merge(
+        vec_hits,
+        regex_hits,
+        [(pc["chunk_id"], 0.0) for pc in ppr_chunks],
+        k=60,
+        top_k=len(vec_hits) + len(regex_hits) + len(ppr_chunks),
+    )
+    merged_ids = [cid for cid, _score in merged_hits]
+    fetched = chunks_by_ids(session, merged_ids)
+    score_by_id = dict(merged_hits)
+    chunks = []
+    for c in fetched:
+        c["score"] = score_by_id.get(c["chunk_id"], 0.0)
+        chunks.append(c)
+    chunks = _group_chunks_with_window(session, chunks)
+    chunk_ids = [c["chunk_id"] for c in chunks]
+
+    # 2. Proposiciones de los chunks ganadores.
+    propositions = propositions_for_chunks(session, chunk_ids)
+    if verbose:
+        print(f"[KAG] Proposiciones: {len(propositions)}")
+
+    # 3. Síntesis fáctica.
+    facts = _synthesize_facts(session, query, propositions, verbose=verbose)
+
+    # 4. Contradicciones.
+    contradiction_report = _resolve_contradictions(
+        session, query, facts, verbose=verbose
+    )
+
+    # 5. Suficiencia + Branch B (hasta 2 iteraciones).
+    corpus_metadata = []
+    try:
+        rows = session.execute(
+            text(
+                "SELECT title, doc_type, summary FROM kag_documents "
+                "WHERE status = 'ready' LIMIT 20"
+            )
+        ).fetchall()
+        corpus_metadata = [
+            {
+                "title": r.title,
+                "doc_type": r.doc_type,
+                "summary": r.summary or "",
+            }
+            for r in rows
+        ]
+    except Exception as exc:  # noqa: BLE001 — degradación natural
+        _safe_rollback(session)
+        if verbose:
+            print(f"[KAG] ⚠ Metadatos de corpus fallaron ({exc}).")
+    evaluation = _evaluate_sufficiency(
+        session, query, facts, corpus_metadata, verbose=verbose
+    )
+    verdict = evaluation.get("verdict", "SUFFICIENT_FOR_SYNTHESIS")
+
+    if verdict == "NEGATIVE_REJECTION":
+        details = evaluation.get("negative_rejection_details") or {}
+        abstention = details.get("formal_abstention_statement") or (
+            "El corpus disponible no cubre el dominio conceptual requerido "
+            "por la consulta (abstención temprana)."
+        )
+        if verbose:
+            print(f"[KAG] ⛔ Abstención formal: {abstention}")
+        return {
+            "answer": abstention,
+            "verdict": verdict,
+            "grounded_evidence": [],
+            "epistemic_tensions": [],
+            "used_fallback": False,
+        }
+
+    visited_chunks = [p.get("chunk_id") for p in propositions if p.get("chunk_id")]
+    max_iterations = 2
+    iteration = 0
+    while verdict == "INSUFFICIENT_TRIGGER_BRANCH_B" and iteration <= max_iterations:
+        if verbose:
+            print(f"[KAG] Branch B iteración {iteration} (max {max_iterations}).")
+        extra = _branch_b_expand(
+            session, query, entity_ids, visited_chunks, top_k=k, verbose=verbose
+        )
+        if not extra:
+            break
+        extra_facts = _synthesize_facts(session, query, extra, verbose=verbose)
+        facts = list(facts) + extra_facts
+        contradiction_report = _resolve_contradictions(
+            session, query, facts, verbose=verbose
+        )
+        evaluation = _evaluate_sufficiency(
+            session, query, facts, corpus_metadata, verbose=verbose
+        )
+        verdict = evaluation.get("verdict", "SUFFICIENT_FOR_SYNTHESIS")
+        iteration += 1
+        visited_chunks = list(
+            dict.fromkeys(visited_chunks + [p.get("chunk_id") for p in extra])
+        )
+
+    # 6. Grounding verbatim.
+    grounded_evidence = _verify_grounding(session, facts, verbose=verbose)
+
+    # 7. Tensiones epistémicas.
+    tensions = []
+    for case in contradiction_report.get("analysis_cases") or []:
+        tensions.append(
+            {
+                "tension_label": case.get(
+                    "conflict_type", "paradigmatic_theoretical_divergence"
+                ),
+                "divergence_description": case.get("divergence_summary", ""),
+                "framework_a": (case.get("thesis_a") or {}).get(
+                    "author_or_framework", ""
+                ),
+                "framework_b": (case.get("thesis_b") or {}).get(
+                    "author_or_framework", ""
+                ),
+            }
+        )
+
+    # 8. Respuesta final con el LLM grande.
+    retries, fallback = _settings_retries(session)
+    _small_model, large_model = _settings_models(session)
+    used_fallback = False
+    system, user_template = _get_prompt_pair(
+        session,
+        large_model,
+        TASK_ANSWER,
+        AUDITED_ANSWER_SYSTEM_SHORT,
+        AUDITED_ANSWER_PROMPT,
+    )
+    prompt = user_template.format(
+        query=query,
+        grounded_evidence_json=_json_dumps(grounded_evidence),
+        epistemic_tensions_json=_json_dumps(tensions),
+    )
+    try:
+        text_out, _model, used_fallback = call_with_retries(
+            session,
+            prompt=prompt,
+            system=system,
+            model_size="large",
+            response_format=None,
+            retries=retries,
+            fallback_model=fallback,
+        )
+        answer = text_out
+    except Exception as exc:  # noqa: BLE001 — degradación: contexto crudo
+        _safe_rollback(session)
+        if verbose:
+            print(f"[KAG] ⚠ Respuesta LLM falló ({exc}); contexto crudo.")
+        answer = _json_dumps(
+            {"grounded_evidence": grounded_evidence, "epistemic_tensions": tensions}
+        )
+        used_fallback = True
+
+    if verbose:
+        print(f"[KAG] Verdict: {verdict} | Evidencia: {len(grounded_evidence)}")
+    return {
+        "answer": answer,
+        "verdict": verdict,
+        "grounded_evidence": grounded_evidence,
+        "epistemic_tensions": tensions,
+        "used_fallback": used_fallback,
+    }
+
+
+# ---------------------------------------------------------------------
 # Flujo completo
 # ---------------------------------------------------------------------
 
 
-def ask(session, query, top_k=8, global_top_k=20, verbose=True, history=None):
-    """Flujo completo de consulta KAG (§3.1 del diseño). Devuelve la respuesta.
+def ask(
+    session, query, top_k=8, global_top_k=20, verbose=True, history=None, mode="fast"
+):
+    """Flujo completo de consulta KAG (§3.1 del diseño).
 
     `history` (opcional) es una lista de dicts {"role", "content"} del
     historial de conversación. PREPARADO pero aún sin probar con Docker:
     se incluye como sección informativa en el contexto, no modifica la
     búsqueda.
+
+    `mode` (opcional): "fast" (default) devuelve la respuesta como str con
+    el contexto clásico + proposiciones atómicas de los chunks ganadores;
+    "audited" devuelve un dict con la auditoría epistémica completa
+    (síntesis, contradicciones, suficiencia, Branch B, grounding).
     """
+    if mode == "audited":
+        return _ask_audited(
+            session, query, top_k=top_k, global_top_k=global_top_k, verbose=verbose
+        )
     if verbose:
         print(f"\n🔎 Pregunta: {query}")
 
@@ -1863,9 +2617,20 @@ def ask(session, query, top_k=8, global_top_k=20, verbose=True, history=None):
     if verbose:
         print(f"[KAG] Resúmenes: {len(summaries)} documentos")
 
+    # 8.5. Proposiciones atómicas de los chunks ganadores (capa micro).
+    propositions = propositions_for_chunks(session, chunk_ids)
+    if verbose:
+        print(f"[KAG] Proposiciones: {len(propositions)}")
+
     # 9. Ensamblar contexto
     context = assemble_context(
-        chunks, triples, figures, summaries, query, history=history
+        chunks,
+        triples,
+        figures,
+        summaries,
+        query,
+        history=history,
+        propositions=propositions,
     )
     if verbose:
         print("\n[KAG] Contexto ensamblado:")
@@ -1903,6 +2668,12 @@ def main() -> None:
     parser.add_argument(
         "--verbose", action="store_true", default=True, help="Prints descriptivos."
     )
+    parser.add_argument(
+        "--mode",
+        choices=["fast", "audited"],
+        default="fast",
+        help="Modo de consulta: fast (respuesta directa) o audited (auditoría epistémica).",
+    )
     args = parser.parse_args()
 
     _fix_db_host()
@@ -1916,6 +2687,7 @@ def main() -> None:
             top_k=args.top_k,
             global_top_k=args.global_top_k,
             verbose=args.verbose,
+            mode=args.mode,
         )
         print(answer)
     finally:

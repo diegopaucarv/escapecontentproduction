@@ -11,7 +11,6 @@ import pytest
 from src.kag.stages import (
     CLEANUP_SQL,
     KAG_INGEST_STAGES,
-    KAG_PROPOSITIONAL_STAGES,
     cleanup_stage,
     get_stage,
     next_stage,
@@ -34,17 +33,6 @@ def test_kag_ingest_stages_order():
     ]
 
 
-def test_kag_propositional_stages_order():
-    assert KAG_PROPOSITIONAL_STAGES == [
-        "detected",
-        "analysis",
-        "chunks",
-        "topic_tree",
-        "images",
-        "ready",
-    ]
-
-
 # ---------------------------------------------------------------------
 # resume_from
 # ---------------------------------------------------------------------
@@ -54,13 +42,11 @@ def test_resume_from_first_stage():
     # Sin stage previo (fila nueva) -> primera etapa.
     assert resume_from(KAG_INGEST_STAGES, "") == "pending"
     assert resume_from(KAG_INGEST_STAGES, None) == "pending"
-    assert resume_from(KAG_PROPOSITIONAL_STAGES, "") == "detected"
 
 
 def test_resume_from_unknown_stage():
     # Stage desconocido -> primera etapa (defensivo).
     assert resume_from(KAG_INGEST_STAGES, "bogus") == "pending"
-    assert resume_from(KAG_PROPOSITIONAL_STAGES, "bogus") == "detected"
 
 
 def test_resume_from_intermediate_stage():
@@ -69,17 +55,11 @@ def test_resume_from_intermediate_stage():
     assert resume_from(KAG_INGEST_STAGES, "segmented") == "chunked"
     assert resume_from(KAG_INGEST_STAGES, "chunked") == "figures"
     assert resume_from(KAG_INGEST_STAGES, "figures") == "ready"
-    assert resume_from(KAG_PROPOSITIONAL_STAGES, "detected") == "analysis"
-    assert resume_from(KAG_PROPOSITIONAL_STAGES, "analysis") == "chunks"
-    assert resume_from(KAG_PROPOSITIONAL_STAGES, "chunks") == "topic_tree"
-    assert resume_from(KAG_PROPOSITIONAL_STAGES, "topic_tree") == "images"
-    assert resume_from(KAG_PROPOSITIONAL_STAGES, "images") == "ready"
 
 
 def test_resume_from_ready():
     # 'ready' es terminal: no hay nada que reanudar.
     assert resume_from(KAG_INGEST_STAGES, "ready") == "ready"
-    assert resume_from(KAG_PROPOSITIONAL_STAGES, "ready") == "ready"
 
 
 # ---------------------------------------------------------------------
@@ -104,8 +84,6 @@ def test_cleanup_sql_covers_all_stages():
     # no necesitan: la primera no tiene datos previos, 'ready' es terminal).
     for stage in KAG_INGEST_STAGES[1:-1]:
         assert CLEANUP_SQL["kag_documents"][stage], f"falta cleanup {stage}"
-    for stage in KAG_PROPOSITIONAL_STAGES[1:-1]:
-        assert CLEANUP_SQL["documents"][stage], f"falta cleanup {stage}"
 
 
 def test_cleanup_stage_executes_sql():
@@ -119,10 +97,10 @@ def test_cleanup_stage_executes_sql():
         def commit(self):
             pass
 
-    cleanup_stage(_FakeSession(), "documents", 42, "chunks")
-    assert len(executed) == 1
+    cleanup_stage(_FakeSession(), "kag_documents", 42, "chunked")
+    assert len(executed) == 3
     sql, params = executed[0]
-    assert "DELETE FROM propositional_chunks" in sql
+    assert "DELETE FROM kag_relations" in sql
     assert params == {"doc_id": 42}
 
 
@@ -135,7 +113,7 @@ def test_cleanup_stage_unknown_stage_noop():
             pass
 
     # Etapa sin cleanup registrado -> no ejecuta nada.
-    cleanup_stage(_FakeSession(), "documents", 1, "detected")
+    cleanup_stage(_FakeSession(), "kag_documents", 1, "pending")
 
 
 # ---------------------------------------------------------------------
@@ -149,7 +127,7 @@ def test_get_stage_reads_column():
             assert params == {"id": 7}
             return SimpleNamespace(first=lambda: SimpleNamespace(stage="chunks"))
 
-    assert get_stage(_FakeSession(), "documents", 7) == "chunks"
+    assert get_stage(_FakeSession(), "kag_documents", 7) == "chunks"
 
 
 def test_get_stage_missing_row_returns_empty():
@@ -157,7 +135,7 @@ def test_get_stage_missing_row_returns_empty():
         def execute(self, stmt, params=None):
             return SimpleNamespace(first=lambda: None)
 
-    assert get_stage(_FakeSession(), "documents", 7) == ""
+    assert get_stage(_FakeSession(), "kag_documents", 7) == ""
 
 
 def test_set_stage_updates_and_commits():

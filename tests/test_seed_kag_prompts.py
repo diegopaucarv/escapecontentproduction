@@ -1,6 +1,6 @@
 """Tests del seed de prompts KAG (src/db/seed_kag_prompts.py) — sin DB.
 
-Verifica la migración completa a prompt-as-code (0021): las 16 specs
+Verifica la migración completa a prompt-as-code (0021): las 11 specs
 incluyen `user_template` (el USER prompt parametrizable que antes era
 constante en código) además del SYSTEM (intent + rules).
 """
@@ -8,31 +8,26 @@ constante en código) además del SYSTEM (intent + rules).
 from src.db.seed_kag_prompts import KAG_TEMPLATES
 
 EXPECTED_TASK_KEYS = {
-    # A. src/kag_propositional.py
-    "kag_metadata",
-    "kag_chapters",
-    "kag_document_analysis",
-    "kag_propositional_chunking",
-    "kag_topic_label",
-    "kag_vision_analysis",
-    # B. src/kag_agents.py
+    # A. Modo audited (src/kag_query.py)
     "kag_synthesis",
     "kag_contradictions",
     "kag_sufficiency",
     "kag_answer",
-    # C. src/kag_query.py
+    # B. src/kag_query.py (clásico)
     "kag_grounded_entities",
     "kag_critic_regex",
     "kag_critic_linking",
     "kag_query_answer",
-    # D. src/kag_ingest.py
+    # C. src/kag_ingest.py
     "kag_extract_entities",
     "kag_qwen_summary",
+    # C. src/kag_ingest.py (expansión proposicional, Agente B)
+    "kag_proposition_chunking",
 }
 
 
-def test_kag_templates_has_16_specs():
-    assert len(KAG_TEMPLATES) == 16
+def test_kag_templates_has_11_specs():
+    assert len(KAG_TEMPLATES) == 11
 
 
 def test_kag_templates_task_keys_match_expected():

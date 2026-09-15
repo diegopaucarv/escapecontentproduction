@@ -1,7 +1,7 @@
 """Máquina de estados de ingesta KAG — atomicidad por etapa.
 
-Cada pipeline (legacy `kag_ingest.py` y proposicional `kag_propositional.py`)
-tiene su propia secuencia de etapas. Este módulo centraliza:
+El pipeline clásico (`kag_ingest.py`) tiene su propia secuencia de etapas.
+Este módulo centraliza:
 
   - La definición de las secuencias (orden canónico de etapas).
   - La lectura/escritura de `stage` en la tabla maestra.
@@ -15,7 +15,7 @@ Contrato de una etapa:
   3. `set_stage(session, doc_id, stage)` — registra la etapa completada.
 
 Si el proceso se interrumpe a mitad de una etapa, la fila queda con el stage
-de la ÚLTIMA etapa completada; al reanudar se salta todo lo ya hecho y se
+ de la ÚLTIMA etapa completada; al reanudar se salta todo lo ya hecho y se
 re-ejecuta solo la etapa interrumpida (con su cleanup previo).
 """
 
@@ -27,23 +27,13 @@ from sqlalchemy import text
 # Secuencias canónicas de etapas
 # ---------------------------------------------------------------------
 
-# Pipeline legacy (src/kag_ingest.py) — tabla kag_documents.
+# Pipeline clásico (src/kag_ingest.py) — tabla kag_documents.
 KAG_INGEST_STAGES = [
     "pending",  # fila insertada, nada persistido
     "segmented",  # chunks insertados (embedding NULL) — segmentación persistida
     "chunked",  # embeddings + entidades + relaciones
     "figures",  # figuras indexadas
     "ready",  # resumen + status='ready'
-]
-
-# Pipeline proposicional (src/kag_propositional.py) — tabla documents.
-KAG_PROPOSITIONAL_STAGES = [
-    "detected",  # MultibookFinderTool lo detectó (manifest), sin fila en DB
-    "analysis",  # ficha + capítulos (documents + document_chapters)
-    "chunks",  # propositional_chunks + embeddings
-    "topic_tree",  # topic_tree_nodes
-    "images",  # document_images
-    "ready",  # status='ready'
 ]
 
 # ---------------------------------------------------------------------
@@ -117,7 +107,7 @@ def cleanup_stage(session, table: str, doc_id: int, stage: str) -> None:
 # ---------------------------------------------------------------------
 
 CLEANUP_SQL: dict[str, dict[str, list[str]]] = {
-    # Pipeline legacy — kag_documents
+    # Pipeline clásico — kag_documents
     "kag_documents": {
         "segmented": [
             # Re-segmentar: borra chunks (cascada a entidades/relaciones/figuras
@@ -126,32 +116,19 @@ CLEANUP_SQL: dict[str, dict[str, list[str]]] = {
             # El índice de frecuencia de palabras se reescribe por doc en esta
             # etapa (migración 0023): limpiarlo junto con los chunks.
             "DELETE FROM kag_word_freq WHERE doc_id = :doc_id",
+            # Las proposiciones se re-extraen junto con el chunking (0024).
+            "DELETE FROM kag_propositions WHERE doc_id = :doc_id",
         ],
         "chunked": [
             # Re-embeder/entidades: borra entidades y relaciones (los chunks ya
             # están; se re-insertan con embedding).
             "DELETE FROM kag_relations WHERE doc_id = :doc_id",
             "DELETE FROM kag_entities WHERE doc_id = :doc_id",
+            # Las proposiciones se re-extraen junto con el chunking (0024).
+            "DELETE FROM kag_propositions WHERE doc_id = :doc_id",
         ],
         "figures": [
             "DELETE FROM kag_figures WHERE doc_id = :doc_id",
-        ],
-    },
-    # Pipeline proposicional — documents
-    "documents": {
-        "analysis": [
-            # Re-análisis: borra capítulos (cascada a chunks/topic/images vía
-            # document_id/chapter_id ON DELETE CASCADE).
-            "DELETE FROM document_chapters WHERE document_id = :doc_id",
-        ],
-        "chunks": [
-            "DELETE FROM propositional_chunks WHERE document_id = :doc_id",
-        ],
-        "topic_tree": [
-            "DELETE FROM topic_tree_nodes WHERE document_id = :doc_id",
-        ],
-        "images": [
-            "DELETE FROM document_images WHERE document_id = :doc_id",
         ],
     },
 }

@@ -1,9 +1,9 @@
 """
 Seed de las specs de prompts del pipeline KAG (prompt-as-code).
 
-Inserta/actualiza en `prompt_templates` las 16 specs agnósticas de los
-prompts del sistema KAG (ingesta proposicional, agentes query-time, query
-clásica e ingesta clásica). Cada spec captura el rol (intent) y las
+Inserta/actualiza en `prompt_templates` las 11 specs agnósticas de los
+prompts del sistema KAG (modo audited de la consulta, query clásica e
+ingesta clásica expandida). Cada spec captura el rol (intent) y las
 instrucciones (rules) del SYSTEM prompt actual; el USER prompt (con sus
 placeholders) se construye en runtime y NO vive en la spec.
 
@@ -33,359 +33,7 @@ from src.db.models import PromptTemplate
 # ---------------------------------------------------------------------
 
 KAG_TEMPLATES = [
-    # --- A. src/kag_propositional.py -----------------------------------
-    {
-        "task_key": "kag_metadata",
-        "user_template": """Archivo: {source_file}
-ID de Documento: {document_id}
-Rango de Líneas: {line_start} a {line_end}
-
-Contenido inicial del documento:
----
-{document_head_snippet}
----
-
-Genera el JSON estricto con este schema:
-{"source_file": str, "document_id": str, "title": str, "technical_level": "introductory|intermediate|advanced|research", "bibtex": str, "thematic_areas_iso25964": [{"preferred_term": str, "non_preferred_terms": [str], "scope_note_disambiguation": str, "broader_term": str, "narrower_term": str, "related_terms": [str]}], "library_of_congress": {"lcsh_terms": [{"term": str, "uri": str}], "lcc_classification": {"class_code": str, "class_title": str, "uri": str}}, "key_entities": [str]}""",
-        "version": "1.0",
-        "intent": (
-            "Eres un indexador bibliografico especializado en Ciencias Sociales "
-            "y normas de documentacion formal (ISO 25964 y Library of Congress). "
-            "Tu rol es extraer los metadatos estructurales del documento "
-            "delimitado por las lineas indicadas."
-        ),
-        "rules": [
-            (
-                "Normalizacion de Tesauros (ISO 25964): proporciona un minimo de "
-                "3 tematicas principales con preferred_term, non_preferred_terms, "
-                "scope_note_disambiguation, broader_term, narrower_term y "
-                "related_terms"
-            ),
-            (
-                "Clasificacion de la Biblioteca del Congreso (LCC y LCSH): "
-                "proporciona las materias LCSH con su codigo LCC representativo"
-            ),
-            "Registro BibTeX formal del documento",
-            "Salida JSON estricta con el schema indicado",
-        ],
-        "input_schema": {
-            "source_file": "string",
-            "document_id": "string",
-            "line_start": "integer",
-            "line_end": "integer",
-            "document_head_snippet": "string",
-        },
-        "output_schema": {
-            "source_file": "string",
-            "document_id": "string",
-            "title": "string",
-            "technical_level": "introductory|intermediate|advanced|research",
-            "bibtex": "string",
-            "thematic_areas_iso25964": "array",
-            "library_of_congress": "object",
-            "key_entities": "array",
-        },
-        "few_shot": [],
-    },
-    {
-        "task_key": "kag_chapters",
-        "user_template": """Archivo maestro: {source_file}
-ID de documento: {document_id}
-Límites del documento: {line_start} a {line_end}
-
-Líneas del documento numeradas:
-{numbered_text_block}
-
-Devuelve el JSON: {"source_file": str, "document_id": str, "total_chapters": int, "chapters": [{"chapter_index": int, "title": str, "line_start": int, "line_end": int, "main_theme": str, "subsections": [{"title": str, "line_start": int, "line_end": int}]}]}""",
-        "version": "1.0",
-        "intent": (
-            "Eres un parser de estructura textual. Analizas el archivo Markdown "
-            "provisto y extraes la segmentacion completa de capitulos para el "
-            "documento especificado."
-        ),
-        "rules": [
-            "Cada capitulo debe contener el numero exacto de linea de inicio y fin",
-            ("La salida debe reflejar la jerarquia: archivo -> documento -> capitulos"),
-            "Identificar los titulos de capitulo (#, ## o mayusculas canonicas)",
-            (
-                "El line_end del capitulo N debe ser la linea inmediatamente "
-                "anterior al line_start del capitulo N+1; para el ultimo, el "
-                "line_end global del documento"
-            ),
-            (
-                "Si existen subsecciones relevantes, mapear sus lineas sin quebrar "
-                "los rangos del capitulo contenedor"
-            ),
-            "Salida JSON estricta con el schema indicado",
-        ],
-        "input_schema": {
-            "source_file": "string",
-            "document_id": "string",
-            "line_start": "integer",
-            "line_end": "integer",
-            "numbered_text_block": "string",
-        },
-        "output_schema": {
-            "source_file": "string",
-            "document_id": "string",
-            "total_chapters": "integer",
-            "chapters": "array",
-        },
-        "few_shot": [],
-    },
-    {
-        "task_key": "kag_document_analysis",
-        "user_template": """Archivo: {source_file}
-ID de Documento: {document_id}
-Rango de Líneas: {line_start} a {line_end}
-
-Esqueleto del documento (primeras líneas + encabezados H1/H2/H3 con su número de línea real):
----
-{document_skeleton}
----
-
-Genera el JSON estricto con este schema:
-{"source_file": str, "document_id": str, "title": str, "technical_level": "introductory|intermediate|advanced|research", "bibtex": str, "thematic_areas_iso25964": [{"preferred_term": str, "non_preferred_terms": [str], "scope_note_disambiguation": str, "broader_term": str, "narrower_term": str, "related_terms": [str]}], "library_of_congress": {"lcsh_terms": [{"term": str, "uri": str}], "lcc_classification": {"class_code": str, "class_title": str, "uri": str}}, "key_entities": [str], "summary": str, "chapters": [{"chapter_index": int, "title": str, "line_start": int, "line_end": int, "main_theme": str, "summary": str, "subsections": [{"title": str, "line_start": int, "line_end": int}]}]}""",
-        "version": "1.0",
-        "intent": (
-            "Eres un indexador bibliografico especializado en Ciencias Sociales "
-            "y un parser estructural de documentos academicos. Tu rol es producir, "
-            "en UNA sola pasada, el analisis documental completo del documento "
-            "delimitado por las lineas indicadas."
-        ),
-        "rules": [
-            (
-                "Ficha bibliografica: title, technical_level "
-                "(introductory|intermediate|advanced|research) y bibtex (registro "
-                "BibTeX formal)"
-            ),
-            (
-                "Normalizacion de Tesauros (ISO 25964): minimo de 3 tematicas "
-                "principales con preferred_term, non_preferred_terms, "
-                "scope_note_disambiguation, broader_term, narrower_term y "
-                "related_terms"
-            ),
-            (
-                "Clasificacion de la Biblioteca del Congreso (LCC y LCSH): materias "
-                "LCSH con su codigo LCC representativo"
-            ),
-            (
-                "Resumen Ejecutivo Global: summary, sintesis de 2-4 oraciones de la "
-                "tesis central y la progresion argumental de TODO el documento"
-            ),
-            (
-                "Estructura de capitulos: chapters[] con chapter_index, title, "
-                "line_start, line_end, main_theme, summary y subsections[]; el "
-                "line_end del capitulo N es la linea anterior al line_start del "
-                "N+1 y el ultimo usa el line_end global"
-            ),
-            (
-                "Entidades Rectoras: key_entities, entre 15 y 30 conceptos "
-                "ontologicos nucleares del documento"
-            ),
-            (
-                "La salida debe ser un unico objeto JSON atomico que combine ficha, "
-                "tematicas, clasificacion, resumen global, capitulos y entidades"
-            ),
-        ],
-        "input_schema": {
-            "source_file": "string",
-            "document_id": "string",
-            "line_start": "integer",
-            "line_end": "integer",
-            "document_skeleton": "string",
-        },
-        "output_schema": {
-            "source_file": "string",
-            "document_id": "string",
-            "title": "string",
-            "technical_level": "introductory|intermediate|advanced|research",
-            "bibtex": "string",
-            "thematic_areas_iso25964": "array",
-            "library_of_congress": "object",
-            "key_entities": "array",
-            "summary": "string",
-            "chapters": "array",
-        },
-        "few_shot": [],
-    },
-    {
-        "task_key": "kag_propositional_chunking",
-        "user_template": """Archivo: {source_file}
-Documento: {document_id}
-Capítulo: {chapter_index} - {chapter_title}
-Rango: Línea {line_start} a Línea {line_end}
-
-Texto a procesar:
----
-{chapter_text_content}
----
-
-Genera el JSON: {"source_file": str, "document_id": str, "chapter_index": int, "chapter_title": str, "core_ideas": [{"core_idea_id": str, "central_claim": str, "supporting_arguments": [{"argument_id": str, "argument_type": "empirical_evidence|theoretical_deduction|methodological_critique|comparative_analysis", "argument_statement": str, "propositional_chunks": [{"chunk_id": str, "proposition": str, "verbatim_span": str, "line_start": int, "line_end": int, "char_start": int, "char_end": int, "citations_references": [str]}]}]}]}""",
-        "version": "1.0",
-        "intent": (
-            "Eres un analista de epistemologia y analisis del discurso. Tu objetivo "
-            "es realizar una extraccion proposicional jerarquica sobre el texto de "
-            "un capitulo."
-        ),
-        "rules": [
-            (
-                "Nivel 1 - Ideas Centrales (Central Claims): formular las tesis "
-                "teoricas de alto nivel defendidas en el texto"
-            ),
-            (
-                "Nivel 2 - Argumentos (Supporting Arguments): identificar las "
-                "premisas logicas, pruebas empiricas o deducciones conceptuales "
-                "que sustentan cada tesis"
-            ),
-            (
-                "Nivel 3 - Proposiciones Atomicas (Chunks): descomponer cada "
-                "argumento en proposiciones elementales gramaticalmente "
-                "independientes y autocontenidas, reemplazando anforas por el "
-                "sujeto explicito"
-            ),
-            ("verbatim_span debe contener el fragmento de texto exacto del original"),
-            (
-                "REGLA DE REFERENCIAS DUPLICADAS: si una frase contiene una "
-                "referencia academica, debe preservarse y duplicarse en "
-                "citations_references de TODAS las proposiciones atomicas que "
-                "deriven de ella; prohibido descartar o separar citas bibliograficas"
-            ),
-            "Salida JSON estricta con el schema indicado",
-        ],
-        "input_schema": {
-            "source_file": "string",
-            "document_id": "string",
-            "chapter_index": "integer",
-            "chapter_title": "string",
-            "line_start": "integer",
-            "line_end": "integer",
-            "chapter_text_content": "string",
-        },
-        "output_schema": {
-            "source_file": "string",
-            "document_id": "string",
-            "chapter_index": "integer",
-            "chapter_title": "string",
-            "core_ideas": "array",
-        },
-        "few_shot": [],
-    },
-    {
-        "task_key": "kag_topic_label",
-        "user_template": """Archivo: {source_file}
-Documento: {document_id}
-Orden secuencial: Fase {sequential_order}
-Palabras representativas c-TF-IDF: {top_ctfidf_keywords}
-Rango de chunks: {start_chunk_id} a {end_chunk_id}
-
-Proposiciones constitutivas del cluster:
----
-{cluster_statements_text}
----
-
-Genera el JSON: {"source_file": str, "document_id": str, "sequential_order": int, "macro_phase_label": str, "representative_keywords": [str], "start_chunk_id": str, "end_chunk_id": str, "epistemic_summary": str}""",
-        "version": "1.0",
-        "intent": (
-            "Eres un analista bibliometrico y de modelado de topicos. Se te presenta "
-            "una secuencia temporal ordenada de proposiciones atomicas agrupadas "
-            "mediante agrupamiento aglomerativo secuencial (c-TF-IDF). Tu funcion "
-            "es sintetizar el significado del grupo y asignarle una etiqueta "
-            "tematica precisa que preserve la progresion del texto original."
-        ),
-        "rules": [
-            (
-                "macro_phase_label: asignar un titulo representativo y conciso que "
-                "describa la funcion del bloque tematico dentro de la obra"
-            ),
-            (
-                "epistemic_summary: resumir en dos oraciones la tesis o progresion "
-                "conceptual central del rango de proposiciones"
-            ),
-            (
-                "Conservar estrictamente los identificadores de chunk de inicio y "
-                "fin provistos"
-            ),
-            "Salida JSON estricta con el schema indicado",
-        ],
-        "input_schema": {
-            "source_file": "string",
-            "document_id": "string",
-            "sequential_order": "integer",
-            "top_ctfidf_keywords": "string",
-            "start_chunk_id": "string",
-            "end_chunk_id": "string",
-            "cluster_statements_text": "string",
-        },
-        "output_schema": {
-            "source_file": "string",
-            "document_id": "string",
-            "sequential_order": "integer",
-            "macro_phase_label": "string",
-            "representative_keywords": "array",
-            "start_chunk_id": "string",
-            "end_chunk_id": "string",
-            "epistemic_summary": "string",
-        },
-        "few_shot": [],
-    },
-    {
-        "task_key": "kag_vision_analysis",
-        "user_template": """Documento: {document_id}
-Línea de inserción: {anchor_line}
-Etiqueta Markdown original: {markdown_tag}
-Texto de contexto circundante (±15 líneas):
----
-{surrounding_text_context}
----
-
-Examina la imagen cargada y devuelve el JSON: {"image_id": str, "document_id": str, "file_path": str, "anchor_line": int, "caption": str, "image_type": "diagram|chart_or_plot|flowchart|conceptual_illustration|screenshot|table_image|photograph", "dense_visual_description": str, "epistemic_contribution": str, "faq_indexing": [str], "associated_entities": [str]}""",
-        "version": "1.0",
-        "intent": (
-            "Eres un asistente de investigacion visual especializado en analisis de "
-            "diagramas cientificos, graficos metodologicos y esquemas teoricos. Tu "
-            "objetivo es analizar la imagen suministrada junto al contexto textual "
-            "donde fue citada dentro del documento."
-        ),
-        "rules": [
-            (
-                "dense_visual_description: transcribir todo texto, etiquetas de "
-                "ejes, valores numericos, leyendas y flujos de cajas o flechas "
-                "visibles; desglosar los componentes exactos sin generalizaciones"
-            ),
-            (
-                "epistemic_contribution: explicar con rigor que fenomeno o "
-                "mecanismo teorico/metodologico formaliza o comprueba la imagen"
-            ),
-            (
-                "faq_indexing: generar entre 3 y 5 preguntas explicitas cuya "
-                "respuesta este contenida visualmente en la imagen (Reverse HyDE), "
-                "incluyendo las variables y relaciones exactas representadas"
-            ),
-            "Extraer las entidades clave directamente referenciadas en el grafico",
-            "Salida JSON estricta con el schema indicado",
-        ],
-        "input_schema": {
-            "document_id": "string",
-            "anchor_line": "integer",
-            "markdown_tag": "string",
-            "surrounding_text_context": "string",
-        },
-        "output_schema": {
-            "image_id": "string",
-            "document_id": "string",
-            "file_path": "string",
-            "anchor_line": "integer",
-            "caption": "string",
-            "image_type": "diagram|chart_or_plot|flowchart|conceptual_illustration|screenshot|table_image|photograph",
-            "dense_visual_description": "string",
-            "epistemic_contribution": "string",
-            "faq_indexing": "array",
-            "associated_entities": "array",
-        },
-        "few_shot": [],
-    },
-    # --- B. src/kag_agents.py -------------------------------------------
+    # --- Modo audited (src/kag_query.py) -----------------------------
     {
         "task_key": "kag_synthesis",
         "user_template": """Consulta del usuario: "{query}"
@@ -850,6 +498,60 @@ Summary:""",
         },
         "output_schema": {
             "summary": "string",
+        },
+        "few_shot": [],
+    },
+    # --- D. src/kag_ingest.py (expansión proposicional, Agente B) ---------
+    {
+        "task_key": "kag_proposition_chunking",
+        "user_template": """Archivo: {source_file}
+Documento: {document_id}
+Chunk: {chunk_index} - {chunk_title}
+Rango: Línea {line_start} a Línea {line_end}
+
+Texto a procesar:
+---
+{chapter_text_content}
+---
+
+Genera el JSON: {"propositions": [{"core_idea_id": str, "argument_id": str, "statement": str, "text_span": str, "char_start": int, "char_end": int, "line_start": int, "line_end": int, "citations_references": [str]}]}""",
+        "version": "1.0",
+        "intent": (
+            "Eres un analista de epistemologia y analisis del discurso. Tu "
+            "objetivo es descomponer el texto del chunk en proposiciones "
+            "atomicas gramaticalmente independientes y autocontenidas."
+        ),
+        "rules": [
+            (
+                "Proposiciones Atomicas: descomponer el texto en proposiciones "
+                "elementales gramaticalmente independientes y autocontenidas, "
+                "reemplazando anforas por el sujeto explicito"
+            ),
+            "text_span debe contener el fragmento de texto exacto del original",
+            (
+                "char_start/char_end y line_start/line_end: offsets absolutos "
+                "del text_span dentro del chunk"
+            ),
+            (
+                "REGLA DE REFERENCIAS DUPLICADAS: si una frase contiene una "
+                "referencia academica, debe preservarse y duplicarse en "
+                "citations_references de TODAS las proposiciones atomicas que "
+                "deriven de ella; prohibido descartar o separar citas "
+                "bibliograficas"
+            ),
+            "Salida JSON estricta con el schema indicado",
+        ],
+        "input_schema": {
+            "source_file": "string",
+            "document_id": "string",
+            "chunk_index": "integer",
+            "chunk_title": "string",
+            "line_start": "integer",
+            "line_end": "integer",
+            "chapter_text_content": "string",
+        },
+        "output_schema": {
+            "propositions": "array",
         },
         "few_shot": [],
     },

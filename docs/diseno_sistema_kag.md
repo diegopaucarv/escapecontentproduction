@@ -744,3 +744,138 @@ query ──► 1. Embedding (input_type='query')
 - Servir Qwen 2.5 vía Ollama/vLLM (hoy: endpoint OpenAI-compatible, p. ej. llama.cpp server).
 - Historial de conversación con Docker (el `history` de `assemble_context` está preparado pero sin probar con Docker).
 - Calibración de umbrales con datos reales: `TOPIC_DISTANCE_THRESHOLD=0.55`, `MAX_CONTEXT_CHARS=12000` y el umbral de grounding (rapidfuzz ≥95) son valores iniciales — ajustarlos con el corpus proposicional real.
+
+---
+
+## 8. Orden de trabajo — Unificación KAG (expansión del clásico, eliminación del proposicional)
+
+> **Decisión de arquitectura (2026-09-15):** unificar los dos motores KAG en un pipeline híbrido de dos niveles de grano (chunks macro + proposiciones micro) con enrutamiento adaptativo (`mode="fast"` para CLI, `mode="audited"` para API). **NO se modifican los pasos del algoritmo clásico** (ingesta o ask): el workflow actual funciona bien y sus especificidades se conservan. El clásico se **EXPANDE** con código adyacente degradable, y el motor proposicional (`src/kag_propositional.py` + `src/kag_agents.py` + sus 5 tablas) se **ELIMINA** al final. Esta sección es la especificación de trabajo para los agentes: cada agente lee su subsección y ejecuta SOLO su scope.
+
+### 8.0 Filosofía y restricciones globales (TODOS los agentes)
+
+1. **NO tocar los pasos del algoritmo clásico.** `src/kag_ingest.py` (etapas `pending → segmented → chunked → figures → ready`) y `src/kag_query.py` (`ask()` fast) se conservan EXACTOS en su comportamiento actual. Toda adición es código NUEVO adyacente, con degradación natural (try/except + log, nunca romper).
+2. **EXPANDIR el clásico en base al proposicional.** Las capacidades valiosas del motor proposicional (proposiciones atómicas, auditoría epistémica: síntesis/contradicciones/suficiencia/Branch B/grounding) se portan al clásico, adaptadas a `kag_chunks`/`kag_entities`/`kag_relations` y a la nueva tabla `kag_propositions`.
+3. **ELIMINAR el proposicional** (solo el Agente E, al final): borrar `src/kag_propositional.py`, `src/kag_agents.py`, sus tests, sus 5 tablas (`documents`, `document_chapters`, `propositional_chunks`, `topic_tree_nodes`, `document_images`) y las specs de prompts muertas.
+4. **Patrones obligatorios (pitfalls ya aprendidos, NO repetir):**
+   - **NO re-introducir `expanding=True` con `ANY(...)`** — el row constructor `ANY((p1,p2))` es rechazado por PG. Pasar listas planas (`:ids` con `bindparam(expanding=True)` está bien para `IN`; para `= ANY(:norms)` pasar la lista plana).
+   - **NO pasar lista de dicts a INSERT con RETURNING** — executemany+RETURNING no devuelve filas (`ResourceClosedError: This result object does not return rows`). Usar multi-VALUES con UN solo statement y placeholders `:d0,:c0,...` (patrón de `_store_entities_relations` en `src/kag_ingest.py` L590-631).
+   - **`md_text` se llama intencionalmente así** (no `text`) para no sombrear `text()` de SQLAlchemy.
+   - **`websearch_to_tsquery`** es el fix FTS del crítico — no revertirlo. `fts_search` usa `plainto_tsquery` — dejarlo.
+   - **`_get_prompt_pair`** lee de `prompt_artifacts` (DB) vía `get_active_prompt`; fallback a constantes de código si no hay artefacto (tests sin DB).
+   - **`_fill_prompt`** (replace por clave, NO `.format()`) — los prompts contienen llaves JSON literales que `.format()` interpretaría como placeholders (KeyError). Ya existe `_fill` en `src/kag_propositional.py` L295-304.
+   - **Degradación natural**: try/except con log, nunca romper. Si el LLM falla en proposiciones → `[]` (la ingesta sigue).
+   - **Dimensión de embeddings: `vector(768)`** (jina-embeddings-v5-text-nano). NO 384. Verificado en `alembic/versions/0013_kag.py`, `0018_kag_propositional.py`, `0022_kag_entity_embeddings.py`; `src/db/seed_kag.py` define `EMBEDDING_DIMENSION = 768`.
+   - **`embedding_to_sql`** convierte lista de floats al literal pgvector `'[0.1,...]'` con `CAST(:emb AS vector)` — psycopg2 no adapta listas a vector.
+5. **Prompt-as-code**: toda spec nueva se añade a `src/db/seed_kag_prompts.py` (con `user_template` + placeholders) y se compila con `python -m src.llm.compile_prompts`. El runtime usa `_get_prompt_pair` con fallback a constantes.
+6. **Tests**: correr SOLO los tests rápidos (sin DB real, sin torch/spacy): `tests/test_kag.py`, `tests/test_kag_stages.py`, `tests/test_seed_ai.py`, `tests/test_seed_kag_prompts.py`, `tests/test_api_llm_infra.py`, `tests/test_kag_agents.py`, `tests/test_kag_propositional.py` y los tests nuevos de cada agente. **NO correr `tests/test_kag_ingest_stages.py`** (el segmentador es lento).
+7. **Estilo**: código simple y directo, sin dataclasses ni abstracciones innecesarias; SQL crudo vía `session.execute(text(...))`; prints descriptivos cuando `verbose=True`; imports perezosos de módulos pesados (torch/spacy/embeddings).
+
+### 8.1 Agente A — Fundación de esquema (migración + stages + seed + tests)
+
+**Scope (archivos):** `alembic/versions/0024_kag_propositions.py` (NUEVO), `src/kag/stages.py`, `src/db/seed_kag_prompts.py`, `tests/test_seed_kag_prompts.py`.
+
+**Tareas:**
+
+1. **Migración `0024_kag_propositions.py`** (plantilla: `0022_kag_entity_embeddings.py` / `0023_kag_word_freq.py`):
+   ```sql
+   CREATE TABLE kag_propositions (
+       id SERIAL PRIMARY KEY,
+       doc_id INT NOT NULL REFERENCES kag_documents(id) ON DELETE CASCADE,
+       chunk_id INT NOT NULL REFERENCES kag_chunks(id) ON DELETE CASCADE,
+       core_idea_id VARCHAR(50),
+       argument_id VARCHAR(50),
+       statement TEXT NOT NULL,
+       text_span TEXT,
+       char_start INT,
+       char_end INT,
+       line_start INT,
+       line_end INT,
+       citation_references JSONB NOT NULL DEFAULT '[]'::jsonb,
+       embedding vector(768),
+       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+   );
+   CREATE INDEX ix_kag_propositions_doc_id ON kag_propositions(doc_id);
+   CREATE INDEX ix_kag_propositions_chunk_id ON kag_propositions(chunk_id);
+   CREATE INDEX ix_kag_propositions_embedding ON kag_propositions
+       USING hnsw (embedding vector_cosine_ops);
+   ```
+   `downgrade`: `DROP TABLE kag_propositions;`
+2. **`src/kag/stages.py`**: añadir al cleanup de `kag_documents` en la etapa `chunked` (y `segmented`): `DELETE FROM kag_propositions WHERE doc_id = :doc_id` (las proposiciones se re-extraen junto con el chunking). NO tocar `KAG_PROPOSITIONAL_STAGES` (lo elimina el Agente E).
+3. **`src/db/seed_kag_prompts.py`**: añadir la spec `kag_proposition_chunking` (task_key nuevo, version `1.0`) con `user_template` y placeholders: `{source_file}`, `{document_id}`, `{chunk_index}`, `{chunk_title}`, `{line_start}`, `{line_end}`, `{chapter_text_content}`. El prompt pide proposiciones atómicas autocontenidas (reemplazar anáforas por sujeto explícito), `verbatim_span` EXACTO del original, `char_start/char_end`/`line_start/line_end` y `citations_references` duplicadas en TODAS las proposiciones derivadas de una frase con cita (regla de referencias duplicadas del proposicional). Schema de salida: `{"propositions": [{"core_idea_id": str, "argument_id": str, "statement": str, "text_span": str, "char_start": int, "char_end": int, "line_start": int, "line_end": int, "citations_references": [str]}]}`.
+4. **`tests/test_seed_kag_prompts.py`**: actualizar `len(KAG_TEMPLATES)` de 16 → 17 y añadir la key `kag_proposition_chunking` a `EXPECTED_TASK_KEYS`.
+
+**Entregables:** migración aplicable, stages con cleanup, spec nueva, tests actualizados y pasando.
+
+### 8.2 Agente B — Expansión de ingesta (proposiciones en `src/kag_ingest.py`)
+
+**Scope (archivos):** `src/kag_ingest.py`, `tests/test_kag_propositions.py` (NUEVO).
+
+**Tareas:**
+
+1. **Constantes**: `TASK_PROPOSITION_CHUNKING = "kag_proposition_chunking"`, `PROPOSITIONAL_SYSTEM_SHORT` (intent del analista epistemológico, corto) y `PROPOSITIONAL_USER_SHORT` (template con los placeholders de la spec).
+2. **Helper `_fill_prompt(template, **kwargs)`**: replace por clave (NO `.format()`) — copiar el patrón de `_fill` de `src/kag_propositional.py` L295-304.
+3. **Helper `_locate_span_in_chunk(content, text_span)`**: localiza `text_span` dentro del chunk (búsqueda por substring, normalizando espacios) y devuelve `(char_start, char_end, line_start, line_end)` absolutos del chunk; si no lo encuentra, devuelve `(None, None, None, None)` (degradación: la proposición se guarda igual con spans NULL).
+4. **`_extract_propositions(session, doc_id, chunk_id, content, doc_path, chunk_index, section_path, verbose)`** → lista de dicts `{doc_id, chunk_id, core_idea_id, argument_id, statement, text_span, char_start, char_end, line_start, line_end, citations}`. Usa `_get_prompt_pair` + `call_with_retries` (modelo pequeño, `model_size="small"`), parsea JSON con try/except; si el LLM falla o devuelve JSON inválido → `[]` (degradación, la ingesta sigue). Trunca `content` a ~12000 chars (MAX_CONTEXT_CHARS) si es necesario.
+5. **`_store_propositions(session, doc_id, propositions, embed_fn)`**: INSERT multi-VALUES con UN solo statement y placeholders `:d0,:c0,...` (patrón de `_store_entities_relations` L590-631), con `RETURNING id` NO necesario (no se reutiliza). `embedding` = `embed_fn([p["statement"]...])` en batch (degradación: `[None]*n` si falla). `citation_references` = `json.dumps(citations)`.
+6. **Hook en `index_document`**: en la etapa `chunked`, DESPUÉS de `_store_entities_relations` y ANTES de `set_stage(session, "kag_documents", doc_id, "chunked")`, llamar `_extract_propositions` + `_store_propositions` por chunk. Cambiar el SELECT de `chunk_rows` para incluir `chunk_index, section_path` (hoy solo `id, content`).
+7. **Parámetros**: `index_document(..., extract_propositions=True)` y `index_all(..., extract_propositions=True)` + flag CLI `--no-propositions` en `main()`. Si `extract_propositions=False`, el hook se salta (comportamiento clásico EXACTO).
+8. **Añadir `import json`** si no está.
+9. **Tests** (`tests/test_kag_propositions.py`, sin DB real): `_fill_prompt` (no rompe llaves JSON), `_locate_span_in_chunk` (hit, miss, normalización de espacios), `_extract_propositions` (LLM fake OK, LLM falla → `[]`, JSON inválido → `[]`), `_store_propositions` (multi-VALUES con sesión fake que captura el SQL y verifica que NO usa executemany).
+
+**Entregables:** hook funcional con degradación, CLI `--no-propositions`, tests pasando.
+
+### 8.3 Agente C — Expansión de consulta (proposiciones + modo audited en `src/kag_query.py`)
+
+**Scope (archivos):** `src/kag_query.py`, `tests/test_kag_unified.py` (NUEVO).
+
+**Tareas:**
+
+1. **`propositions_for_chunks(session, chunk_ids, per_chunk=6, max_total=120)`**: SELECT de `kag_propositions` por `chunk_id = ANY(:ids)` (lista plana), ordenado por `chunk_id, id`, limitado a `per_chunk` por chunk y `max_total` total. Devuelve lista de dicts `{chunk_id (id de kag_propositions), document_id, statement, text_span, char_start, char_end, citation_references, doc_title, chapter_title (section_path)}`.
+2. **`assemble_context(..., propositions=None)`**: nuevo parámetro opcional; si `propositions` no es None, añade la sección `--- PROPOSICIONES ATÓMICAS (capa micro) ---` DESPUÉS de los fragmentos y ANTES de las figuras. Cada proposición: `[n] doc: {doc_title} | sección: {chapter_title} | chunk {chunk_index} | {statement}` + `(cita: {text_span})` si hay span. Si la lista está vacía, `(sin proposiciones)`. NO cambiar el orden de las secciones existentes (prompt caching).
+3. **`ask(..., mode="fast"|"audited")`** (default `"fast"`):
+   - `mode="fast"`: comportamiento ACTUAL exacto + proposiciones de los chunks ganadores en el contexto (llamar `propositions_for_chunks` con los `chunk_ids` finales y pasarlas a `assemble_context`). Devuelve `str`.
+   - `mode="audited"`: flujo portado de `src/kag_agents.py` adaptado a `kag_propositions` (ver abajo). Devuelve `dict` `{answer, verdict, grounded_evidence, epistemic_tensions, used_fallback}`.
+4. **Flujo audited (portar de `src/kag_agents.py`, adaptado):**
+   - `_synthesize_facts(session, query, propositions)` → hechos atómicos (LLM pequeño, prompt `kag_synthesis`; degradación: cada proposición como hecho con `atomic_summary=statement` y `verbatim_evidence=text_span`).
+   - `_resolve_contradictions(session, query, facts)` → tipología (prompt `kag_contradictions`; degradación: `[]`).
+   - `_evaluate_sufficiency(session, query, facts, tensions)` → verdict `SUFFICIENT_FOR_SYNTHESIS | INSUFFICIENT_TRIGGER_BRANCH_B | NEGATIVE_REJECTION` (prompt `kag_sufficiency`; degradación: `SUFFICIENT_FOR_SYNTHESIS` con `confidence_score=0.5`).
+   - `_verify_grounding(session, facts)` → rapidfuzz `partial_ratio >= 95` entre cada afirmación y su `text_span`/chunk original (import `from rapidfuzz import fuzz`); descarta o marca las que no pasan.
+   - `_branch_b_expand(session, query, facts)` → FTS sobre `kag_propositions` (términos del crítico) + vecinos del grafo (PPR 2-hop sobre `kag_relations`); re-consulta y añade proposiciones nuevas.
+   - `_ask_audited(session, query, ...)` → orquesta: recuperación clásica (reutilizar el flujo de `ask` fast) → proposiciones → síntesis → contradicciones → suficiencia → Branch B si `INSUFFICIENT_TRIGGER_BRANCH_B` → grounding → respuesta final con prompt `kag_answer` (LLM grande). `NEGATIVE_REJECTION` → abstención formal (respuesta que lo dice claramente, `verdict` incluido).
+5. **CLI**: flag `--mode {fast,audited}` (default `fast`).
+6. **Añadir `import json`** y `from rapidfuzz import fuzz` si no están.
+7. **Tests** (`tests/test_kag_unified.py`, sin DB real): `propositions_for_chunks` (filtro por ids, límites per_chunk/max_total, degradación), `assemble_context` con proposiciones (sección nueva en la posición correcta, vacío), `ask` fast con proposiciones (fake session), `_verify_grounding` (exacto, fuzzy ≥95, fallo), `_evaluate_sufficiency` (verdicts parametrizados, degradación), `_ask_audited` (pipeline completo con fakes, negative rejection, Branch B, degradación).
+
+**Entregables:** modo fast con proposiciones, modo audited completo, CLI `--mode`, tests pasando.
+
+### 8.4 Agente D — API unificada (`src/api/main.py`)
+
+**Scope (archivos):** `src/api/main.py`, `tests/test_api_llm_infra.py` (si aplica).
+
+**Tareas:**
+
+1. **`KagAskRequest`**: añadir `mode: str = Field("audited", pattern="^(fast|audited)$")` (default `audited` para la API académica).
+2. **`/kag/ask`**: usar `ask()` de `src/kag_query` (import lazy) con `mode=body.mode`; mantener el shape de respuesta actual `{answer, verdict, grounded_evidence, epistemic_tensions, used_fallback, consulted_documents}`. Para `mode="fast"`, `verdict`/`grounded_evidence`/`epistemic_tensions` van vacíos/`None` y `used_fallback=False`; `consulted_documents` se deriva de los chunks consultados (doc_id → doc_path/title).
+3. **`/kag/ingest`**: usar `index_all`/`index_document` de `src/kag_ingest` (clásico, import lazy) con `extract_propositions=True` por defecto; `KagIngestRequest` añade `extract_propositions: bool = True`. Eliminar los imports de `src.kag_propositional` y `src.kag_agents`.
+4. **NO tocar** el resto de endpoints de la API.
+
+**Entregables:** `/kag/ask` con mode, `/kag/ingest` clásico, sin imports del proposicional.
+
+### 8.5 Agente E — Eliminación del proposicional (SOLO después de A-D verificados)
+
+**Scope (archivos):** `alembic/versions/0025_kag_drop_propositional.py` (NUEVO), `src/kag/stages.py`, `src/db/seed_kag_prompts.py`, `tests/test_kag_stages.py`, borrar `src/kag_propositional.py`, `src/kag_agents.py`, `tests/test_kag_agents.py`, `tests/test_kag_propositional.py`.
+
+**Tareas:**
+
+1. **Migración `0025_kag_drop_propositional`**: `DROP TABLE` en orden: `topic_tree_nodes`, `document_images`, `propositional_chunks`, `document_chapters`, `documents`. `downgrade`: no-op (o recrear vacías, documentado).
+2. **`src/kag/stages.py`**: eliminar `KAG_PROPOSITIONAL_STAGES` y el bloque `"documents"` de `CLEANUP_SQL`.
+3. **`src/db/seed_kag_prompts.py`**: eliminar las specs muertas del proposicional: `kag_metadata`, `kag_chapters`, `kag_document_analysis`, `kag_propositional_chunking` (la VIEJA), `kag_topic_label`, `kag_vision_analysis`. **CONSERVAR** `kag_synthesis`, `kag_contradictions`, `kag_sufficiency`, `kag_answer` — las usa el modo audited de `src/kag_query.py` (TASK_SYNTHESIS/TASK_CONTRADICTIONS/TASK_SUFFICIENCY/TASK_ANSWER leen esos artefactos vía `_get_prompt_pair`). Resultado: 17 → 11 specs.
+4. **Borrar** `src/kag_propositional.py`, `src/kag_agents.py`, `tests/test_kag_agents.py`, `tests/test_kag_propositional.py`.
+5. **`tests/test_kag_stages.py`**: quitar los asserts de `KAG_PROPOSITIONAL_STAGES`.
+6. **Grep final**: verificar que nada importa `kag_propositional`/`kag_agents` (incluido `src/api/main.py` y `src/kag/tools.py` — `MultibookFinderTool` se conserva, solo se elimina su uso).
+
+**Entregables:** proposicional eliminado, migración aplicable, tests rápidos pasando.
+
+---
+
+**Orden de ejecución:** Agentes A, B, C, D en paralelo (scopes disjuntos) → verificación de contratos entre B y C (dict shapes de proposición) → Agente E (solo después). El usuario borrará la DB y re-clonará: el seed fresco compilará los artefactos con los placeholders nuevos.

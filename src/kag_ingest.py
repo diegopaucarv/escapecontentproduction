@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import json
 import os
 import re
 import sys
@@ -47,6 +48,7 @@ from src.llm.together import complete_vision
 
 TASK_EXTRACT_ENTITIES = "kag_extract_entities"
 TASK_QWEN_SUMMARY = "kag_qwen_summary"
+TASK_PROPOSITION_CHUNKING = "kag_proposition_chunking"
 
 # System prompts cortos actuales — fallback EXACTO de hoy cuando no hay
 # artefacto compilado (tests sin DB: get_active_prompt devuelve None).
@@ -101,6 +103,9 @@ LONG_DOC_THRESHOLD = 20000
 CHUNK_MAX_TOKENS = 800
 # Truncado del texto para el resumen local (~16k tokens ≈ 64k chars).
 SUMMARY_MAX_CHARS = 16000 * 4
+# Límite de contexto del LLM por llamada (chars) para la extracción de
+# proposiciones atómicas (mismo valor que el proposicional).
+MAX_CONTEXT_CHARS = 12000
 
 # ---------------------------------------------------------------------
 # Helpers de host / texto
@@ -138,6 +143,20 @@ def normalize_entity_name(name: str) -> str:
     return " ".join(name.lower().strip().split())
 
 
+def sanitize_text(value: str) -> str:
+    """Elimina caracteres que PostgreSQL rechaza en columnas text/varchar.
+
+    El NUL (\x00) rompe la inserción con "A string literal cannot contain NUL
+    (0x00) characters" (aparece en .md extraídos de PDFs). También se quitan
+    otros C0 de control (excepto \n, \r, \t) que ensucian el texto.
+    """
+    if not value:
+        return value
+    return "".join(
+        ch for ch in value if ch == "\n" or ch == "\r" or ch == "\t" or ord(ch) >= 32
+    )
+
+
 def embedding_to_sql(emb):
     """Convierte una lista de floats a la sintaxis literal de pgvector.
 
@@ -147,6 +166,18 @@ def embedding_to_sql(emb):
     if emb is None:
         return None
     return "[" + ",".join(repr(float(x)) for x in emb) + "]"
+
+
+def _fill_prompt(template: str, **kwargs) -> str:
+    """Rellena placeholders {name} sin tocar las llaves JSON literales del prompt.
+
+    Los prompts contienen schemas JSON con llaves que .format() interpretaría
+    como placeholders (KeyError); por eso se usa replace() por clave.
+    """
+    out = template
+    for key, value in kwargs.items():
+        out = out.replace("{" + key + "}", str(value))
+    return out
 
 
 # Stopwords por idioma para detect_language (heurística determinista).
@@ -570,10 +601,10 @@ def _store_entities_relations(session, doc_id, chunk_id, data, embed_fn=None):
     entity_ids = dict(existing)
     new_entities = []
     for ent in entities:
-        name = str(ent.get("name", "")).strip()
+        name = sanitize_text(str(ent.get("name", "")).strip())[:300]
         if not name:
             continue
-        name_norm = normalize_entity_name(name)
+        name_norm = normalize_entity_name(name)[:300]
         if name_norm in entity_ids:
             continue
         entity_ids[name_norm] = None  # placeholder: se rellena con RETURNING
@@ -583,8 +614,8 @@ def _store_entities_relations(session, doc_id, chunk_id, data, embed_fn=None):
                 chunk_id,
                 name,
                 name_norm,
-                str(ent.get("type", "concept"))[:100],
-                str(ent.get("description", "")),
+                sanitize_text(str(ent.get("type", "concept")))[:100],
+                sanitize_text(str(ent.get("description", ""))),
             )
         )
     if new_entities:
@@ -634,8 +665,8 @@ def _store_entities_relations(session, doc_id, chunk_id, data, embed_fn=None):
     #    entidades ya insertadas/existentes de este chunk.
     new_relations = []
     for rel in relations:
-        src = normalize_entity_name(str(rel.get("source", "")))
-        tgt = normalize_entity_name(str(rel.get("target", "")))
+        src = normalize_entity_name(sanitize_text(str(rel.get("source", ""))))
+        tgt = normalize_entity_name(sanitize_text(str(rel.get("target", ""))))
         if src not in entity_ids or tgt not in entity_ids:
             continue
         if entity_ids[src] is None or entity_ids[tgt] is None:
@@ -646,8 +677,8 @@ def _store_entities_relations(session, doc_id, chunk_id, data, embed_fn=None):
                 chunk_id,
                 entity_ids[src],
                 entity_ids[tgt],
-                str(rel.get("type", "RELACIONA"))[:200],
-                str(rel.get("description", "")),
+                sanitize_text(str(rel.get("type", "RELACIONA")))[:200],
+                sanitize_text(str(rel.get("description", ""))),
             )
         )
     if new_relations:
@@ -676,6 +707,225 @@ def _store_entities_relations(session, doc_id, chunk_id, data, embed_fn=None):
             ),
             params,
         )
+
+
+# ---------------------------------------------------------------------
+# Extracción LLM de proposiciones atómicas (capa micro, migración 0024)
+# ---------------------------------------------------------------------
+
+# Intent del analista epistemológico (corto) — fallback EXACTO cuando no hay
+# artefacto compilado (tests sin DB: get_active_prompt devuelve None).
+PROPOSITIONAL_SYSTEM_SHORT = (
+    "Eres un analista de epistemología y análisis del discurso. Tu objetivo "
+    "es descomponer el texto en proposiciones atómicas autocontenidas: cada "
+    "proposición debe ser gramaticalmente independiente (reemplaza anáforas "
+    "como 'éste', 'lo anterior', 'dicho autor' por el sujeto explícito). "
+    "'text_span' debe contener el fragmento de texto EXACTO del original. "
+    "REGLA DE REFERENCIAS DUPLICADAS: si una frase contiene una referencia "
+    "académica (ej. 'Bourdieu, 1984, p. 52'), dicha referencia DEBE "
+    "preservarse y duplicarse en 'citations_references' de TODAS las "
+    "proposiciones que deriven de ella. Devuelve JSON válido."
+)
+
+PROPOSITIONAL_USER_SHORT = """Archivo: {source_file}
+Documento: {document_id}
+Chunk: {chunk_index} - {chunk_title}
+Rango: Línea {line_start} a Línea {line_end}
+
+Texto a procesar:
+---
+{chapter_text_content}
+---
+
+Genera el JSON: {"propositions": [{"core_idea_id": str, "argument_id": str, "statement": str, "text_span": str, "char_start": int, "char_end": int, "line_start": int, "line_end": int, "citations_references": [str]}]}"""
+
+
+def _span_offsets(content: str, char_start: int, char_end: int):
+    """(char_start, char_end, line_start, line_end) 1-based del chunk."""
+    line_start = content.count("\n", 0, char_start) + 1
+    line_end = content.count("\n", 0, max(char_start, char_end - 1)) + 1
+    return (char_start, char_end, line_start, line_end)
+
+
+def _map_norm_to_orig(content: str, norm_pos: int) -> int:
+    """Mapea un índice del contenido normalizado (espacios colapsados) al
+    índice original del chunk."""
+    norm_idx = 0
+    prev_ws = False
+    for orig_idx, ch in enumerate(content):
+        if ch.isspace():
+            if prev_ws:
+                continue
+            prev_ws = True
+        else:
+            prev_ws = False
+        if norm_idx == norm_pos:
+            return orig_idx
+        norm_idx += 1
+    return len(content)
+
+
+def _locate_span_in_chunk(content: str, text_span: str):
+    """Localiza `text_span` dentro del chunk (substring, normalizando espacios).
+
+    Devuelve (char_start, char_end, line_start, line_end) absolutos del chunk
+    (líneas 1-based). Si el span no aparece (el LLM parafraseó), devuelve
+    (None, None, None, None) — la proposición se guarda igual con spans NULL.
+    """
+    if not text_span:
+        return (None, None, None, None)
+    pos = content.find(text_span)
+    if pos != -1:
+        return _span_offsets(content, pos, pos + len(text_span))
+    # Normalización de espacios: colapsar runs de whitespace a un espacio.
+    norm_content = re.sub(r"\s+", " ", content)
+    norm_span = re.sub(r"\s+", " ", text_span).strip()
+    if not norm_span:
+        return (None, None, None, None)
+    npos = norm_content.find(norm_span)
+    if npos == -1:
+        return (None, None, None, None)
+    char_start = _map_norm_to_orig(content, npos)
+    char_end = _map_norm_to_orig(content, npos + len(norm_span))
+    return _span_offsets(content, char_start, char_end)
+
+
+def _extract_propositions(
+    session, doc_id, chunk_id, content, doc_path, chunk_index, section_path, verbose
+):
+    """Extrae proposiciones atómicas de un chunk con el modelo pequeño.
+
+    Usa _get_prompt_pair (artefacto compilado o fallback a constantes) +
+    call_with_retries (model_size="small"). Devuelve lista de dicts
+    {doc_id, chunk_id, core_idea_id, argument_id, statement, text_span,
+    char_start, char_end, line_start, line_end, citations}. Si el LLM falla
+    o devuelve JSON inválido → [] (degradación: la ingesta sigue).
+    """
+    settings = load_settings(session)
+    retries = int(getattr(settings, "llm_retries", 3) or 3) if settings else 3
+    fallback = getattr(settings, "fallback_model", None) if settings else None
+    small_model = getattr(settings, "small_model", None) if settings else None
+    system, user_template = _get_prompt_pair(
+        session,
+        small_model,
+        TASK_PROPOSITION_CHUNKING,
+        PROPOSITIONAL_SYSTEM_SHORT,
+        PROPOSITIONAL_USER_SHORT,
+    )
+    # Truncado del contexto (~12000 chars) si el chunk es muy grande.
+    chunk_text = content[:MAX_CONTEXT_CHARS]
+    prompt = _fill_prompt(
+        user_template,
+        source_file=doc_path,
+        document_id=doc_id,
+        chunk_index=chunk_index,
+        chunk_title=section_path or "",
+        line_start=1,
+        line_end=chunk_text.count("\n") + 1,
+        chapter_text_content=chunk_text,
+    )
+    try:
+        text_out, _model, _used_fallback = call_with_retries(
+            session,
+            prompt=prompt,
+            system=system,
+            model_size="small",
+            response_format={"type": "json_object"},
+            retries=retries,
+            fallback_model=fallback,
+        )
+        data = parse_llm_output(text_out)
+    except Exception as exc:  # noqa: BLE001 — LLM no disponible: degradación
+        if verbose:
+            print(f"[KAG] ⚠ Proposiciones fallaron (chunk {chunk_id}): {exc}")
+        return []
+    propositions = data.get("propositions") if isinstance(data, dict) else None
+    if not isinstance(propositions, list) or not propositions:
+        return []
+    out = []
+    for p in propositions:
+        if not isinstance(p, dict):
+            continue
+        statement = str(p.get("statement") or "").strip()
+        if not statement:
+            continue
+        text_span = str(p.get("text_span") or "")
+        char_start, char_end, line_start, line_end = _locate_span_in_chunk(
+            chunk_text, text_span
+        )
+        citations = p.get("citations_references") or []
+        if not isinstance(citations, list):
+            citations = []
+        out.append(
+            {
+                "doc_id": doc_id,
+                "chunk_id": chunk_id,
+                "core_idea_id": str(p.get("core_idea_id") or "")[:50],
+                "argument_id": str(p.get("argument_id") or "")[:50],
+                "statement": statement,
+                "text_span": text_span,
+                "char_start": char_start,
+                "char_end": char_end,
+                "line_start": line_start,
+                "line_end": line_end,
+                "citations": [str(c) for c in citations],
+            }
+        )
+    return out
+
+
+def _store_propositions(session, doc_id, propositions, embed_fn=None):
+    """Guarda proposiciones atómicas de un chunk (multi-VALUES, un statement).
+
+    Mismo patrón que _store_entities_relations: UN solo INSERT multi-VALUES
+    con placeholders :d0,:c0,... (una lista de dicts haría executemany, y
+    psycopg2 no devuelve filas con executemany + RETURNING). `embed_fn`
+    embebe los statements en batch (degradación: [None]*n si falla).
+    `citation_references` = json.dumps(citations).
+    """
+    if not propositions:
+        return
+    embs: list = []
+    if embed_fn is not None:
+        try:
+            embs = embed_fn([p["statement"] for p in propositions])
+        except Exception:  # noqa: BLE001 — sin embedding: embedding NULL
+            embs = [None] * len(propositions)
+    else:
+        embs = [None] * len(propositions)
+    placeholders = ", ".join(
+        f"(:d{i}, :c{i}, :ci{i}, :a{i}, :s{i}, :ts{i}, :cs{i}, :ce{i}, "
+        f":ls{i}, :le{i}, CAST(:cr{i} AS jsonb), CAST(:emb{i} AS vector))"
+        for i in range(len(propositions))
+    )
+    params: dict = {}
+    for i, p in enumerate(propositions):
+        params.update(
+            {
+                f"d{i}": p["doc_id"],
+                f"c{i}": p["chunk_id"],
+                f"ci{i}": p["core_idea_id"],
+                f"a{i}": p["argument_id"],
+                f"s{i}": sanitize_text(p["statement"]),
+                f"ts{i}": sanitize_text(p["text_span"]),
+                f"cs{i}": p["char_start"],
+                f"ce{i}": p["char_end"],
+                f"ls{i}": p["line_start"],
+                f"le{i}": p["line_end"],
+                f"cr{i}": json.dumps(p["citations"], ensure_ascii=False),
+                f"emb{i}": embedding_to_sql(embs[i]),
+            }
+        )
+    session.execute(
+        text(
+            "INSERT INTO kag_propositions "
+            "(doc_id, chunk_id, core_idea_id, argument_id, statement, text_span, "
+            "char_start, char_end, line_start, line_end, citation_references, "
+            "embedding) "
+            f"VALUES {placeholders}"
+        ),
+        params,
+    )
 
 
 # ---------------------------------------------------------------------
@@ -820,7 +1070,7 @@ def _index_figures(session, doc_id, md_path, md_text, verbose=True) -> int:
             continue
         caption = _find_caption(md_text, img.name)
         chunk_id = _find_chunk_for_image(session, doc_id, img.name)
-        description = describe_figure(session, str(img), caption)
+        description = sanitize_text(describe_figure(session, str(img), caption))
         session.execute(
             text(
                 "INSERT INTO kag_figures "
@@ -850,12 +1100,18 @@ def _title_from_md(text: str, doc_path: str) -> str:
     """Título: primer H1 del markdown, o el nombre del archivo."""
     m = re.search(r"^#\s+(.+)$", text, re.MULTILINE)
     if m:
-        return m.group(1).strip()[:300]
-    return Path(doc_path).stem[:300]
+        return sanitize_text(m.group(1).strip())[:300]
+    return sanitize_text(Path(doc_path).stem)[:300]
 
 
 def index_document(
-    session, md_path, force=False, no_summary=False, verbose=True, llm_entities=False
+    session,
+    md_path,
+    force=False,
+    no_summary=False,
+    verbose=True,
+    llm_entities=False,
+    extract_propositions=True,
 ):
     """Indexa un documento .md en el KAG (flujo §2.3 del diseño).
 
@@ -870,6 +1126,10 @@ def index_document(
 
     `llm_entities=True` usa la extracción LLM por chunk (Together, costosa);
     por defecto se usa la extracción determinista con spaCy (gratis).
+
+    `extract_propositions=True` (default) extrae y persiste proposiciones
+    atómicas por chunk en `kag_propositions` (capa micro, migración 0024).
+    Con False el hook se salta: comportamiento clásico EXACTO.
     """
     md_path = Path(md_path)
     if not md_path.exists():
@@ -878,7 +1138,7 @@ def index_document(
     # OJO: la variable se llama md_text (NO text) para no sombrear la función
     # text() de SQLAlchemy — un bug previo rompía la ingesta con
     # "'str' object is not callable" en el primer SELECT.
-    md_text = md_path.read_text(encoding="utf-8")
+    md_text = sanitize_text(md_path.read_text(encoding="utf-8"))
     content_hash = hashlib.sha256(md_text.encode("utf-8")).hexdigest()
     token_estimate = estimate_tokens(md_text)
     doc_type = "long" if token_estimate >= LONG_DOC_THRESHOLD else "short"
@@ -1057,7 +1317,7 @@ def index_document(
             EMBED_BATCH_SIZE = 32
             chunk_rows = session.execute(
                 text(
-                    "SELECT id, content FROM kag_chunks "
+                    "SELECT id, content, chunk_index, section_path FROM kag_chunks "
                     "WHERE doc_id = :id ORDER BY chunk_index"
                 ),
                 {"id": doc_id},
@@ -1109,6 +1369,23 @@ def index_document(
                     _store_entities_relations(
                         session, doc_id, row.id, data, embed_fn=embed_texts
                     )
+                    if extract_propositions:
+                        # Capa micro: proposiciones atómicas por chunk (0024).
+                        # Degradación natural: si el LLM falla, _extract_propositions
+                        # devuelve [] y la ingesta sigue (comportamiento clásico).
+                        props = _extract_propositions(
+                            session,
+                            doc_id,
+                            row.id,
+                            row.content,
+                            doc_path,
+                            row.chunk_index,
+                            row.section_path,
+                            verbose,
+                        )
+                        _store_propositions(
+                            session, doc_id, props, embed_fn=embed_texts
+                        )
             set_stage(session, "kag_documents", doc_id, "chunked")
 
         entity_count = session.execute(
@@ -1149,7 +1426,7 @@ def index_document(
                     print(
                         "[KAG] 📝 ready: generando resumen jerárquico (Qwen local)..."
                     )
-                summary = summarize_document(session, md_text, doc_type)
+                summary = sanitize_text(summarize_document(session, md_text, doc_type))
                 if verbose:
                     print("[KAG] 📝 ready: resumen listo.")
 
@@ -1219,7 +1496,14 @@ def index_document(
         raise
 
 
-def index_all(session, force=False, no_summary=False, verbose=True, llm_entities=False):
+def index_all(
+    session,
+    force=False,
+    no_summary=False,
+    verbose=True,
+    llm_entities=False,
+    extract_propositions=True,
+):
     """Indexa todos los .md de data/knowledge_repository/docs/."""
     docs = sorted(DOCS_DIR.glob("*.md"))
     if not docs:
@@ -1237,6 +1521,7 @@ def index_all(session, force=False, no_summary=False, verbose=True, llm_entities
                     no_summary=no_summary,
                     verbose=verbose,
                     llm_entities=llm_entities,
+                    extract_propositions=extract_propositions,
                 )
             )
         except Exception as exc:  # noqa: BLE001 — un doc no bloquea el resto
@@ -1341,6 +1626,12 @@ def main() -> None:
         "determinista con spaCy (default).",
     )
     parser.add_argument(
+        "--no-propositions",
+        action="store_true",
+        help="Omite la extracción de proposiciones atómicas (comportamiento "
+        "clásico EXACTO; default: extraer).",
+    )
+    parser.add_argument(
         "--verbose", action="store_true", default=True, help="Prints descriptivos."
     )
     parser.add_argument(
@@ -1372,6 +1663,7 @@ def main() -> None:
                 no_summary=args.no_summary,
                 verbose=args.verbose,
                 llm_entities=args.llm_entities,
+                extract_propositions=not args.no_propositions,
             )
         else:
             index_all(
@@ -1380,6 +1672,7 @@ def main() -> None:
                 no_summary=args.no_summary,
                 verbose=args.verbose,
                 llm_entities=args.llm_entities,
+                extract_propositions=not args.no_propositions,
             )
     finally:
         session.close()

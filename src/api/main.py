@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import date
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import OAuth2PasswordRequestForm
@@ -2382,7 +2383,7 @@ def list_order_kaizen_cycles(
 
 
 # ---------------------------------------------------------------------
-# Motor KAG proposicional — consulta e ingesta
+# Motor KAG unificado — consulta e ingesta
 # ---------------------------------------------------------------------
 
 
@@ -2390,31 +2391,42 @@ class KagAskRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=4000)
     top_propositions: int = Field(15, ge=1, le=100)
     max_iterations: int = Field(2, ge=0, le=5)
+    mode: str = Field("audited", pattern="^(fast|audited)$")
 
 
 @app.post("/kag/ask", response_model=dict)
 def kag_ask(body: KagAskRequest, session: Session = Depends(get_session)) -> dict:
-    """Consulta proposicional al motor KAG (§3 del diseño).
+    """Consulta al motor KAG unificado (§3 del diseño).
 
-    Devuelve el payload enriquecido: respuesta final, veredicto de
-    suficiencia, estado de Branch A (citas auditadas en grounded_evidence)
-    y metadatos de las obras consultadas (consulted_documents, dedup por
-    document_id). El import de ask_propositional es lazy: el módulo KAG
-    carga torch/spacy y no debe pesarse al arrancar la API.
+    mode="audited" (default, API académica): devuelve el payload
+    enriquecido — respuesta final, veredicto de suficiencia, citas
+    auditadas (grounded_evidence), tensiones epistémicas, estado de
+    fallback y metadatos de las obras consultadas (consulted_documents,
+    dedup por document_id). mode="fast": respuesta directa sin auditoría
+    (verdict/grounded_evidence/epistemic_tensions vacíos). El import de
+    ask es lazy: el módulo KAG carga torch/spacy y no debe pesarse al
+    arrancar la API.
     """
-    from src.kag_agents import ask_propositional
+    from src.kag_query import ask
 
     try:
-        result = ask_propositional(
-            session,
-            body.query,
-            top_propositions=body.top_propositions,
-            max_iterations=body.max_iterations,
-            verbose=False,
-        )
+        result = ask(session, body.query, mode=body.mode, verbose=False)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    if body.mode == "fast":
+        # ask() en modo fast devuelve str: respuesta directa, sin auditoría.
+        return {
+            "answer": result,
+            "verdict": None,
+            "grounded_evidence": [],
+            "epistemic_tensions": [],
+            "used_fallback": False,
+            "consulted_documents": [],
+        }
+
+    # mode="audited": ask() devuelve dict {answer, verdict,
+    # grounded_evidence, epistemic_tensions, used_fallback}.
     consulted: dict[str, dict] = {}
     for ev in result.get("grounded_evidence", []) or []:
         doc_id = ev.get("document_id")
@@ -2441,6 +2453,7 @@ class KagIngestRequest(BaseModel):
         None, description="Ruta del .md a indexar; None = todos los de docs/"
     )
     force: bool = False
+    extract_propositions: bool = True
 
 
 @app.post("/kag/ingest", response_model=dict)
@@ -2449,24 +2462,37 @@ def kag_ingest(
     session: Session = Depends(get_session),
     user: AppUser = Depends(require_role("lider")),
 ) -> dict:
-    """Ingesta proposicional: indexa un .md concreto o todos los de
+    """Ingesta clásica del KAG: indexa un .md concreto o todos los de
     data/knowledge_repository/docs/ (force=True reindexa aunque ya estén
-    indexados). Solo un 🟨 líder puede disparar la ingesta.
+    indexados). extract_propositions=True (default) extrae además las
+    proposiciones atómicas (capa micro). Solo un 🟨 líder puede disparar
+    la ingesta.
     """
     if body.file_path:
-        from src.kag_propositional import index_stacked_file
+        from src.kag_ingest import index_document
 
         try:
-            results = index_stacked_file(
-                session, body.file_path, force=body.force, verbose=False
-            )
+            results = [
+                index_document(
+                    session,
+                    Path(body.file_path),
+                    force=body.force,
+                    extract_propositions=body.extract_propositions,
+                    verbose=False,
+                )
+            ]
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
     else:
-        from src.kag_propositional import index_all
+        from src.kag_ingest import index_all
 
         try:
-            results = index_all(session, force=body.force, verbose=False)
+            results = index_all(
+                session,
+                force=body.force,
+                extract_propositions=body.extract_propositions,
+                verbose=False,
+            )
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
     return {"results": results, "count": len(results)}

@@ -7,7 +7,7 @@ Tres herramientas independientes, sin dependencias pesadas a nivel de módulo
   - MultibookFinderTool: detecta libros/papers apilados en un único .md grande
     (anclas ISBN + separadores pesados, búsqueda hacia atrás de fronteras
     reales) y devuelve los límites físicos (line_start/line_end) de cada
-    documento. Alimenta la tabla `documents` (migración 0018).
+    documento.
   - LibraryOfCongressAPITool: cliente de la API de Linked Data de la Biblioteca
     del Congreso (id.loc.gov) para encabezamientos de materia (LCSH) y códigos
     de clasificación (LCC) — ficha documental ISO 25964.
