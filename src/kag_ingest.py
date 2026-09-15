@@ -1434,7 +1434,7 @@ def _extract_document_batch(
         ensure_ascii=False,
     )
     # Metadata del prompt: capítulos cubiertos por el lote.
-    chapter_ids = sorted({c for c in chunk_chapters.values() if c})
+    chapter_ids = sorted({str(c) for c in chunk_chapters.values() if c})
     chapter_label = ", ".join(chapter_ids) if chapter_ids else "(archivo completo)"
     prompt = _fill_prompt(
         user_template,
