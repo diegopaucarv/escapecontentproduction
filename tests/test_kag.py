@@ -37,19 +37,22 @@ from src.kag_query import (
 
 @pytest.fixture(autouse=True)
 def _reset_adjacency_cache():
-    """Resetea el caché module-level de build_adjacency entre tests.
+    """Resetea los cachés module-level de src.kag_query entre tests.
 
-    El caché es global al módulo src.kag_query y contamina entre tests: un
-    test que cachea con una sesión falsa dejaría el dict/versión para el
-    siguiente. Se resetea antes y después de cada test.
+    Los cachés son globales al módulo y contaminan entre tests: un test que
+    cachea con una sesión falsa dejaría el dict/versión para el siguiente.
+    Se resetean antes y después de cada test (build_adjacency y el índice de
+    frecuencia de palabras + idiomas del crítico).
     """
     import src.kag_query as kq
 
     kq._adjacency_cache = None
     kq._adjacency_version = -1
+    kq._CORPUS_CACHE = {"ts": 0.0, "words": None, "langs": None}
     yield
     kq._adjacency_cache = None
     kq._adjacency_version = -1
+    kq._CORPUS_CACHE = {"ts": 0.0, "words": None, "langs": None}
 
 
 # ---------------------------------------------------------------------
@@ -1528,6 +1531,12 @@ def test_critic_regex_search_batches_terms_in_one_query(monkeypatch):
         "load_settings",
         lambda session: SimpleNamespace(llm_retries=3, fallback_model=None),
     )
+    # El índice de frecuencia/idiomas no debe tocar la sesión contadora
+    # (rompería el conteo de consultas FTS).
+    monkeypatch.setattr(kq, "_corpus_common_words", lambda session: [])
+    monkeypatch.setattr(
+        kq, "_corpus_languages", lambda session: ["es", "en", "pt", "de", "fr"]
+    )
 
     hits, terms = kq.critic_regex_search(
         session, "¿Qué es CVE-2024-3094 y Bourdieu?", top_k=5
@@ -1566,7 +1575,8 @@ def test_critic_regex_search_escapes_quotes_in_terms(monkeypatch):
         retries,
         fallback_model=None,
     ):
-        return '{"needs_regex": true, "terms": ["a\\"b"]}', "small", False
+        # Término tipo código (pasa el filtro de anclaje) con comilla interna.
+        return '{"needs_regex": true, "terms": ["CVE-2024\\"x"]}', "small", False
 
     monkeypatch.setattr(kq, "call_with_retries", fake_call)
     monkeypatch.setattr(
@@ -1574,10 +1584,73 @@ def test_critic_regex_search_escapes_quotes_in_terms(monkeypatch):
         "load_settings",
         lambda session: SimpleNamespace(llm_retries=3, fallback_model=None),
     )
+    monkeypatch.setattr(kq, "_corpus_common_words", lambda session: [])
+    monkeypatch.setattr(
+        kq, "_corpus_languages", lambda session: ["es", "en", "pt", "de", "fr"]
+    )
 
-    hits, terms = kq.critic_regex_search(session, 'a"b', top_k=5)
-    assert terms == ['a"b']
-    assert '"a b"' in session.tsq  # comilla doble reemplazada por espacio (websearch)
+    hits, terms = kq.critic_regex_search(session, 'CVE-2024"x', top_k=5)
+    assert terms == ['CVE-2024"x']
+    assert '"CVE-2024 x"' in session.tsq  # comilla reemplazada por espacio (websearch)
+
+
+def test_critic_regex_search_drops_copula_verbs(monkeypatch):
+    """Las copulas/verbos de función se descartan; los términos de contenido quedan.
+
+    El crítico SLM a veces propone verbos vacíos ("existe", "afecta") como
+    términos exactos — ruido para FTS y PPR. El safety net (_clean_llm_terms)
+    descarta las copulas de _QUERY_STOPWORDS; el resto lo decide el SLM con
+    el contexto de frecuencia del corpus.
+    """
+    import src.kag_query as kq
+
+    class _CaptureSession:
+        def __init__(self):
+            self.tsq = None
+
+        def execute(self, stmt, params=None):
+            self.tsq = params.get("tsq", "")
+
+            class _Result:
+                def fetchall(self):
+                    return []
+
+            return _Result()
+
+    session = _CaptureSession()
+
+    def fake_call(
+        session,
+        *,
+        prompt,
+        system,
+        model_size,
+        response_format,
+        retries,
+        fallback_model=None,
+    ):
+        return (
+            '{"needs_regex": true, "terms": ["Existe", "discriminación negativa"]}',
+            "small",
+            False,
+        )
+
+    monkeypatch.setattr(kq, "call_with_retries", fake_call)
+    monkeypatch.setattr(
+        kq,
+        "load_settings",
+        lambda session: SimpleNamespace(llm_retries=3, fallback_model=None),
+    )
+    monkeypatch.setattr(kq, "_corpus_common_words", lambda session: [])
+    monkeypatch.setattr(
+        kq, "_corpus_languages", lambda session: ["es", "en", "pt", "de", "fr"]
+    )
+
+    hits, terms = kq.critic_regex_search(
+        session, "¿Existe la discriminación negativa?", top_k=5
+    )
+    assert terms == ["discriminación negativa"]  # "Existe" (copula) se descarta
+    assert '"discriminación negativa"' in session.tsq
 
 
 # ---------------------------------------------------------------------
@@ -1999,3 +2072,154 @@ def test_rerank_chunks_degrades_on_model_failure(monkeypatch):
 
     chunks = [{"chunk_id": 1, "content": "a"}, {"chunk_id": 2, "content": "b"}]
     assert kq.rerank_chunks("query", chunks) is chunks
+
+
+# ---------------------------------------------------------------------
+# Índice de frecuencia de palabras + idiomas del crítico (migración 0023)
+# ---------------------------------------------------------------------
+
+
+def test_corpus_common_words_reads_word_freq():
+    """_corpus_common_words lee el top-N de kag_word_freq (GROUP BY word)."""
+    import src.kag_query as kq
+
+    class _FreqSession:
+        def execute(self, stmt, params=None):
+            assert "kag_word_freq" in str(stmt)
+            assert params["n"] == 200
+
+            class _Result:
+                def fetchall(self):
+                    return [
+                        SimpleNamespace(word="cultura"),
+                        SimpleNamespace(word="psicología"),
+                    ]
+
+            return _Result()
+
+    assert kq._corpus_common_words(_FreqSession()) == ["cultura", "psicología"]
+
+
+def test_corpus_common_words_degrades_without_index():
+    """Sin el índice (tabla ausente/error) → [] (el crítico decide sin contexto)."""
+    import src.kag_query as kq
+
+    class _BrokenSession:
+        def execute(self, stmt, params=None):
+            raise RuntimeError("kag_word_freq no existe")
+
+    assert kq._corpus_common_words(_BrokenSession()) == []
+
+
+def test_corpus_languages_reads_segmenter_settings():
+    """_corpus_languages lee spacy_models de kag_segmenter_settings."""
+    import src.kag_query as kq
+
+    class _SettingsSession:
+        def execute(self, stmt, params=None):
+            assert "kag_segmenter_settings" in str(stmt)
+
+            class _Result:
+                def first(self):
+                    return SimpleNamespace(
+                        spacy_models={
+                            "es": "es_core_news_md",
+                            "en": "en_core_web_md",
+                            "pt": "pt_core_news_md",
+                            "de": "de_core_news_md",
+                            "fr": "fr_core_news_md",
+                        }
+                    )
+
+            return _Result()
+
+    assert kq._corpus_languages(_SettingsSession()) == ["es", "en", "pt", "de", "fr"]
+
+
+def test_corpus_languages_fallback_defaults():
+    """Sin settings activos → fallback a los idiomas instalados inicialmente."""
+    import src.kag_query as kq
+
+    class _EmptySession:
+        def execute(self, stmt, params=None):
+            class _Result:
+                def first(self):
+                    return None
+
+            return _Result()
+
+    assert kq._corpus_languages(_EmptySession()) == ["es", "en", "pt", "de", "fr"]
+
+
+def test_critic_prompt_injects_common_words_and_languages(monkeypatch):
+    """El prompt del crítico recibe el contexto de frecuencia + idiomas."""
+    import src.kag_query as kq
+
+    class _FakeSession:
+        def execute(self, stmt, params=None):
+            class _Result:
+                def fetchall(self):
+                    return [
+                        SimpleNamespace(word="cultura"),
+                        SimpleNamespace(word="psicología"),
+                    ]
+
+                def first(self):
+                    return SimpleNamespace(
+                        spacy_models={
+                            "es": "x",
+                            "en": "y",
+                            "pt": "z",
+                            "de": "w",
+                            "fr": "v",
+                        }
+                    )
+
+            return _Result()
+
+    captured = {}
+
+    def fake_call(
+        session,
+        *,
+        prompt,
+        system,
+        model_size,
+        response_format,
+        retries,
+        fallback_model=None,
+    ):
+        captured["prompt"] = prompt
+        return '{"needs_regex": false, "terms": []}', "small", False
+
+    monkeypatch.setattr(kq, "call_with_retries", fake_call)
+    monkeypatch.setattr(
+        kq,
+        "load_settings",
+        lambda session: SimpleNamespace(llm_retries=3, fallback_model=None),
+    )
+
+    kq.critic_regex_search(_FakeSession(), "¿Qué es la cultura?", top_k=5)
+    assert "cultura, psicología" in captured["prompt"]
+    assert "es, en, pt, de, fr" in captured["prompt"]
+
+
+def test_maintain_word_freq_deletes_and_inserts():
+    """_maintain_word_freq reescribe el índice: DELETE + INSERT por doc."""
+    import src.kag_ingest as ki
+
+    sqls = []
+
+    class _CaptureSession:
+        def execute(self, stmt, params=None):
+            sqls.append((str(stmt), params))
+
+    ki._maintain_word_freq(_CaptureSession(), doc_id=42)
+    assert len(sqls) == 2
+    delete_sql, delete_params = sqls[0]
+    insert_sql, insert_params = sqls[1]
+    assert "DELETE FROM kag_word_freq" in delete_sql
+    assert delete_params == {"doc_id": 42}
+    assert "INSERT INTO kag_word_freq" in insert_sql
+    assert "unnest(c.content_tsv)" in insert_sql
+    assert insert_params == {"doc_id": 42}

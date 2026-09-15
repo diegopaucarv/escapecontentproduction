@@ -508,6 +508,32 @@ def extract_entities_relations(session, chunk_text):
         return {}
 
 
+def _maintain_word_freq(session, doc_id: int) -> None:
+    """Reescribe el índice de frecuencia de palabras de un documento.
+
+    Se llama al final de la etapa 'segmented' (los chunks ya están insertados
+    y content_tsv es una columna generada, migración 0014). DELETE + INSERT
+    por doc: idempotente y consistente con el patrón de re-indexado (misma
+    característica que name_embedding: se recalcula al añadir/modificar un
+    documento).
+    """
+    session.execute(
+        text("DELETE FROM kag_word_freq WHERE doc_id = :doc_id"),
+        {"doc_id": doc_id},
+    )
+    session.execute(
+        text(
+            "INSERT INTO kag_word_freq (doc_id, word, nentry) "
+            "SELECT :doc_id, t.lexeme, COUNT(*) "
+            "FROM kag_chunks c "
+            "CROSS JOIN LATERAL unnest(c.content_tsv) AS t(lexeme, positions, weights) "
+            "WHERE c.doc_id = :doc_id "
+            "GROUP BY t.lexeme"
+        ),
+        {"doc_id": doc_id},
+    )
+
+
 def _store_entities_relations(session, doc_id, chunk_id, data, embed_fn=None):
     """Guarda entidades y relaciones de un chunk con dedup por name_norm (por doc).
 
@@ -930,6 +956,9 @@ def index_document(
         resume = "pending"
 
     title = _title_from_md(md_text, doc_path)
+    # lang se calcula UNA vez: lo necesitan el INSERT (columna language), la
+    # segmentación y la extracción determinista de entidades (nlp).
+    lang = detect_language(md_text)
     doc_id = None
     try:
         if resume == "pending":
@@ -939,9 +968,10 @@ def index_document(
             doc_id = session.execute(
                 text(
                     "INSERT INTO kag_documents "
-                    "(doc_path, title, doc_type, status, content_hash, token_estimate, stage) "
+                    "(doc_path, title, doc_type, status, content_hash, token_estimate, "
+                    "stage, language) "
                     "VALUES (:doc_path, :title, :doc_type, 'pending', :content_hash, "
-                    ":token_estimate, 'pending') RETURNING id"
+                    ":token_estimate, 'pending', :language) RETURNING id"
                 ),
                 {
                     "doc_path": doc_path,
@@ -949,6 +979,7 @@ def index_document(
                     "doc_type": doc_type,
                     "content_hash": content_hash,
                     "token_estimate": token_estimate,
+                    "language": lang,
                 },
             ).scalar()
             session.commit()
@@ -959,9 +990,6 @@ def index_document(
         # La segmentación es la etapa LENTA (torch/spacy). Se persisten los
         # chunks con embedding NULL ANTES de embeker: si se interrumpe aquí,
         # al reanudar NO se re-segmenta.
-        # lang/segmenter se calculan UNA vez: los necesitan tanto la
-        # segmentación como la extracción determinista de entidades (nlp).
-        lang = detect_language(md_text)
         if verbose:
             print(
                 f"[KAG] 📄 {doc_path} | {doc_type} | ~{token_estimate} tokens | idioma {lang}"
@@ -1002,6 +1030,7 @@ def index_document(
                     },
                 )
                 chunk_count += 1
+            _maintain_word_freq(session, doc_id)
             set_stage(session, "kag_documents", doc_id, "segmented")
             if verbose:
                 print(f"[KAG] ✂ {doc_path}: {chunk_count} chunks segmentados.")
@@ -1261,6 +1290,28 @@ def backfill_entity_embeddings(session, batch_size=64, verbose=True):
     return total
 
 
+def backfill_word_freq(session, verbose=True):
+    """Reconstruye kag_word_freq para todos los documentos (migración 0023).
+
+    Idempotente: DELETE + INSERT por documento ready. Para los docs ya
+    indexados antes de la migración. Devuelve el número de documentos
+    procesados.
+    """
+    rows = session.execute(
+        text(
+            "SELECT id FROM kag_documents "
+            "WHERE status = 'ready' AND EXISTS (SELECT 1 FROM kag_chunks c "
+            "WHERE c.doc_id = kag_documents.id) ORDER BY id"
+        )
+    ).fetchall()
+    for r in rows:
+        _maintain_word_freq(session, r.id)
+    session.commit()
+    if verbose:
+        print(f"[KAG] ✅ Backfill word_freq completo: {len(rows)} documentos.")
+    return len(rows)
+
+
 # ---------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------
@@ -1297,6 +1348,11 @@ def main() -> None:
         action="store_true",
         help="Rellena name_embedding de entidades sin embedding (migración 0022).",
     )
+    parser.add_argument(
+        "--backfill-word-freq",
+        action="store_true",
+        help="Reconstruye kag_word_freq para todos los docs (migración 0023).",
+    )
     args = parser.parse_args()
 
     _fix_db_host()
@@ -1306,6 +1362,8 @@ def main() -> None:
     try:
         if args.backfill_embeddings:
             backfill_entity_embeddings(session, verbose=args.verbose)
+        elif args.backfill_word_freq:
+            backfill_word_freq(session, verbose=args.verbose)
         elif args.doc:
             index_document(
                 session,

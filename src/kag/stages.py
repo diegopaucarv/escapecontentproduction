@@ -123,6 +123,9 @@ CLEANUP_SQL: dict[str, dict[str, list[str]]] = {
             # Re-segmentar: borra chunks (cascada a entidades/relaciones/figuras
             # vía ON DELETE CASCADE de chunk_id; las de doc_id también).
             "DELETE FROM kag_chunks WHERE doc_id = :doc_id",
+            # El índice de frecuencia de palabras se reescribe por doc en esta
+            # etapa (migración 0023): limpiarlo junto con los chunks.
+            "DELETE FROM kag_word_freq WHERE doc_id = :doc_id",
         ],
         "chunked": [
             # Re-embeder/entidades: borra entidades y relaciones (los chunks ya

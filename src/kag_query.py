@@ -21,6 +21,7 @@ import os
 import re
 import sys
 import threading
+import time
 from pathlib import Path
 
 from sqlalchemy import bindparam, text
@@ -291,6 +292,35 @@ _QUERY_STOPWORDS = {
     "a",
     "o",
     "e",
+    # Verbos copulativos / existenciales comunes (el crítico SLM a veces los
+    # propone como términos exactos — son ruido; el resto de verbos los
+    # decide el SLM con el contexto de frecuencia del corpus).
+    "existe",
+    "existen",
+    "hay",
+    "ser",
+    "estar",
+    "está",
+    "están",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "has",
+    "have",
+    "had",
+    "does",
+    "do",
+    "did",
+    "will",
+    "would",
+    "can",
+    "could",
+    "should",
+    "may",
+    "might",
+    "must",
 }
 
 
@@ -1206,11 +1236,19 @@ de búsqueda semántica: nombres propios, países, ciudades, organizaciones,
 códigos alfanuméricos (CVE-2024-3094, SKU-123), acrónimos, fechas, cifras,
 identificadores o términos técnicos raros.
 
+El corpus es MULTILINGÜE. Para cada término exacto, incluye su traducción a
+TODOS los idiomas soportados: {languages}. Los códigos y nombres propios no
+se traducen (se repiten igual en todos los idiomas).
+
+Palabras muy frecuentes en el corpus (NO las propongas: matchearían
+demasiados chunks y no aportan precisión): {common_words}
+
 Devuelve SOLO JSON:
-{{"needs_regex": true/false, "terms": ["término1", "término2"]}}
+{{"needs_regex": true/false, "terms": ["término y sus traducciones..."]}}
 
 - needs_regex: true si hay al menos un término exacto que buscar.
-- terms: los términos exactos (máx 5), tal como aparecen en la pregunta.
+- terms: máx 3 términos, cada uno con su traducción a todos los idiomas
+  (ej. ["discriminación negativa", "negative discrimination", ...]).
 - Si no hay términos exactos, devuelve {{"needs_regex": false, "terms": []}}.
 
 Pregunta: {query}
@@ -1232,6 +1270,85 @@ def _deterministic_regex_terms(query: str) -> list:
         if t and t.lower() not in _QUERY_STOPWORDS and len(t) > 2:
             terms.append(t)
     return terms[:5]
+
+
+# Caché del índice de frecuencia de palabras + idiomas soportados (el corpus
+# cambia al indexar; TTL corto para no servir datos muy viejos).
+_CORPUS_CACHE: dict = {"ts": 0.0, "words": None, "langs": None}
+_CORPUS_CACHE_TTL = 600.0  # 10 min
+
+
+def _corpus_common_words(session, top_n: int = 200) -> list:
+    """Palabras más frecuentes del corpus (índice kag_word_freq, migración 0023).
+
+    Se inyecta al crítico SLM como contexto: palabras que matchearían
+    demasiados chunks y no sirven como términos exactos. El SLM decide qué
+    proponer con esta información (no hay filtro duro en código).
+    """
+    cache = _CORPUS_CACHE
+    now = time.time()
+    if cache["words"] is not None and now - cache["ts"] < _CORPUS_CACHE_TTL:
+        return cache["words"]
+    words = []
+    try:
+        rows = session.execute(
+            text(
+                "SELECT word FROM kag_word_freq "
+                "GROUP BY word ORDER BY SUM(nentry) DESC, COUNT(*) DESC LIMIT :n"
+            ),
+            {"n": top_n},
+        ).fetchall()
+        words = [r.word for r in rows]
+    except Exception:  # noqa: BLE001 — sin índice: el crítico decide sin contexto
+        words = []
+    cache["ts"] = now
+    cache["words"] = words
+    return words
+
+
+def _corpus_languages(session) -> list:
+    """Idiomas soportados por el sistema (kag_segmenter_settings.spacy_models).
+
+    Los instalados inicialmente (es/en/pt/de/fr). El crítico SLM traduce cada
+    término a TODOS estos idiomas para que el FTS matchee el corpus
+    multilingüe.
+    """
+    cache = _CORPUS_CACHE
+    now = time.time()
+    if cache["langs"] is not None and now - cache["ts"] < _CORPUS_CACHE_TTL:
+        return cache["langs"]
+    langs = []
+    try:
+        row = session.execute(
+            text(
+                "SELECT spacy_models FROM kag_segmenter_settings "
+                "WHERE is_active = TRUE ORDER BY id LIMIT 1"
+            )
+        ).first()
+        if row and row.spacy_models:
+            langs = [str(k) for k in row.spacy_models.keys()]
+    except Exception:  # noqa: BLE001 — degradación natural
+        langs = []
+    if not langs:
+        langs = ["es", "en", "pt", "de", "fr"]
+    cache["ts"] = now
+    cache["langs"] = langs
+    return langs
+
+
+def _clean_llm_terms(raw: list) -> list:
+    """Safety net mínimo sobre los términos del crítico SLM.
+
+    El SLM decide qué términos proponer (con el contexto de frecuencia del
+    corpus y la traducción a todos los idiomas). Aquí solo se descartan
+    palabras de función y copulas — el resto lo decide el SLM.
+    """
+    cleaned = []
+    for t in raw:
+        s = str(t).strip()
+        if s and s.lower() not in _QUERY_STOPWORDS and len(s) > 2:
+            cleaned.append(s)
+    return cleaned[:15]
 
 
 def critic_regex_search(session, query, top_k=10, verbose=False):
@@ -1261,9 +1378,15 @@ def critic_regex_search(session, query, top_k=10, verbose=False):
         CRITIC_PROMPT,
     )
     try:
+        common = _corpus_common_words(session)
+        langs = _corpus_languages(session)
         text_out, _model, _used_fallback = call_with_retries(
             session,
-            prompt=user_template.format(query=query),
+            prompt=user_template.format(
+                query=query,
+                common_words=", ".join(common[:80]) or "(sin datos)",
+                languages=", ".join(langs),
+            ),
             system=system,
             model_size="small",
             response_format={"type": "json_object"},
@@ -1272,9 +1395,9 @@ def critic_regex_search(session, query, top_k=10, verbose=False):
         )
         data = parse_llm_output(text_out)
         if data.get("needs_regex"):
-            terms = [
-                str(t).strip() for t in (data.get("terms") or []) if str(t).strip()
-            ]
+            terms = _clean_llm_terms(
+                [str(t).strip() for t in (data.get("terms") or [])]
+            )
     except Exception:  # noqa: BLE001 — LLM no disponible: heurística
         pass
     if not terms:
@@ -1325,14 +1448,22 @@ Dada una pregunta:
    o está vacía, propón entidades adicionales tú mismo (nombres canónicos,
    posiblemente en inglés — el sistema las resolverá por similitud).
 
+El corpus es MULTILINGÜE. Para cada término exacto, incluye su traducción a
+TODOS los idiomas soportados: {languages}. Los códigos y nombres propios no
+se traducen (se repiten igual en todos los idiomas).
+
+Palabras muy frecuentes en el corpus (NO las propongas: matchearían
+demasiados chunks y no aportan precisión): {common_words}
+
 Candidatos del grafo:
 {candidates}
 
 Devuelve SOLO JSON:
-{{"needs_regex": true/false, "terms": ["término1"], "entities": ["Entidad 1"]}}
+{{"needs_regex": true/false, "terms": ["término y sus traducciones..."], "entities": ["Entidad 1"]}}
 
 - needs_regex: true si hay al menos un término exacto que buscar.
-- terms: los términos exactos (máx 5), tal como aparecen en la pregunta.
+- terms: máx 3 términos, cada uno con su traducción a todos los idiomas
+  (ej. ["discriminación negativa", "negative discrimination", ...]).
 - entities: 3-5 entidades relevantes. Prefiere las de la lista de candidatos;
   si la lista es insuficiente o está vacía, propón entidades adicionales tú
   mismo (nombres canónicos, posiblemente en inglés). Si ninguna, [].
@@ -1369,12 +1500,16 @@ def critic_and_linking(session, query, top_k=10, verbose=False):
         COMBINED_PROMPT,
     )
     try:
+        common = _corpus_common_words(session)
+        langs = _corpus_languages(session)
         text_out, _model, _used_fallback = call_with_retries(
             session,
             prompt=user_template.format(
                 candidates="\n".join(f"- {c}" for c in candidates)
                 or "(sin candidatos)",
                 query=query,
+                common_words=", ".join(common[:80]) or "(sin datos)",
+                languages=", ".join(langs),
             ),
             system=system,
             model_size="small",
@@ -1384,9 +1519,9 @@ def critic_and_linking(session, query, top_k=10, verbose=False):
         )
         data = parse_llm_output(text_out)
         if data.get("needs_regex"):
-            terms = [
-                str(t).strip() for t in (data.get("terms") or []) if str(t).strip()
-            ]
+            terms = _clean_llm_terms(
+                [str(t).strip() for t in (data.get("terms") or [])]
+            )
         raw_names = [
             str(e).strip() for e in (data.get("entities") or []) if str(e).strip()
         ]
