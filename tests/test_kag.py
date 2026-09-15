@@ -1339,7 +1339,7 @@ def test_get_prompt_pair_ignores_artifact_without_user_template():
 class _RegexSession:
     """Sesión falsa: responde a la query FTS combinada (tsq) por término.
 
-    El crítico ahora hace UNA consulta con to_tsquery OR ("t1" | "t2").
+    El crítico ahora hace UNA consulta con websearch_to_tsquery OR ("t1" OR "t2").
     La sesión parsea el tsq, extrae los términos entre comillas dobles y
     devuelve los hits de cada uno (dedup por id, orden de aparición).
     """
@@ -1489,7 +1489,7 @@ def test_critic_regex_search_batches_terms_in_one_query(monkeypatch):
             tsq = params.get("tsq", "")
             assert '"CVE-2024-3094"' in tsq
             assert '"Bourdieu"' in tsq
-            assert " | " in tsq  # OR booleano
+            assert " OR " in tsq  # OR booleano (sintaxis websearch)
             rows = [
                 SimpleNamespace(id=7, score=3.0),
                 SimpleNamespace(id=9, score=2.5),
@@ -1577,7 +1577,7 @@ def test_critic_regex_search_escapes_quotes_in_terms(monkeypatch):
 
     hits, terms = kq.critic_regex_search(session, 'a"b', top_k=5)
     assert terms == ['a"b']
-    assert '"a""b"' in session.tsq  # comilla doble escapada duplicándola
+    assert '"a b"' in session.tsq  # comilla doble reemplazada por espacio (websearch)
 
 
 # ---------------------------------------------------------------------

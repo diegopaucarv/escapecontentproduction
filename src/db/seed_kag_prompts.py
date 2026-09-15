@@ -857,8 +857,9 @@ def _upsert_template(session, data: dict) -> PromptTemplate:
 def seed(session=None) -> dict:
     """Inserta/actualiza las specs de prompts KAG. Devuelve un resumen.
 
-    No requiere variables de entorno. No compila artefactos (eso lo hace
-    src/llm/compile_prompts.py).
+    No requiere variables de entorno. Compila los artefactos automáticamente
+    (src/llm/compiler.py::compile_prompts) — idempotente: solo crea versiones
+    nuevas si el contenido cambió.
     """
     own_session = session is None
     if own_session:
@@ -869,9 +870,14 @@ def seed(session=None) -> dict:
     try:
         templates = [_upsert_template(session, data) for data in KAG_TEMPLATES]
         session.commit()
+        from src.llm.compiler import compile_prompts
+
+        compiled = compile_prompts(session)
         return {
             "templates": [str(t.id) for t in templates],
             "task_keys": [t.task_key for t in templates],
+            "compiled": compiled["compiled"],
+            "skipped": compiled["skipped"],
         }
     finally:
         if own_session:

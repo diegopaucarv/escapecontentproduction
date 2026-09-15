@@ -1060,6 +1060,7 @@ def create_prompt_template(
     session.add(template)
     session.commit()
     session.refresh(template)
+    _auto_compile_prompts(session)
     return _prompt_template_to_dict(template)
 
 
@@ -1092,6 +1093,7 @@ def update_prompt_template(
     _validate_critic(template, body.checklist_items)
     session.commit()
     session.refresh(template)
+    _auto_compile_prompts(session)
     return _prompt_template_to_dict(template)
 
 
@@ -1239,6 +1241,20 @@ def ensure_prompts(session: Session = Depends(get_session)) -> dict:
             status_code=500,
             detail=f"No se pudo compilar los prompts: {exc}",
         )
+
+
+def _auto_compile_prompts(session: Session) -> None:
+    """Recompila artefactos tras crear/editar un prompt template.
+
+    Idempotente: compile_prompts solo crea versiones nuevas si el contenido
+    cambió. Un fallo de compilación no debe romper el CRUD — se ignora.
+    """
+    try:
+        from src.llm.compiler import compile_prompts
+
+        compile_prompts(session)
+    except Exception:  # noqa: BLE001 — el CRUD no debe fallar por el compile
+        pass
 
 
 # ---------------------------------------------------------------------

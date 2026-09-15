@@ -1286,19 +1286,21 @@ def critic_regex_search(session, query, top_k=10, verbose=False):
 
     # Búsqueda FTS de TODOS los términos en UNA consulta (config 'simple':
     # agnóstica de idioma, sin stemming — ideal para códigos, acrónimos y
-    # nombres propios). Se construye un tsquery booleano OR: cada término se
-    # escapa como frase literal entre comillas dobles ("término") y se une
-    # con |. Las comillas dobles evitan que caracteres como '-' (operador
-    # NOT de tsquery) o espacios rompan el parseo. El ranking usa ts_rank_cd
-    # sobre el tsquery combinado; los chunks que matchean varios términos
-    # puntúan más alto (suma de relevancia por término).
-    tsq = " | ".join(f'"{t.replace(chr(34), chr(34) * 2)}"' for t in terms)
+    # nombres propios). Se construye un tsquery booleano OR con
+    # websearch_to_tsquery: tolera frases con espacios y acentos (a
+    # diferencia de to_tsquery, que exige sintaxis tsquery estricta y
+    # revienta con '"discriminación negativa"'). Las comillas dobles internas
+    # se reemplazan por espacio (en websearch las comillas delimitan frases).
+    # El ranking usa ts_rank_cd sobre el tsquery combinado; los chunks que
+    # matchean varios términos puntúan más alto (suma de relevancia por
+    # término).
+    tsq = " OR ".join(f'"{t.replace(chr(34), " ")}"' for t in terms)
     rows = session.execute(
         text(
-            "SELECT c.id, ts_rank_cd(c.content_tsv, to_tsquery('simple', :tsq)) "
+            "SELECT c.id, ts_rank_cd(c.content_tsv, websearch_to_tsquery('simple', :tsq)) "
             "AS score FROM kag_chunks c "
             "JOIN kag_documents d ON d.id = c.doc_id "
-            "WHERE c.content_tsv @@ to_tsquery('simple', :tsq) "
+            "WHERE c.content_tsv @@ websearch_to_tsquery('simple', :tsq) "
             "AND d.status = 'ready' ORDER BY score DESC LIMIT :top_k"
         ),
         {"tsq": tsq, "top_k": top_k},
@@ -1407,18 +1409,24 @@ def critic_and_linking(session, query, top_k=10, verbose=False):
     if terms:
         if verbose:
             print(f"[KAG] 🔍 Crítico: búsqueda textual con términos {terms}")
-        tsq = " | ".join(f'"{t.replace(chr(34), chr(34) * 2)}"' for t in terms)
-        rows = session.execute(
-            text(
-                "SELECT c.id, ts_rank_cd(c.content_tsv, to_tsquery('simple', :tsq)) "
-                "AS score FROM kag_chunks c "
-                "JOIN kag_documents d ON d.id = c.doc_id "
-                "WHERE c.content_tsv @@ to_tsquery('simple', :tsq) "
-                "AND d.status = 'ready' ORDER BY score DESC LIMIT :top_k"
-            ),
-            {"tsq": tsq, "top_k": top_k},
-        ).fetchall()
-        regex_hits = [(r.id, float(r.score)) for r in rows][:top_k]
+        try:
+            tsq = " OR ".join(f'"{t.replace(chr(34), " ")}"' for t in terms)
+            rows = session.execute(
+                text(
+                    "SELECT c.id, ts_rank_cd(c.content_tsv, websearch_to_tsquery('simple', :tsq)) "
+                    "AS score FROM kag_chunks c "
+                    "JOIN kag_documents d ON d.id = c.doc_id "
+                    "WHERE c.content_tsv @@ websearch_to_tsquery('simple', :tsq) "
+                    "AND d.status = 'ready' ORDER BY score DESC LIMIT :top_k"
+                ),
+                {"tsq": tsq, "top_k": top_k},
+            ).fetchall()
+            regex_hits = [(r.id, float(r.score)) for r in rows][:top_k]
+        except Exception:  # noqa: BLE001 — FTS falla (p.ej. tsquery inválido):
+            # no debe matar el entity linking; `names` ya se calculó arriba.
+            if verbose:
+                print("[KAG] ⚠ FTS textual falló; continúo solo con entity linking.")
+            session.rollback()
     return regex_hits, terms, names
 
 

@@ -83,7 +83,13 @@ def test_seed_data_has_6_templates():
         assert isinstance(t["rules"], list) and t["rules"]
 
 
-def test_seed_upserts_without_duplicates():
+def test_seed_upserts_without_duplicates(monkeypatch):
+    # El compilador necesita una DB real; en el test se mockea (el seed lo
+    # llama automáticamente tras el upsert).
+    monkeypatch.setattr(
+        "src.llm.compiler.compile_prompts",
+        lambda session: {"compiled": 0, "skipped": 0, "warnings": [], "artifacts": []},
+    )
     fake = _FakeSession()
     result1 = seed(session=fake)
     assert len(result1["model_names"]) == 3
@@ -97,7 +103,11 @@ def test_seed_upserts_without_duplicates():
     assert result2["task_keys"] == result1["task_keys"]
 
 
-def test_seed_returns_summary_with_ids():
+def test_seed_returns_summary_with_ids(monkeypatch):
+    monkeypatch.setattr(
+        "src.llm.compiler.compile_prompts",
+        lambda session: {"compiled": 0, "skipped": 0, "warnings": [], "artifacts": []},
+    )
     fake = _FakeSession()
     result = seed(session=fake)
     assert "models" in result and len(result["models"]) == 3
