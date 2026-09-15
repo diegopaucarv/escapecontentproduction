@@ -2704,12 +2704,14 @@ def _title_from_md(text: str, doc_path: str) -> str:
 
 
 def _sanitize_document_id(did: str, max_len: int = 200) -> str:
-    """Normaliza un document_id del LLM para que quepa en la columna.
+    """Normaliza un document_id del LLM para mantener ids legibles y estables.
 
-    El LLM de separación a veces genera ids larguísimos (nombre completo del
-    archivo + sufijo) que exceden VARCHAR(255). Se trunca a `max_len` y, si
-    hubo truncado, se añade un hash corto del id original para mantener la
-    unicidad y la estabilidad (mismo input → mismo id, idempotencia intacta).
+    La columna kag_documents.document_id es TEXT (migración 0031), así que no
+    hay límite de longitud; pero el LLM de separación a veces genera ids
+    larguísimos (nombre completo del archivo + sufijo) que ensucian la UI y
+    las claves. Se trunca a `max_len` y, si hubo truncado, se añade un hash
+    corto del id original para mantener la unicidad y la estabilidad (mismo
+    input → mismo id, idempotencia intacta).
     """
     did = str(did or "").strip()
     if not did:
@@ -2829,7 +2831,7 @@ def _index_document_separation(session, md_path, md_text, verbose=True) -> list[
     seen_ids = set()
 
     def _append_doc(did, title, ls, le, language):
-        # Normalizar el id del LLM (puede exceder la columna VARCHAR): truncar
+        # Normalizar el id del LLM (ids larguísimos ensucian la UI): truncar
         # con hash corto ANTES del dedup para que la unicidad se evalúe sobre
         # el id final que se persiste.
         did = _sanitize_document_id(did)
