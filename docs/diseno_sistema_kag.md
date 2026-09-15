@@ -1,7 +1,7 @@
 # Diseño — Sistema KAG Pragmático (Vector + Grafo de Entidades + HippoRAG)
 
 **Tipo de documento:** diseño de implementación — capa de conocimiento del pipeline
-**Estado:** implementado y verificado (2026-09-14) — migraciones `0013_kag` → `0021_kag_prompt_user_templates` aplicadas, seed aplicado. Incluye 4 optimizaciones: entity linking anclado con el LLM, desambiguación por copresencia en el grafo, noun chunks con spaCy y búsqueda híbrida densa + FTS + RRF. **Rediseño profundo (2026-09-14):** capa proposicional completa — ingesta proposicional (`src/kag_propositional.py`, 6 pasos), herramientas de ingesta (`src/kag/tools.py`), agentes query-time (`src/kag_agents.py`) y modelos de visión registrados con `is_vision=True` (`src/db/seed_vision.py`). **Bugs corregidos en verificación con el book stack real (2.8MB):** sombreado de `text()` de SQLAlchemy por la variable local `text` (rompía la ingesta con `'str' object is not callable`), `KeyError` en `EXTRACT_PROMPT` por llaves JSON literales con `.format()`, y `session.rollback()` en el except que deshacía el INSERT (ahora re-inserta con `status='failed'`). **Validación end-to-end (2026-09-13):** fixture temporal `_test_backprop.md` indexado y consultado con éxito (4 chunks, 20 entidades, 16 relaciones; respuesta correcta con cita de fuente). El fixture y sus datos se eliminaron tras validar; la ingesta del book stack real (Handbook of Culture and Psychology, ~712k tokens) quedó corriendo en background.
+**Estado:** implementado y verificado (2026-09-14) — migraciones `0013_kag` → `0025_kag_drop_propositional` aplicadas, seed aplicado. Incluye 4 optimizaciones: entity linking anclado con el LLM, desambiguación por copresencia en el grafo, noun chunks con spaCy y búsqueda híbrida densa + FTS + RRF. **Rediseño profundo (2026-09-14):** capa proposicional completa — ingesta proposicional (`src/kag_propositional.py`, 6 pasos), herramientas de ingesta (`src/kag/tools.py`), agentes query-time (`src/kag_agents.py`) y modelos de visión registrados con `is_vision=True` (`src/db/seed_vision.py`). **Unificación (2026-09-15, §8):** el motor proposicional fue **ELIMINADO** (migración `0025_kag_drop_propositional`) y sus capacidades se portaron al clásico expandido — proposiciones atómicas en `kag_propositions` (migración `0024_kag_propositions`) y modo `audited` en `src/kag_query.py` (ver §8 y §9). **Bugs corregidos en verificación con el book stack real (2.8MB):** sombreado de `text()` de SQLAlchemy por la variable local `text` (rompía la ingesta con `'str' object is not callable`), `KeyError` en `EXTRACT_PROMPT` por llaves JSON literales con `.format()`, y `session.rollback()` en el except que deshacía el INSERT (ahora re-inserta con `status='failed'`). **Validación end-to-end (2026-09-13):** fixture temporal `_test_backprop.md` indexado y consultado con éxito (4 chunks, 20 entidades, 16 relaciones; respuesta correcta con cita de fuente). El fixture y sus datos se eliminaron tras validar; la ingesta del book stack real (Handbook of Culture and Psychology, ~712k tokens) quedó corriendo en background.
 **Función:** indexar el `knowledge_repository` (`.md` + imágenes) y responder consultas locales y globales (_multi-hop_) sobre ese conocimiento, con el stack existente (Postgres + pgvector + Together) y la filosofía 0007.
 
 ---
@@ -12,7 +12,7 @@ Construimos un **KAG pragmático**: nada de Neo4j, nada de Leiden/Louvain, nada 
 
 > **Por qué HippoRAG y no GraphRAG:** la activación asociativa en 1–2 saltos (PPR simple sobre el grafo de entidades) supera a GraphRAG en precisión multi-hop con **órdenes de magnitud menos costo computacional** — no hay detección de comunidades ni resúmenes sintéticos por cluster. Para consultas globales usamos **resúmenes por documento** generados con un **LLM local ultra pequeño (Qwen 2.5 quantizado)**, mucho más baratos que los community summaries.
 
-**Rediseño profundo (capa proposicional, §4):** sobre la capa clásica construimos una capa de **proposiciones atómicas** — ficha documental ISO 25964 + Library of Congress, capítulos, proposiciones autocontenidas con embeddings, árbol temático secuencial e imágenes con FAQ Reverse HyDE (ingesta en `src/kag_propositional.py`, migración `0018_kag_propositional`). En consulta, un pipeline de agentes (`src/kag_agents.py`) sintetiza hechos, tipifica contradicciones, audita la suficiencia (con abstención formal si el corpus no cubre el dominio), expande con Branch B y verifica el grounding verbatim de cada cita antes de responder.
+**Rediseño profundo (capa proposicional, §4):** sobre la capa clásica construimos una capa de **proposiciones atómicas** — ficha documental ISO 25964 + Library of Congress, capítulos, proposiciones autocontenidas con embeddings, árbol temático secuencial e imágenes con FAQ Reverse HyDE (ingesta en `src/kag_propositional.py`, migración `0018_kag_propositional`). En consulta, un pipeline de agentes (`src/kag_agents.py`) sintetiza hechos, tipifica contradicciones, audita la suficiencia (con abstención formal si el corpus no cubre el dominio), expande con Branch B y verifica el grounding verbatim de cada cita antes de responder. **⚠ Unificación (2026-09-15, §8):** este motor proposicional fue **ELIMINADO** (migración `0025_kag_drop_propositional`); sus capacidades se portaron al pipeline clásico expandido — proposiciones atómicas en `kag_propositions` (migración `0024_kag_propositions`, extraídas en la etapa `chunked` de `src/kag_ingest.py`) y auditoría epistémica en el modo `audited` de `src/kag_query.py` (síntesis, contradicciones, suficiencia, Branch B, grounding).
 
 **Segmentación:** usamos el segmentador propio del proyecto (`src/kag/segmentador.py`, `ProgressiveSegmenter`), adaptado para leer su configuración de la base de datos (`load_segmenter_config`) y elegir el modelo spaCy del idioma del documento (es/en/pt/de/fr). La detección de idioma (`detect_language`, heurística determinista por stopwords) vive en `src/kag_ingest.py` — módulo ligero, testable sin cargar torch/spacy — y `build_segmenter(session, lang, verbose)` la recibe como parámetro.
 
@@ -29,7 +29,7 @@ Construimos un **KAG pragmático**: nada de Neo4j, nada de Leiden/Louvain, nada 
 
 ## 1. Estructura de datos (migración `0013_kag`)
 
-Cadena de migraciones: `0012_brand_knowledge` → `0013_kag` → `0014_kag_fts` → `0015_kag_hnsw` → `0016_kag_graph_version` → `0017_kag_trgm` → `0018_kag_propositional` → `0019_kag_unified` → `0020_kag_stages` → **`0021_kag_prompt_user_templates`** (head).
+Cadena de migraciones: `0012_brand_knowledge` → `0013_kag` → `0014_kag_fts` → `0015_kag_hnsw` → `0016_kag_graph_version` → `0017_kag_trgm` → `0018_kag_propositional` → `0019_kag_unified` → `0020_kag_stages` → `0021_kag_prompt_user_templates` → `0022_kag_entity_embeddings` → `0023_kag_word_freq` → `0024_kag_propositions` → **`0025_kag_drop_propositional`** (head).
 
 ### 1.1 Tablas KAG
 
@@ -504,6 +504,8 @@ Los umbrales del sistema son RELATIVOS a la distribución, no absolutos: el scor
 
 ## 4. Arquitectura proposicional (rediseño profundo)
 
+> **⚠ OBSOLETO (2026-09-15):** esta sección describe el motor proposicional **eliminado** en la unificación (§8). `src/kag_propositional.py` y `src/kag_agents.py` fueron borrados y sus 5 tablas (`documents`, `document_chapters`, `propositional_chunks`, `topic_tree_nodes`, `document_images`) DROPPED (migración `0025_kag_drop_propositional`). Las capacidades valiosas se portaron al pipeline clásico expandido: proposiciones atómicas en `kag_propositions` (migración `0024_kag_propositions`, extraídas en la etapa `chunked` de `src/kag_ingest.py`) y auditoría epistémica (síntesis/contradicciones/suficiencia/Branch B/grounding) en el modo `audited` de `src/kag_query.py`. Los diagramas ASCII de esta sección son históricos; el diagrama de secuencias del sistema unificado está en §9.
+
 Sobre la capa clásica (chunks + grafo de entidades + HippoRAG, §1–§3) construimos una **capa proposicional**: proposiciones atómicas autocontenidas con embeddings, ficha documental ISO 25964 + Library of Congress, capítulos, árbol temático secuencial e imágenes con FAQ Reverse HyDE. La ingesta vive en `src/kag_propositional.py` (migración `0018_kag_propositional`) y la consulta en `src/kag_agents.py`. Las herramientas de ingesta (`MultibookFinderTool`, `LibraryOfCongressAPITool`, `MarkdownImageExtractorTool`) viven en `src/kag/tools.py`.
 
 ### 4.1 Pipeline de ingesta proposicional (`src/kag_propositional.py`)
@@ -721,13 +723,15 @@ query ──► 1. Embedding (input_type='query')
 | `src/kag/entities.py`                                | Extracción determinista de entidades y relaciones con spaCy (sin LLM): candidatos por noun_chunks + tokens NOUN/PROPN, supresión NER (los spans NER se sirven por búsqueda textual, los conceptos que los mencionan se conservan), normalización, filtro de ruido, canonicalización por embeddings con `gap_margin` (evita fusiones ambiguas), relaciones CO_OCURRE por oración                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `src/kag_ingest.py`                                  | `_fix_db_host`, `estimate_tokens`, `normalize_entity_name`, `embedding_to_sql`, `detect_language`, `chunk_markdown`, `complete_local`, `extract_entities_relations`, `_store_entities_relations`, `summarize_document`, `describe_figure`, `_index_figures`, `index_document` (stage-driven con `src/kag/stages.py`, §2.3.1), `index_all`, `main`. Prompts con fallback prompt-as-code (`_get_prompt_pair` + task keys)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `src/kag_query.py`                                   | `_fix_db_host`, `classify_query`, `_deterministic_entity_fallback`, `_noun_chunk_fallback`, `_get_spacy_nlp`, `_spacy_model_for`, `grounded_entity_linking`, `match_entities_candidates`, `disambiguate_by_cooccurrence`, `build_adjacency` (cacheado por versión en DB, migración 0016; degrada a reconstrucción por query si no está aplicada), `personalized_pagerank`, `ego_network` (subgrafo 2-hop para PPR), `ppr_entity_selection`, `vector_search`, `fts_search`, `rrf_merge` (variádico), `hybrid_search`, `chunks_for_entities`, `chunks_by_ids` (una consulta `ANY(:ids)` + `array_position`), `subgraph_triples`, `figures_for_chunks`, `doc_summaries`, `apply_relevance_threshold`, `expand_chunk_window`, `_group_chunks_with_window`, `_get_reranker`, `rerank_chunks` (cross-encoder opcional, `RERANK_ENABLED=False`), `_deterministic_regex_terms`, `critic_regex_search`, `critic_and_linking` (CRIT+EL fusionados en una llamada), `assemble_context` (orden determinista para prompt caching), `generate_answer`, `ask`, `main`. Prompts con fallback prompt-as-code (`_get_prompt_pair` + task keys) |
-| `src/api/main.py`                                    | API FastAPI: `POST /kag/ask` (consulta proposicional con payload enriquecido: `answer`, `verdict`, `grounded_evidence` de Branch A, `epistemic_tensions`, `used_fallback`, `consulted_documents` dedup por `document_id`) y `POST /kag/ingest` (ingesta de un `.md` o de todos, protegido con `require_role("lider")`). Imports perezosos de `ask_propositional`/`index_*`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `src/api/main.py`                                    | API FastAPI: `POST /kag/ask` (consulta al motor unificado, `mode="audited"` default — payload enriquecido: `answer`, `verdict`, `grounded_evidence`, `epistemic_tensions`, `used_fallback`, `consulted_documents` dedup por `document_id`; `mode="fast"` devuelve respuesta directa) y `POST /kag/ingest` (ingesta clásica de un `.md` o de todos, `extract_propositions=True` por defecto, protegido con `require_role("lider")`). Imports perezosos de `ask`/`index_*`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `tests/test_kag.py`                                  | 85 tests de lógica pura (sin DB, sin torch/spacy): chunking con segmenter fake (incl. fusión hasta max_tokens y `use_coref`), PPR, clasificación, ensamblado (incl. `history` y orden determinista para prompt caching), normalización, detección de idioma, `complete_local` (monkeypatch httpx), RRF (2 y 3 capas), `ppr_entity_selection` (umbral relativo + guarda estadística), desambiguación por copresencia (overlap coefficient + margen), entity linking anclado, crítico regex (terms + heurística), `critic_and_linking` (anclaje al pool + degradación), `rerank_chunks` (default OFF + degradación), `hybrid_search` (degradación y merge)                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `tests/test_kag_tools.py`                            | Tests de `src/kag/tools.py` (sin red ni DB): MultibookFinderTool (2 libros apilados, archivo faltante, vacío), LibraryOfCongressAPITool (parseo del JSON de suggest2, errores HTTP/timeout/no-200/JSON malformado → None), MarkdownImageExtractorTool (sintaxis MD + HTML, respeta el rango de líneas)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `tests/test_kag_propositional.py`                    | Tests de `src/kag_propositional.py` (sin DB real ni red): pipeline completo con fakes, idempotencia por hash, `--force`, degradación cuando el LLM falla, `_sequential_clusters` (solo fusiona adyacentes, no fusiona no-adyacentes, edge cases con None), `_ctfidf_keywords` (términos distintivos, stopwords filtradas, vacío/único), `_index_images` (VLM éxito y fallo → degradación)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `tests/test_kag_agents.py`                           | 31 tests de `src/kag_agents.py` (sin DB real ni red): `query_focused_proposition_extractor` (orden por coseno, `top_propositions`, degradación con embedding None, corpus vacío), `escalate_to_parent_context`, `synthesize_chunks` (hechos con LLM, vacío, degradación), `resolve_contradictions` (tipificación, none, vacío, degradación), `evaluate_sufficiency` (verdicts parametrizados, degradación), `BranchBOrchestrator` (dedup, exclusión de visitados, límite de hops, expansión 2-hop), `verify_claim_grounding` (exacto, fuzzy ≥95, fallo, chunk inválido), `assemble_final_context` y `ask_propositional` (pipeline completo, negative rejection, Branch B, degradación, rescate por Branch B si falla el embedding)                                                                                                                                                                                                                                                                                                                                                                                           |
 | `scripts/kag_demo.py`                                | CLI de demo: `--index 'pregunta'` (indexa todo + responde) o modo pregunta directa, con prints detallados                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `scripts/test_together.py`                           | Test independiente: envía un prompt a Together AI (modelo pequeño/grande/ambos) y visualiza el resultado, con prints de la config leída de la DB                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+
+> **⚠ Nota de unificación (2026-09-15):** las filas de `src/kag_propositional.py` y `src/kag_agents.py` describen el motor proposicional **ELIMINADO** (migración `0025_kag_drop_propositional`); se conservan como referencia histórica. El sistema unificado vive en `src/kag_ingest.py` (etapa `chunked` con proposiciones en `kag_propositions`, migración `0024_kag_propositions`) y `src/kag_query.py` (`ask` con `mode="fast"|"audited"`). Ver §8 y §9.
 
 **Estilo deliberado:** código simple y directo, sin dataclasses ni abstracciones innecesarias — fácil de cambiar luego. SQL crudo vía `session.execute(text(...))` (no se toca `src/db/models.py` — la única excepción es `LlmModel.is_vision` en `src/db/models.py`, añadido por la migración 0018). **Prompt-as-code completo (migración 0021):** SYSTEM + USER viven en `prompt_templates` (specs con `user_template` en `src/db/seed_kag_prompts.py`) y se compilan a `prompt_artifacts` con `user_template` + `user_template_hash` (idempotencia dual del compilador); el runtime consulta el par (system, user) vía `_get_prompt_pair`/`get_active_prompt` y cae a las constantes SOLO si no hay DB/artefacto (tests sin DB). Prints descriptivos en cada paso (`verbose=True`). Los módulos nuevos (`src/kag/tools.py`, `src/kag_propositional.py`, `src/kag_agents.py`) son LIGEROS a propósito: scipy/sklearn/embeddings/httpx se importan solo dentro de las funciones que los necesitan. La API (`src/api/main.py`) importa `ask_propositional`/`index_*` de forma perezosa para no pesar el arranque.
 
@@ -737,7 +741,7 @@ query ──► 1. Embedding (input_type='query')
 
 ## 7. Trabajo futuro (explícitamente fuera de alcance)
 
-> Ya implementado (fuera de esta lista): entity linking anclado con el LLM (§3.3.1), desambiguación por copresencia (§3.3.2), noun chunks con spaCy (§3.3.3), búsqueda híbrida densa + FTS + RRF (§3.3.4, migración `0014_kag_fts`), LLM crítico → búsqueda textual + grafo integrado (§3.3.5), merge final con RRF sobre 3 capas + ventana de contexto (§3.3.6), CRIT + EL fusionados + chunks por lotes + PPR ego-network + prompt caching (§3.3.7), reranker cross-encoder opcional (§3.3.8, `RERANK_ENABLED=False`), **capa proposicional completa (§4, migración `0018_kag_propositional`):** ingesta proposicional de 6 pasos (`src/kag_propositional.py`), herramientas de ingesta (`src/kag/tools.py`), agentes query-time con síntesis/contradicciones/suficiencia/Branch B/grounding (`src/kag_agents.py`) y modelos de visión con `is_vision=True` (`src/db/seed_vision.py` + `get_vision_model`/`complete_vision` en `src/llm/together.py`). **Migración completa de prompts a prompt-as-code (migración `0021_kag_prompt_user_templates`):** SYSTEM + USER viven en `prompt_templates` (16 specs con `user_template` en `src/db/seed_kag_prompts.py`) y se compilan a `prompt_artifacts` con `user_template` + `user_template_hash` (idempotencia dual en `src/llm/compiler.py`); el runtime usa el par (system, user) vía `_get_prompt_pair` con fallback a constantes solo sin DB. **Restricción de VLM:** `complete_vision` solo usa modelos `is_vision=True` — si no hay VLM activo lanza `LLMConfigError` (nunca degrada a `cfg.large_model`); los callers degradan con gracia (imagen con descripción vacía). **Máquina de estados por etapa (migración `0020_kag_stages` + `src/kag/stages.py`):** ingesta clásica y proposicional atómicas por etapa (`resume_from`/`cleanup_stage`/`set_stage`), reanudación sin perder la segmentación/chunking ya persistido. **Pendientes de la Sección 6 resueltos:** migración de prompts a prompt-as-code (ahora COMPLETA: SYSTEM + USER, ver arriba), llamada unificada de análisis documental (migración `0019_kag_unified`: `documents.summary` + GIN en `faq_indexing`; `_index_document_analysis` consolida ficha+capítulos+resumen+entidades en UNA llamada), `stacked_manifest.json` (rangos del MultibookFinderTool por `source_file`) y endpoints HTTP `POST /kag/ask` + `POST /kag/ingest` en `src/api/main.py` (payload enriquecido con `consulted_documents`). **Suite de tests de los agentes query-time:** `tests/test_kag_agents.py` (31 tests: síntesis, contradicciones, suficiencia, Branch B, grounding y pipeline completo de `ask_propositional`).
+> Ya implementado (fuera de esta lista): entity linking anclado con el LLM (§3.3.1), desambiguación por copresencia (§3.3.2), noun chunks con spaCy (§3.3.3), búsqueda híbrida densa + FTS + RRF (§3.3.4, migración `0014_kag_fts`), LLM crítico → búsqueda textual + grafo integrado (§3.3.5), merge final con RRF sobre 3 capas + ventana de contexto (§3.3.6), CRIT + EL fusionados + chunks por lotes + PPR ego-network + prompt caching (§3.3.7), reranker cross-encoder opcional (§3.3.8, `RERANK_ENABLED=False`), **capa proposicional completa (§4, migración `0018_kag_propositional`):** ingesta proposicional de 6 pasos (`src/kag_propositional.py`), herramientas de ingesta (`src/kag/tools.py`), agentes query-time con síntesis/contradicciones/suficiencia/Branch B/grounding (`src/kag_agents.py`) y modelos de visión con `is_vision=True` (`src/db/seed_vision.py` + `get_vision_model`/`complete_vision` en `src/llm/together.py`). **Migración completa de prompts a prompt-as-code (migración `0021_kag_prompt_user_templates`):** SYSTEM + USER viven en `prompt_templates` (16 specs con `user_template` en `src/db/seed_kag_prompts.py`) y se compilan a `prompt_artifacts` con `user_template` + `user_template_hash` (idempotencia dual en `src/llm/compiler.py`); el runtime usa el par (system, user) vía `_get_prompt_pair` con fallback a constantes solo sin DB. **Restricción de VLM:** `complete_vision` solo usa modelos `is_vision=True` — si no hay VLM activo lanza `LLMConfigError` (nunca degrada a `cfg.large_model`); los callers degradan con gracia (imagen con descripción vacía). **Máquina de estados por etapa (migración `0020_kag_stages` + `src/kag/stages.py`):** ingesta clásica y proposicional atómicas por etapa (`resume_from`/`cleanup_stage`/`set_stage`), reanudación sin perder la segmentación/chunking ya persistido. **Pendientes de la Sección 6 resueltos:** migración de prompts a prompt-as-code (ahora COMPLETA: SYSTEM + USER, ver arriba), llamada unificada de análisis documental (migración `0019_kag_unified`: `documents.summary` + GIN en `faq_indexing`; `_index_document_analysis` consolida ficha+capítulos+resumen+entidades en UNA llamada), `stacked_manifest.json` (rangos del MultibookFinderTool por `source_file`) y endpoints HTTP `POST /kag/ask` + `POST /kag/ingest` en `src/api/main.py` (payload enriquecido con `consulted_documents`). **Suite de tests de los agentes query-time:** `tests/test_kag_agents.py` (31 tests: síntesis, contradicciones, suficiencia, Branch B, grounding y pipeline completo de `ask_propositional`). **⚠ Unificación (2026-09-15, §8):** el motor proposicional fue **ELIMINADO** (migración `0025_kag_drop_propositional`); sus capacidades se portaron al clásico expandido — proposiciones atómicas en `kag_propositions` (0024) y modo `audited` en `src/kag_query.py` (síntesis, contradicciones, suficiencia, Branch B, grounding).
 
 - Embeddings por entidad (para entity linking puramente vectorial).
 - Resúmenes por comunidad (GraphRAG completo) si el volumen lo justifica.
@@ -879,3 +883,156 @@ query ──► 1. Embedding (input_type='query')
 ---
 
 **Orden de ejecución:** Agentes A, B, C, D en paralelo (scopes disjuntos) → verificación de contratos entre B y C (dict shapes de proposición) → Agente E (solo después). El usuario borrará la DB y re-clonará: el seed fresco compilará los artefactos con los placeholders nuevos.
+
+---
+
+## 9. Diagrama de secuencias unificado
+
+> **Arquitectura real (2026-09-15):** pipeline KAG unificado tras la eliminación
+> del motor proposicional (migración `0025_kag_drop_propositional`). La ingesta
+> clásica expandida (`src/kag_ingest.py`) extrae proposiciones atómicas en la
+> etapa `chunked` (`kag_propositions`, migración `0024_kag_propositions`), y la
+> consulta (`src/kag_query.py`) ofrece dos modos: `fast` (default CLI, respuesta
+> `str`) y `audited` (default API, respuesta `dict` con auditoría epistémica).
+> Los diagramas reflejan el flujo REAL del código actual.
+
+### 9.1 Ingesta — `index_document` (máquina de estados `pending → segmented → chunked → figures → ready`)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as Usuario / CLI
+    participant I as kag_ingest (index_document)
+    participant S as Segmentador (ProgressiveSegmenter)
+    participant E as Embeddings (Jina local)
+    participant L as LLM (pequeño / Qwen local / VLM)
+    participant DB as Postgres (kag_*)
+
+    U->>I: python -m src.kag_ingest [--doc X.md] [--no-propositions]
+    I->>DB: INSERT kag_documents (status pending, stage pending)
+    Note over I,DB: Etapa pending
+    I->>S: build_segmenter(session, lang) + chunk_markdown (coref solo short)
+    S-->>I: chunks con section_path y token_estimate
+    I->>DB: INSERT kag_chunks (embedding NULL) + kag_word_freq
+    I->>DB: set_stage segmented
+    Note over I,DB: Etapa segmented
+    I->>E: embed_texts (batch 32, input_type document)
+    E-->>I: embeddings vector(768)
+    I->>DB: UPDATE kag_chunks.embedding
+    I->>I: extract_entities_deterministic (spaCy) o --llm-entities
+    I->>DB: INSERT kag_entities + kag_relations (CO_OCURRE)
+    opt extract_propositions=True (default)
+        I->>L: _extract_propositions (spec kag_proposition_chunking, JSON mode)
+        L-->>I: proposiciones atómicas (statement, text_span, spans, citas)
+        I->>E: embed statements (batch)
+        I->>DB: INSERT kag_propositions (multi-VALUES)
+    end
+    I->>DB: set_stage chunked
+    Note over I,DB: Etapa chunked (embeddings + entidades + relaciones + proposiciones)
+    I->>L: describe_figure (VLM, data URL base64)
+    L-->>I: descripción de la figura
+    I->>DB: INSERT kag_figures
+    I->>DB: set_stage figures
+    Note over I,DB: Etapa figures
+    I->>L: summarize_document (Qwen 2.5 local, map-reduce si long)
+    L-->>I: resumen del documento
+    I->>DB: UPDATE kag_documents (status ready, counts, summary)
+    I->>DB: set_stage ready
+    I-->>U: resumen de ingesta (chunks, entidades, relaciones, figuras)
+```
+
+### 9.2 Consulta `mode="fast"` — `ask` (flujo clásico + proposiciones de los chunks ganadores)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as Usuario / CLI
+    participant Q as kag_query (ask, mode fast)
+    participant E as Embeddings (Jina local)
+    participant L as LLM (pequeño / grande)
+    participant DB as Postgres (kag_*)
+
+    U->>Q: python -m src.kag_query "pregunta" [--mode fast]
+    Q->>Q: classify_query (global / local)
+    Q->>E: embed_text (input_type query)
+    E-->>Q: q_emb
+    Q->>DB: hybrid_search (densa pgvector + FTS ts_rank_cd + RRF k=60)
+    DB-->>Q: vec_hits
+    Q->>Q: apply_relevance_threshold (codo Kneedle / piso relativo)
+    Q->>L: critic_and_linking (CRIT + EL en UNA llamada, JSON mode)
+    L-->>Q: regex_hits, regex_terms, names
+    Q->>DB: match_entities_candidates (exacto name_norm + LIKE trigram)
+    Q->>DB: build_adjacency (caché por versión kag_graph_state)
+    Q->>Q: disambiguate_by_cooccurrence (overlap coefficient)
+    Q->>Q: ego_network (2-hop) + personalized_pagerank (HippoRAG)
+    Q->>Q: ppr_entity_selection (umbral relativo)
+    Q->>DB: chunks_for_entities (entidades PPR)
+    Q->>Q: rrf_merge (vector + regex + PPR, 3 capas)
+    Q->>DB: chunks_by_ids (ANY(:ids) + array_position)
+    Q->>Q: _group_chunks_with_window (±5 vecinos, cap MAX_CONTEXT_CHUNKS)
+    Q->>DB: subgraph_triples + figures_for_chunks + doc_summaries
+    Q->>DB: propositions_for_chunks (kag_propositions de chunks ganadores)
+    Q->>Q: assemble_context (subgrafo + resúmenes + fragmentos + proposiciones + figuras)
+    Q->>L: generate_answer (LLM grande, prompt kag_query_answer)
+    L-->>Q: respuesta
+    Q-->>U: str (respuesta)
+```
+
+### 9.3 Consulta `mode="audited"` — `_ask_audited` (auditoría epistémica)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as Usuario / API
+    participant Q as kag_query (_ask_audited)
+    participant L as LLM (pequeño / grande)
+    participant DB as Postgres (kag_*)
+
+    U->>Q: ask(query, mode="audited")
+    Note over Q: 1. Recuperación clásica (misma lógica que fast)
+    Q->>Q: classify_query + hybrid_search + critic_and_linking
+    Q->>Q: entity linking + PPR + merge + ventana ±5
+    Q->>DB: propositions_for_chunks (chunks ganadores)
+    Q->>L: _synthesize_facts (LLM pequeño, prompt kag_synthesis)
+    L-->>Q: hechos atómicos (relevance_level, verbatim_evidence)
+    Q->>L: _resolve_contradictions (prompt kag_contradictions)
+    L-->>Q: tipología de contradicciones
+    Q->>L: _evaluate_sufficiency (prompt kag_sufficiency)
+    L-->>Q: verdict (SUFFICIENT / INSUFFICIENT / NEGATIVE_REJECTION)
+    alt NEGATIVE_REJECTION
+        Q-->>U: abstención formal (verdict incluido)
+    else INSUFFICIENT_TRIGGER_BRANCH_B
+        loop hasta max_iterations=2
+            Q->>DB: _branch_b_expand (FTS kag_propositions + vecinos del grafo)
+            Q->>L: re-sintetizar + re-evaluar suficiencia
+        end
+    end
+    Q->>L: _verify_grounding (rapidfuzz partial_ratio >= 95)
+    Q->>L: respuesta final (LLM grande, prompt kag_answer)
+    L-->>Q: answer
+    Q-->>U: "dict {answer, verdict, grounded_evidence, epistemic_tensions, used_fallback}"
+```
+
+### 9.4 API — `POST /kag/ask` y `POST /kag/ingest`
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Cliente HTTP
+    participant A as API (src/api/main.py)
+    participant Q as kag_query (ask)
+    participant I as kag_ingest (index_document / index_all)
+    participant DB as Postgres (kag_*)
+
+    C->>A: "POST /kag/ask {query, mode=audited|fast}"
+    A->>Q: ask(session, query, mode=body.mode) (import lazy)
+    Q->>DB: recuperación + auditoría (ver diagramas 9.2 y 9.3)
+    Q-->>A: str (fast) o dict (audited)
+    A-->>C: "{answer, verdict, grounded_evidence, epistemic_tensions, used_fallback, consulted_documents}"
+
+    C->>A: "POST /kag/ingest {file_path?, force, extract_propositions=True} (rol lider)"
+    A->>I: index_document / index_all (import lazy)
+    I->>DB: pipeline pending → segmented → chunked → figures → ready
+    I-->>A: resultados por documento
+    A-->>C: {results, count}
+```
