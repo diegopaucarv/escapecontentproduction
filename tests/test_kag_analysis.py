@@ -285,6 +285,198 @@ def test_analysis_llm_json_invalido_degrada(monkeypatch):
     assert len(updates) == 1
 
 
+def test_analysis_index_malformado_usa_chapters_plano(monkeypatch):
+    """FIX M1: index no vacío pero con divisiones malformadas (sin chapters
+    list) → backward compat con el schema plano v1.0 (data["chapters"])."""
+
+    def fake_call_with_retries(session, **kwargs):
+        return (
+            json.dumps(
+                {
+                    "ficha": {"title": "Libro Uno"},
+                    "index": [
+                        {"division": "Parte I", "chapters": "no-es-lista"},
+                        {"division": "Parte II"},
+                    ],
+                    "chapters": [
+                        {
+                            "chapter_id": "cap1",
+                            "title": "Capítulo 1",
+                            "line_start": 1,
+                            "line_end": 5,
+                            "has_images": False,
+                        }
+                    ],
+                }
+            ),
+            "fake-large",
+            False,
+        )
+
+    monkeypatch.setattr("src.kag_ingest.call_with_retries", fake_call_with_retries)
+    session = _FakeSession()
+    chapter_map = _index_document_analysis(
+        session, "doc-1", "libro_uno.md", _md_text(), verbose=False
+    )
+    assert chapter_map == {"cap1": "chap-uuid-1"}
+    updates = [c for c in session.calls if "UPDATE kag_documents" in c[0]]
+    sections = json.loads(updates[0][1]["sections"])
+    assert len(sections) == 1
+    assert sections[0]["chapter_id"] == "cap1"
+
+
+def test_analysis_index_jerarquico_aplana_con_division(monkeypatch):
+    """FIX: index jerárquico [{division, chapters: [...]}] se aplana y cada
+    capítulo hereda su division en sections_json."""
+
+    def fake_call_with_retries(session, **kwargs):
+        return (
+            json.dumps(
+                {
+                    "ficha": {"title": "Libro Uno"},
+                    "index": [
+                        {
+                            "division": "PART I",
+                            "chapters": [
+                                {
+                                    "chapter_id": "cap1",
+                                    "title": "Capítulo 1",
+                                    "line_start": 1,
+                                    "line_end": 5,
+                                    "has_images": False,
+                                },
+                                {
+                                    "chapter_id": "cap2",
+                                    "title": "Capítulo 2",
+                                    "line_start": 6,
+                                    "line_end": 10,
+                                    "has_images": True,
+                                },
+                            ],
+                        },
+                        {
+                            "division": "PART II",
+                            "chapters": [
+                                {
+                                    "chapter_id": "cap3",
+                                    "title": "Capítulo 3",
+                                    "line_start": 11,
+                                    "line_end": 15,
+                                    "has_images": False,
+                                }
+                            ],
+                        },
+                    ],
+                }
+            ),
+            "fake-large",
+            False,
+        )
+
+    monkeypatch.setattr("src.kag_ingest.call_with_retries", fake_call_with_retries)
+    session = _FakeSession()
+    chapter_map = _index_document_analysis(
+        session, "doc-1", "libro_uno.md", _md_text(), verbose=False
+    )
+
+    # Los 3 capítulos se aplanan en orden y cada uno hereda su division.
+    assert chapter_map == {
+        "cap1": "chap-uuid-1",
+        "cap2": "chap-uuid-2",
+        "cap3": "chap-uuid-3",
+    }
+    updates = [c for c in session.calls if "UPDATE kag_documents" in c[0]]
+    sections = json.loads(updates[0][1]["sections"])
+    assert len(sections) == 3
+    assert sections[0]["chapter_id"] == "cap1"
+    assert sections[0]["division"] == "PART I"
+    assert sections[1]["chapter_id"] == "cap2"
+    assert sections[1]["division"] == "PART I"
+    assert sections[2]["chapter_id"] == "cap3"
+    assert sections[2]["division"] == "PART II"
+
+
+def test_analysis_index_vacio_usa_chapters_plano(monkeypatch):
+    """FIX: index: [] (lista vacía) cae al fallback chapters plano v1.0."""
+
+    def fake_call_with_retries(session, **kwargs):
+        return (
+            json.dumps(
+                {
+                    "ficha": {"title": "Libro Uno"},
+                    "index": [],
+                    "chapters": [
+                        {
+                            "chapter_id": "cap1",
+                            "title": "Capítulo 1",
+                            "line_start": 1,
+                            "line_end": 5,
+                            "has_images": False,
+                        }
+                    ],
+                }
+            ),
+            "fake-large",
+            False,
+        )
+
+    monkeypatch.setattr("src.kag_ingest.call_with_retries", fake_call_with_retries)
+    session = _FakeSession()
+    chapter_map = _index_document_analysis(
+        session, "doc-1", "libro_uno.md", _md_text(), verbose=False
+    )
+    assert chapter_map == {"cap1": "chap-uuid-1"}
+    updates = [c for c in session.calls if "UPDATE kag_documents" in c[0]]
+    sections = json.loads(updates[0][1]["sections"])
+    assert len(sections) == 1
+    assert sections[0]["chapter_id"] == "cap1"
+    assert sections[0]["division"] == ""
+
+
+def test_analysis_has_images_string_normalizado(monkeypatch):
+    """FIX M3: has_images "false"/"true" (str) no debe evaluar a True."""
+
+    def fake_call_with_retries(session, **kwargs):
+        return (
+            json.dumps(
+                {
+                    "ficha": {"title": "Libro Uno"},
+                    "chapters": [
+                        {
+                            "chapter_id": "cap1",
+                            "title": "Capítulo 1",
+                            "line_start": 1,
+                            "line_end": 5,
+                            "has_images": "false",
+                        },
+                        {
+                            "chapter_id": "cap2",
+                            "title": "Capítulo 2",
+                            "line_start": 6,
+                            "line_end": 10,
+                            "has_images": "true",
+                        },
+                    ],
+                }
+            ),
+            "fake-large",
+            False,
+        )
+
+    monkeypatch.setattr("src.kag_ingest.call_with_retries", fake_call_with_retries)
+    session = _FakeSession()
+    _index_document_analysis(
+        session, "doc-1", "libro_uno.md", _md_text(), verbose=False
+    )
+    updates = [c for c in session.calls if "UPDATE kag_documents" in c[0]]
+    sections = json.loads(updates[0][1]["sections"])
+    assert sections[0]["has_images"] is False
+    assert sections[1]["has_images"] is True
+    inserts = [c for c in session.calls if "INSERT INTO kag_chapters" in c[0]]
+    assert inserts[0][1]["has_images"] is False
+    assert inserts[1][1]["has_images"] is True
+
+
 # ---------------------------------------------------------------------
 # _index_figures — visión condicional
 # ---------------------------------------------------------------------

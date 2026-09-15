@@ -338,9 +338,7 @@ class ClassicSegmenter:
         """
         # dict.fromkeys en vez de un set: preserva orden y deduplica (por si
         # segment1 == segment2 en el mismo llamado).
-        missing = [
-            t for t in dict.fromkeys(texts) if t not in self.embedding_cache
-        ]
+        missing = [t for t in dict.fromkeys(texts) if t not in self.embedding_cache]
         if missing:
             embs = self.embedding_model.encode(
                 missing,
@@ -1234,11 +1232,24 @@ class ProgressiveSegmenter:
         sentences = self.preprocess_text(text)
         print(f"[SegText] {len(sentences)} oraciones tras preprocesado.")
 
+        # Guard: texto diminuto o solo stop words → TF-IDF crashearía con
+        # "empty vocabulary". Devolver el texto crudo como UN segmento (el
+        # caller lo fusiona/inserta igual).
+        if not sentences:
+            print("[SegText] Sin oraciones útiles — devolviendo texto crudo.")
+            return [text.strip()] if text.strip() else []
+
         all_segments = self.recursive_segmentation(sentences)
         print(f"[SegText] {len(all_segments)} segmentos tras segmentación recursiva.")
 
         # FIX: fit TF-IDF on raw sentences, not intermediate segments (avoids circularity)
-        self.tfidf_vectorizer.fit(sentences)
+        try:
+            self.tfidf_vectorizer.fit(sentences)
+        except ValueError:
+            # Solo stop words / vocabulario vacío: no se puede clusterizar por
+            # TF-IDF. Devolver el texto crudo como UN segmento.
+            print("[SegText] Vocabulario vacío (solo stop words) — texto crudo.")
+            return [text.strip()] if text.strip() else []
         print(f"[SegText] TF-IDF ajustado sobre {len(sentences)} oraciones crudas.")
 
         clustered_segments = self.final_clustering(all_segments)

@@ -239,6 +239,46 @@ def test_separation_document_ids_duplicados_se_deduplican(tmp_path, monkeypatch)
     assert docs[1]["document_id"] == "doc_2"
 
 
+def test_separation_llm_omite_doc_determinista_se_conserva(tmp_path, monkeypatch):
+    """FIX M2: si el LLM omite un doc determinista, el hint se conserva SIEMPRE.
+
+    El LLM devuelve solo el Libro Uno (1-61); el Libro Dos (62-123) detectado
+    por MultibookFinderTool no debe perderse. El doc del LLM que colisiona con
+    un hint se descarta (no se duplica).
+    """
+    md = tmp_path / "stack.md"
+    md.write_text(_big_md(), encoding="utf-8")
+
+    def fake_call_with_retries(session, **kwargs):
+        return (
+            json.dumps(
+                {
+                    "documents": [
+                        {
+                            "document_id": "llm_1",
+                            "title": "Libro Uno",
+                            "line_start": 1,
+                            "line_end": 61,
+                            "language": "es",
+                        }
+                    ]
+                }
+            ),
+            "fake-large",
+            False,
+        )
+
+    monkeypatch.setattr("src.kag_ingest.call_with_retries", fake_call_with_retries)
+    docs = _index_document_separation(_FakeSession(), md, _big_md(), verbose=False)
+
+    # 2 hints (siempre incluidos) + 0 del LLM (colisiona con el hint 1-61).
+    assert len(docs) == 2
+    assert docs[0]["line_start"] == 1
+    assert docs[0]["line_end"] == 61
+    assert docs[1]["line_start"] == 62
+    assert docs[1]["line_end"] == 123
+
+
 # ---------------------------------------------------------------------
 # _index_document_separation — degradación
 # ---------------------------------------------------------------------

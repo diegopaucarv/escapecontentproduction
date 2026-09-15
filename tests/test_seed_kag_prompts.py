@@ -56,3 +56,24 @@ def test_all_kag_templates_have_intent_and_rules():
         assert isinstance(t.get("rules"), list) and t["rules"], (
             f"faltan rules en {t['task_key']}"
         )
+
+
+def test_kag_ingest_fallbacks_iguales_a_spec_v11():
+    """Los fallbacks de src/kag_ingest.py deben ser EXACTOS a las specs v1.1.
+
+    FIX H1: las constantes DOCUMENT_*_USER_SHORT copian el user_template de la
+    spec (mismos placeholders: {deterministic_documents}, {document_context}).
+    """
+    from src.kag_ingest import (
+        DOCUMENT_ANALYSIS_USER_SHORT,
+        DOCUMENT_SEPARATION_USER_SHORT,
+    )
+
+    by_key = {t["task_key"]: t for t in KAG_TEMPLATES}
+    assert (
+        DOCUMENT_SEPARATION_USER_SHORT
+        == by_key["kag_document_separation"]["user_template"]
+    )
+    assert (
+        DOCUMENT_ANALYSIS_USER_SHORT == by_key["kag_document_analysis"]["user_template"]
+    )

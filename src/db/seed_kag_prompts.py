@@ -625,7 +625,8 @@ Analiza el documento y devuelve el JSON:
 
 REGLAS:
 - El contexto es el documento COMPLETO: úsalo para detectar TODOS los capítulos reales (no solo los que tengan headers de markdown).
-- Los capítulos suelen aparecer como líneas de texto plano: títulos numerados ("3. Dimensions of Cultural Variation"), líneas "PART X", títulos en MAYÚSCULAS, o entradas del índice (TOC).
+- Los divisores estructurales (p. ej. "PART I", "Parte 1", portadas, páginas de título, entradas del TOC) NO son capítulos por sí mismos: solo son capítulos los títulos (numerados o no) que van SEGUIDOS de texto real.
+- Si una división "PART X" no tiene contenido propio, úsala solo como `division` del índice, nunca como capítulo. Un capítulo debe tener un rango de líneas con contenido sustancial (no 1-2 líneas de solo título).
 - Reagrupa los capítulos en un índice JERÁRQUICO: cada división (p. ej. "PART I Foundations") agrupa sus capítulos. Si el documento no tiene divisiones, usa UNA división con el título del documento.
 - line_start/line_end son RELATIVOS al documento (línea 1 = primera línea del contexto).
 - has_images: true si el capítulo contiene imágenes o figuras.""",
@@ -645,6 +646,7 @@ REGLAS:
             "chapters: cada capitulo con chapter_id unico, titulo y rango de lineas RELATIVO al documento (SIN resumen: los resumenes de capitulo se reemplazan por proposiciones atomicas)",
             "has_images: true si el capitulo contiene imagenes o figuras",
             "Usa el contexto COMPLETO del documento para detectar capitulos aunque no tengan headers de markdown",
+            "Los divisores estructurales (PART I, portadas, TOC) NO son capitulos: solo los titulos seguidos de texto real; una division sin contenido propio se usa solo como 'division' del indice, nunca como capitulo; un capitulo requiere un rango de lineas con contenido sustancial",
             "Salida JSON estricta con el schema indicado",
         ],
         "input_schema": {

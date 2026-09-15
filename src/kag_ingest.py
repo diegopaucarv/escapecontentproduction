@@ -77,8 +77,19 @@ Esqueleto del archivo (líneas del texto plano):
 {skeleton}
 ---
 
+Documentos detectados determinísticamente (MultibookFinderTool, límites físicos por ISBN/separadores):
+---
+{deterministic_documents}
+---
+
 Identifica los documentos contenidos en el archivo y devuelve el JSON:
-{{"documents": [{{"document_id": str, "title": str, "line_start": int, "line_end": int, "language": str}}]}}"""
+{{"documents": [{{"document_id": str, "title": str, "line_start": int, "line_end": int, "language": str}}]}}
+
+REGLAS:
+- La lista determinista es la BASE: confirma cada documento detectado (puedes ajustar títulos/idioma).
+- AÑADE divisiones adicionales SOLO si encuentras libros/papers/artículos SEPARADOS que la detección física no capturó (p. ej. un libro que empieza sin ISBN ni separador).
+- NO dividas un libro en capítulos/secciones: los capítulos se detectan en la Fase 2 (análisis documental), no aquí.
+- Cada documento debe tener un document_id unico y estable; line_start/line_end delimitan su rango en el archivo fuente."""
 
 # Fase 2 — análisis documental (spec kag_document_analysis). El user fallback
 # es el template EXACTO de la spec (src/db/seed_kag_prompts.py): se rellena con
@@ -93,13 +104,21 @@ DOCUMENT_ANALYSIS_SYSTEM_SHORT = (
 DOCUMENT_ANALYSIS_USER_SHORT = """Archivo: {source_file}
 Documento: {document_id}
 
-Esqueleto del documento (líneas del texto plano):
+Contexto del documento COMPLETO (texto plano, líneas 1..N):
 ---
-{skeleton}
+{document_context}
 ---
 
 Analiza el documento y devuelve el JSON:
-{{"ficha": {{"title": str, "technical_level": str, "thematic_areas_iso25964": [{{"preferred_term": str, "non_preferred_terms": [str], "scope_note_disambiguation": str, "broader_term": str, "narrower_terms": [str], "related_terms": [str]}}], "library_of_congress": {{"lcsh_terms": [str], "lcc_classification": {{"label": str, "call_number": str}}}}, "bibtex": str, "key_entities": [{{"name": str, "type": str}}]}}, "chapters": [{{"chapter_id": str, "title": str, "line_start": int, "line_end": int, "has_images": bool}}]}}"""
+{{"ficha": {{"title": str, "technical_level": str, "thematic_areas_iso25964": [{{"preferred_term": str, "non_preferred_terms": [str], "scope_note_disambiguation": str, "broader_term": str, "narrower_terms": [str], "related_terms": [str]}}], "library_of_congress": {{"lcsh_terms": [str], "lcc_classification": {{"label": str, "call_number": str}}}}, "bibtex": str, "key_entities": [{{"name": str, "type": str}}]}}, "index": [{{"division": str, "chapters": [{{"chapter_id": str, "title": str, "line_start": int, "line_end": int, "has_images": bool}}]}}]}}
+
+REGLAS:
+- El contexto es el documento COMPLETO: úsalo para detectar TODOS los capítulos reales (no solo los que tengan headers de markdown).
+- Los divisores estructurales (p. ej. "PART I", "Parte 1", portadas, páginas de título, entradas del TOC) NO son capítulos por sí mismos: solo son capítulos los títulos (numerados o no) que van SEGUIDOS de texto real.
+- Si una división "PART X" no tiene contenido propio, úsala solo como `division` del índice, nunca como capítulo. Un capítulo debe tener un rango de líneas con contenido sustancial (no 1-2 líneas de solo título).
+- Reagrupa los capítulos en un índice JERÁRQUICO: cada división (p. ej. "PART I Foundations") agrupa sus capítulos. Si el documento no tiene divisiones, usa UNA división con el título del documento.
+- line_start/line_end son RELATIVOS al documento (línea 1 = primera línea del contexto).
+- has_images: true si el capítulo contiene imágenes o figuras."""
 
 
 def _get_system_prompt(session, model_name, task_key, fallback: str) -> str:
@@ -2165,12 +2184,17 @@ def _index_document_analysis(
 ) -> dict:
     """Fase 2: ficha documental + capítulos del documento (LLM grande).
 
-    Llama al LLM grande con la spec `kag_document_analysis` (esqueleto del
-    documento vía `_build_skeleton`) y persiste SIEMPRE:
+    Llama al LLM grande con la spec `kag_document_analysis` pasando el
+    contexto COMPLETO del documento (`document_context`, sin truncar) y
+    persiste SIEMPRE:
       - `kag_documents.ficha_jsonb` = el JSON completo del análisis (ficha +
         capítulos + scope_thematic derivado).
       - `kag_documents.sections_json` = los capítulos detectados.
       - `kag_chapters` = una fila por capítulo (RETURNING id → UUID).
+
+    La salida del LLM es un índice JERÁRQUICO `index: [{division, chapters}]`;
+    si el LLM devuelve `chapters` plano (schema v1.0) o un índice vacío/
+    malformado, se usa el fallback a `chapters` plano.
 
     DECISIÓN DE DISEÑO: `line_start`/`line_end` de los capítulos son RELATIVOS
     AL DOCUMENTO (slice), no al archivo — la Fase 3 segmentará el slice por
@@ -2238,6 +2262,10 @@ def _index_document_analysis(
                             if div_title:
                                 ch["division"] = div_title
                             chapters.append(ch)
+                # Backward compat: si el índice vino malformado (divisiones sin
+                # chapters), reintentar con el schema plano v1.0.
+                if not chapters:
+                    chapters = data.get("chapters")
             else:
                 chapters = data.get("chapters")
         if not isinstance(ficha, dict):
@@ -2301,13 +2329,18 @@ def _index_document_analysis(
                 n += 1
             cid = f"{base}_{n}"
         seen_ids.add(cid)
+        has_images = ch.get("has_images")
+        if isinstance(has_images, str):
+            has_images = has_images.strip().lower() in ("1", "true", "yes")
+        else:
+            has_images = bool(has_images)
         clean_chapters.append(
             {
                 "chapter_id": cid,
                 "title": sanitize_text(str(ch.get("title") or ""))[:300] or title,
                 "line_start": ls,
                 "line_end": le,
-                "has_images": bool(ch.get("has_images")),
+                "has_images": has_images,
                 "division": str(ch.get("division") or "").strip(),
             }
         )
@@ -2666,7 +2699,7 @@ def _index_document_separation(session, md_path, md_text, verbose=True) -> list[
         from src.kag.tools import MultibookFinderTool
 
         found = MultibookFinderTool().execute(str(md_path))
-        if len(found) >= 2:
+        if found:
             hints = found
     except Exception as exc:  # noqa: BLE001 — degradación natural
         if verbose:
@@ -2678,7 +2711,7 @@ def _index_document_separation(session, md_path, md_text, verbose=True) -> list[
     # (eso es la Fase 2). Si no hay pistas, se indica "(ninguno detectado)".
     if hints:
         deterministic_docs = "\n".join(
-            f"- {h.get('title', '?')}: líneas {h.get('line_start')}-{h.get('line_end')}"
+            f"- [{h.get('document_id') or '?'}] {h.get('title', '?')}: líneas {h.get('line_start')}-{h.get('line_end')}"
             for h in hints
         )
     else:
@@ -2725,9 +2758,50 @@ def _index_document_separation(session, md_path, md_text, verbose=True) -> list[
             print(f"[KAG] ⚠ Separación por LLM falló: {exc}")
 
     # Sanitización de rangos (swap si line_start > line_end, clamp al archivo).
+    # Los documentos deterministas (hints) SIEMPRE se incluyen; los del LLM se
+    # añaden solo si no colisionan por rango de líneas con un hint.
+    out = []
+    seen_ids = set()
+
+    def _append_doc(did, title, ls, le, language):
+        if did in seen_ids:
+            # Evitar violación del UNIQUE (doc_path, document_id) si el LLM
+            # repite ids: sufijo numérico determinista.
+            base = did or "doc"
+            n = 2
+            while f"{base}_{n}" in seen_ids:
+                n += 1
+            did = f"{base}_{n}"
+        seen_ids.add(did)
+        out.append(
+            {
+                "document_id": did,
+                "title": title,
+                "line_start": ls,
+                "line_end": le,
+                "language": language,
+            }
+        )
+
+    # 1) Deterministas: siempre incluidos (rango sanitizado).
+    hint_ranges = []
+    for h in hints:
+        ls = max(1, int(h.get("line_start") or 1))
+        le = min(total_lines, int(h.get("line_end") or total_lines))
+        if ls > le:
+            ls, le = le, ls
+        hint_ranges.append((ls, le))
+        _append_doc(
+            str(h.get("document_id") or ""),
+            sanitize_text(str(h.get("title") or ""))[:300]
+            or _title_from_md(md_text, source_file),
+            ls,
+            le,
+            lang,
+        )
+
+    # 2) LLM: se añaden solo si no colisionan por rango con un hint.
     if documents:
-        out = []
-        seen_ids = set()
         for d in documents:
             if not isinstance(d, dict):
                 continue
@@ -2740,30 +2814,18 @@ def _index_document_separation(session, md_path, md_text, verbose=True) -> list[
                 ls, le = le, ls
             ls = max(1, min(ls, total_lines))
             le = max(1, min(le, total_lines))
-            did = str(d.get("document_id") or "")
-            if did in seen_ids:
-                # Evitar violación del UNIQUE (doc_path, document_id) si el LLM
-                # repite ids: sufijo numérico determinista.
-                base = did or "doc"
-                n = 2
-                while f"{base}_{n}" in seen_ids:
-                    n += 1
-                did = f"{base}_{n}"
-            seen_ids.add(did)
-            out.append(
-                {
-                    "document_id": did,
-                    "title": (
-                        sanitize_text(str(d.get("title") or ""))[:300]
-                        or _title_from_md(md_text, source_file)
-                    ),
-                    "line_start": ls,
-                    "line_end": le,
-                    "language": str(d.get("language") or lang) or lang,
-                }
+            if any(ls <= h_le and h_ls <= le for h_ls, h_le in hint_ranges):
+                continue
+            _append_doc(
+                str(d.get("document_id") or ""),
+                sanitize_text(str(d.get("title") or ""))[:300]
+                or _title_from_md(md_text, source_file),
+                ls,
+                le,
+                str(d.get("language") or lang) or lang,
             )
-        if out:
-            return out
+    if out:
+        return out
 
     # Degradación: MultibookFinderTool (detección física, sin LLM).
     if hints:
@@ -2934,8 +2996,11 @@ def _index_document_slice(
     """
     document_id = str(spec.get("document_id") or "")
     total_lines = len(md_text.splitlines())
-    line_start = int(spec.get("line_start") or 1)
-    line_end = int(spec.get("line_end") or total_lines)
+    try:
+        line_start = int(spec.get("line_start") or 1)
+        line_end = int(spec.get("line_end") or total_lines)
+    except (TypeError, ValueError):
+        line_start, line_end = 1, total_lines
     if line_start > line_end:
         line_start, line_end = line_end, line_start
     line_start = max(1, min(line_start, total_lines))

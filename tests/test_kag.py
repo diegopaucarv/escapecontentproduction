@@ -206,6 +206,62 @@ def test_chunk_markdown_use_coref_false_disables_coref():
     assert seg2.coref_called is True  # comportamiento original preservado
 
 
+def test_segment_text_guard_vocabulario_vacio(monkeypatch):
+    """FIX: segment_text no crashea con "empty vocabulary" (solo stop words)
+    ni con texto vacío — devuelve el texto crudo como 1 segmento (o [] si no
+    hay texto). NO carga modelos reales: se stubbea torch/spacy/transformers
+    en sys.modules antes de importar src.kag.segmentador (import real ~25s)."""
+    import sys
+    from unittest.mock import MagicMock
+
+    class _FakeTensor:
+        pass
+
+    # scipy (vía sklearn) hace issubclass(cls, torch.Tensor) al importar:
+    # torch.Tensor debe ser una clase real, no un MagicMock.
+    torch_mock = MagicMock()
+    torch_mock.Tensor = _FakeTensor
+    monkeypatch.setitem(sys.modules, "torch", torch_mock)
+    for name in (
+        "spacy",
+        "spacy.language",
+        "stanza",
+        "sentence_transformers",
+        "transformers",
+    ):
+        monkeypatch.setitem(sys.modules, name, MagicMock())
+
+    had_segmentador = "src.kag.segmentador" in sys.modules
+    try:
+        from src.kag.segmentador import ProgressiveSegmenter
+
+        # Instancia sin __init__ (que cargaría AutoTokenizer/
+        # SentenceTransformer/spaCy): solo se ejercita el guard de segment_text.
+        seg = object.__new__(ProgressiveSegmenter)
+        seg.max_depth = 3
+        seg.preprocess_text = lambda text: (
+            [] if not text.strip() else ["the and of to a in is"]
+        )
+
+        class _EmptyVocabVectorizer:
+            def fit(self, sentences):
+                raise ValueError(
+                    "empty vocabulary; perhaps the documents only contain stop words"
+                )
+
+        seg.tfidf_vectorizer = _EmptyVocabVectorizer()
+
+        # Solo stop words → el fit de TF-IDF lanza ValueError → texto crudo
+        # como UN segmento (sin excepción).
+        assert seg.segment_text("the and of to a in is") == ["the and of to a in is"]
+        # Texto vacío / solo whitespace → 0 oraciones tras preprocesado → [].
+        assert seg.segment_text("") == []
+        assert seg.segment_text("   ") == []
+    finally:
+        if not had_segmentador:
+            sys.modules.pop("src.kag.segmentador", None)
+
+
 # ---------------------------------------------------------------------
 # classify_query
 # ---------------------------------------------------------------------
