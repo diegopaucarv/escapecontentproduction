@@ -6,6 +6,7 @@ Fundación de datos del pipeline documental nuevo (Fases 1-5):
     con line_start/line_end sobre el archivo fuente. La relación nueva es
     kag_chapters → kag_chunks.chapter_id → kag_propositions.chapter_id
     (se ELIMINA el section_path determinista de chunk_markdown).
+  - `kag_chunks.chapter_id` (UUID nullable): los chunks se segmentarán DENTRO
     de un capítulo (Fase 3 futura); por ahora quedan con chapter_id = NULL y
     el pipeline degrada con gracia (chapter_title = "").
   - `kag_chunks.paraphrase` (TEXT nullable): paráfrasis del chunk (Fase 4,
