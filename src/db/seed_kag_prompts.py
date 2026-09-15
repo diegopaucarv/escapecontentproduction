@@ -571,15 +571,30 @@ Esqueleto del archivo (líneas del texto plano):
 {skeleton}
 ---
 
+Documentos detectados determinísticamente (MultibookFinderTool, límites físicos por ISBN/separadores):
+---
+{deterministic_documents}
+---
+
 Identifica los documentos contenidos en el archivo y devuelve el JSON:
-{{"documents": [{{"document_id": str, "title": str, "line_start": int, "line_end": int, "language": str}}]}}""",
-        "version": "1.0",
+{{"documents": [{{"document_id": str, "title": str, "line_start": int, "line_end": int, "language": str}}]}}
+
+REGLAS:
+- La lista determinista es la BASE: confirma cada documento detectado (puedes ajustar títulos/idioma).
+- AÑADE divisiones adicionales SOLO si encuentras libros/papers/artículos SEPARADOS que la detección física no capturó (p. ej. un libro que empieza sin ISBN ni separador).
+- NO dividas un libro en capítulos/secciones: los capítulos se detectan en la Fase 2 (análisis documental), no aquí.
+- Cada documento debe tener un document_id unico y estable; line_start/line_end delimitan su rango en el archivo fuente.""",
+        "version": "1.1",
         "intent": (
             "Eres un analista documental. Tu tarea es separar un archivo en "
-            "los documentos que contiene, delimitando cada uno por su rango "
-            "de lineas en el archivo fuente."
+            "los documentos que contiene, partiendo de la deteccion fisica "
+            "determinista (MultibookFinderTool) y anadiendo divisiones solo "
+            "si hay libros/papers separados no detectados."
         ),
         "rules": [
+            "La lista determinista es la BASE: confirmar cada documento detectado",
+            "Anadir divisiones SOLO si hay libros/papers separados no detectados fisicamente",
+            "NUNCA dividir un libro en capitulos: eso es la Fase 2 (analisis documental)",
             "Cada documento debe tener un document_id unico y estable",
             "line_start/line_end delimitan el rango de lineas del documento en el archivo fuente",
             "language: codigo ISO 639-1 del idioma principal del documento",
@@ -588,6 +603,7 @@ Identifica los documentos contenidos en el archivo y devuelve el JSON:
         "input_schema": {
             "source_file": "string",
             "skeleton": "string",
+            "deterministic_documents": "string",
         },
         "output_schema": {
             "documents": "array",
@@ -599,37 +615,46 @@ Identifica los documentos contenidos en el archivo y devuelve el JSON:
         "user_template": """Archivo: {source_file}
 Documento: {document_id}
 
-Esqueleto del documento (líneas del texto plano):
+Contexto del documento COMPLETO (texto plano, líneas 1..N):
 ---
-{skeleton}
+{document_context}
 ---
 
 Analiza el documento y devuelve el JSON:
-{{"ficha": {{"title": str, "technical_level": str, "thematic_areas_iso25964": [{{"preferred_term": str, "non_preferred_terms": [str], "scope_note_disambiguation": str, "broader_term": str, "narrower_terms": [str], "related_terms": [str]}}], "library_of_congress": {{"lcsh_terms": [str], "lcc_classification": {{"label": str, "call_number": str}}}}, "bibtex": str, "key_entities": [{{"name": str, "type": str}}]}}, "chapters": [{{"chapter_id": str, "title": str, "line_start": int, "line_end": int, "has_images": bool}}]}}""",
-        "version": "1.0",
+{{"ficha": {{"title": str, "technical_level": str, "thematic_areas_iso25964": [{{"preferred_term": str, "non_preferred_terms": [str], "scope_note_disambiguation": str, "broader_term": str, "narrower_terms": [str], "related_terms": [str]}}], "library_of_congress": {{"lcsh_terms": [str], "lcc_classification": {{"label": str, "call_number": str}}}}, "bibtex": str, "key_entities": [{{"name": str, "type": str}}]}}, "index": [{{"division": str, "chapters": [{{"chapter_id": str, "title": str, "line_start": int, "line_end": int, "has_images": bool}}]}}]}}
+
+REGLAS:
+- El contexto es el documento COMPLETO: úsalo para detectar TODOS los capítulos reales (no solo los que tengan headers de markdown).
+- Los capítulos suelen aparecer como líneas de texto plano: títulos numerados ("3. Dimensions of Cultural Variation"), líneas "PART X", títulos en MAYÚSCULAS, o entradas del índice (TOC).
+- Reagrupa los capítulos en un índice JERÁRQUICO: cada división (p. ej. "PART I Foundations") agrupa sus capítulos. Si el documento no tiene divisiones, usa UNA división con el título del documento.
+- line_start/line_end son RELATIVOS al documento (línea 1 = primera línea del contexto).
+- has_images: true si el capítulo contiene imágenes o figuras.""",
+        "version": "1.1",
         "intent": (
             "Eres un analista documental y bibliotecario. Tu tarea es producir "
             "la ficha documental (tesauro ISO 25964, clasificacion LCC/LCSH, "
             "cita BibTeX) y detectar los capitulos del documento con su rango "
-            "de lineas."
+            "de lineas, reagrupandolos en un indice jerarquico."
         ),
         "rules": [
             "thematic_areas_iso25964: minimo 3 tematicas con termino preferido, no preferidos, nota de alcance y relaciones de tesauro",
             "library_of_congress.lcsh_terms: encabezamientos de materia; lcc_classification: clasificacion de la Biblioteca del Congreso",
             "bibtex: cita completa en formato BibTeX",
             "key_entities: entidades clave del documento con su tipo",
-            "chapters: cada capitulo con chapter_id unico, titulo y rango de lineas (SIN resumen: los resumenes de capitulo se reemplazan por proposiciones atomicas)",
+            "index: indice jerarquico de capitulos; cada division agrupa sus capitulos (division unica si no hay partes)",
+            "chapters: cada capitulo con chapter_id unico, titulo y rango de lineas RELATIVO al documento (SIN resumen: los resumenes de capitulo se reemplazan por proposiciones atomicas)",
             "has_images: true si el capitulo contiene imagenes o figuras",
+            "Usa el contexto COMPLETO del documento para detectar capitulos aunque no tengan headers de markdown",
             "Salida JSON estricta con el schema indicado",
         ],
         "input_schema": {
             "source_file": "string",
             "document_id": "string",
-            "skeleton": "string",
+            "document_context": "string",
         },
         "output_schema": {
             "ficha": "object",
-            "chapters": "array",
+            "index": "array",
         },
         "few_shot": [],
     },

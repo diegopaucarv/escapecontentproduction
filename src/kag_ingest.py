@@ -2205,7 +2205,7 @@ def _index_document_analysis(
             user_template,
             source_file=source_file,
             document_id=str(doc_id),
-            skeleton=_build_skeleton(slice_text),
+            document_context=slice_text,
         )
         text_out, _model, _used_fallback = call_with_retries(
             session,
@@ -2218,7 +2218,28 @@ def _index_document_analysis(
         )
         data = parse_llm_output(text_out)
         ficha = data.get("ficha") if isinstance(data, dict) else None
-        chapters = data.get("chapters") if isinstance(data, dict) else None
+        # Índice jerárquico (nuevo schema): index = [{division, chapters: [...]}].
+        # Backward compat: chapters plano (schema v1.0).
+        chapters = None
+        if isinstance(data, dict):
+            index = data.get("index")
+            if isinstance(index, list) and index:
+                chapters = []
+                for div in index:
+                    if not isinstance(div, dict):
+                        continue
+                    div_title = str(div.get("division") or "").strip()
+                    div_chapters = div.get("chapters")
+                    if not isinstance(div_chapters, list):
+                        continue
+                    for ch in div_chapters:
+                        if isinstance(ch, dict):
+                            ch = dict(ch)
+                            if div_title:
+                                ch["division"] = div_title
+                            chapters.append(ch)
+            else:
+                chapters = data.get("chapters")
         if not isinstance(ficha, dict):
             ficha = None
         if not isinstance(chapters, list):
@@ -2287,6 +2308,7 @@ def _index_document_analysis(
                 "line_start": ls,
                 "line_end": le,
                 "has_images": bool(ch.get("has_images")),
+                "division": str(ch.get("division") or "").strip(),
             }
         )
     if not clean_chapters:
@@ -2312,6 +2334,7 @@ def _index_document_analysis(
             "line_start": ch["line_start"],
             "line_end": ch["line_end"],
             "has_images": ch["has_images"],
+            "division": ch.get("division", ""),
         }
         for ch in clean_chapters
     ]
@@ -2649,16 +2672,17 @@ def _index_document_separation(session, md_path, md_text, verbose=True) -> list[
         if verbose:
             print(f"[KAG] ⚠ MultibookFinderTool no disponible: {exc}")
 
-    prompt_extra = ""
+    # La lista determinista se inyecta al LLM como BASE (contenido del prompt):
+    # el LLM la confirma y SOLO añade divisiones si encuentra libros/papers
+    # separados no detectados físicamente. NUNCA divide un libro en capítulos
+    # (eso es la Fase 2). Si no hay pistas, se indica "(ninguno detectado)".
     if hints:
-        lines_hint = "\n".join(
+        deterministic_docs = "\n".join(
             f"- {h.get('title', '?')}: líneas {h.get('line_start')}-{h.get('line_end')}"
             for h in hints
         )
-        prompt_extra = (
-            "\n\nPistas de límites físicos detectados (MultibookFinderTool):\n"
-            + lines_hint
-        )
+    else:
+        deterministic_docs = "(ninguno detectado)"
 
     # LLM grande con la spec kag_document_separation.
     documents = None
@@ -2680,7 +2704,8 @@ def _index_document_separation(session, md_path, md_text, verbose=True) -> list[
         prompt = _fill_prompt(
             user_template,
             source_file=source_file,
-            skeleton=_build_skeleton(md_text) + prompt_extra,
+            skeleton=_build_skeleton(md_text),
+            deterministic_documents=deterministic_docs,
         )
         text_out, _model, _used_fallback = call_with_retries(
             session,
