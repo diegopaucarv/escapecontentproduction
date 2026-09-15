@@ -20,6 +20,11 @@ Uso:
     python scripts/setup_colab.py --skip-models  # no descarga modelos
     python scripts/setup_colab.py --skip-db      # no toca PostgreSQL
     python scripts/setup_colab.py --together-key tgp_v1_...  # para seed_llm
+    python scripts/setup_colab.py --ingest       # corre la ingesta KAG completa
+    python scripts/setup_colab.py --dump         # pg_dump de la DB a kag_dump.sql
+
+Colab es efímero: tras la ingesta, usa --dump y descarga kag_dump.sql para
+importarlo en tu Postgres local (psql -f kag_dump.sql).
 """
 
 from __future__ import annotations
@@ -120,6 +125,23 @@ def _migrate_and_seed(together_key: str) -> None:
     _run([py, "-m", "src.db.seed_kag"])
 
 
+def _ingest() -> None:
+    """Corre la ingesta KAG completa (rebuild) sobre la DB ya migrada."""
+    py = sys.executable
+    print("\n=== 8. Ingesta KAG completa ===")
+    _run([py, "-m", "src.kag_ingest", "--verbose"])
+
+
+def _dump(db_name: str, db_user: str, db_password: str) -> None:
+    """Vuelca la DB a kag_dump.sql (Colab es efímero: hay que bajarlo)."""
+    print("\n=== 9. pg_dump → kag_dump.sql ===")
+    _shell(
+        f"PGPASSWORD={db_password} pg_dump -U {db_user} -h localhost "
+        f"-d {db_name} -Fc -f {ROOT / 'kag_dump.dump'}"
+    )
+    print(f"✅ Dump en {ROOT / 'kag_dump.dump'} — descárgalo antes de cerrar Colab.")
+
+
 def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -139,6 +161,14 @@ def main() -> int:
     parser.add_argument("--db-password", default="postgres", help="password de la DB")
     parser.add_argument(
         "--together-key", default="", help="TOGETHER_API_KEY para seed_llm"
+    )
+    parser.add_argument(
+        "--ingest",
+        action="store_true",
+        help="corre la ingesta KAG completa tras el seed",
+    )
+    parser.add_argument(
+        "--dump", action="store_true", help="pg_dump de la DB a kag_dump.dump"
     )
     args = parser.parse_args()
 
@@ -186,6 +216,14 @@ def main() -> int:
     else:
         print("\n=== 5-7. DB ===")
         print("--skip-db → no se toca PostgreSQL.")
+
+    # 8. Ingesta KAG completa (rebuild).
+    if args.ingest:
+        _ingest()
+
+    # 9. Dump para traer los datos de vuelta (Colab es efímero).
+    if args.dump:
+        _dump(args.db_name, args.db_user, args.db_password)
 
     print(
         "\n✅ Setup completado. Reinicia el runtime de Colab si acabas de "
