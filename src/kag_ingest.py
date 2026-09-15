@@ -177,6 +177,10 @@ MAX_CONTEXT_CHARS = 12000
 # grupo de proposiciones; los capítulos ≤ umbral se agrupan a nivel de
 # archivo (una llamada LLM por capítulo grande, una por archivo para el resto).
 CHAPTER_TOKEN_THRESHOLD = 30000
+# Regla determinista: un capítulo con MENOS tokens estimados que esto se
+# elimina (el LLM a veces alucina capítulos de 1-2 líneas: separadores,
+# portadas, "PART X" sin contenido). Complementa la regla del prompt.
+MIN_CHAPTER_TOKENS = 50
 
 # ---------------------------------------------------------------------
 # Helpers de host / texto
@@ -433,6 +437,13 @@ def chunk_markdown(
                 max_tokens=max_tokens,
             )
         lines = md_text.splitlines()
+        # Red de seguridad determinista: capítulos diminutos (separadores,
+        # portadas, "PART X" sin contenido) se saltan — el texto real de los
+        # capítulos siguientes se indexa igual. Cubre flujos de resume donde los
+        # capítulos vienen de kag_chapters (ya persistidos). Solo se aplica si
+        # el documento es suficientemente grande; si TODOS se saltan, se degrada
+        # a segmentar el texto completo.
+        skip_tiny = estimate_tokens(md_text) >= MIN_CHAPTER_TOKENS
         for chapter in chapters:
             ls = int(chapter.get("line_start") or 1)
             le = int(chapter.get("line_end") or len(lines))
@@ -441,6 +452,8 @@ def chunk_markdown(
             ls = max(1, min(ls, len(lines)))
             le = max(1, min(le, len(lines)))
             chapter_text = "\n".join(lines[ls - 1 : le])
+            if skip_tiny and estimate_tokens(chapter_text) < MIN_CHAPTER_TOKENS:
+                continue
             chapter_id = chapter.get("chapter_id")
             chunks.extend(
                 _merge_segments(
@@ -448,6 +461,13 @@ def chunk_markdown(
                     chapter_id=chapter_id,
                     max_tokens=max_tokens,
                 )
+            )
+        if not chunks:
+            # Todos los capítulos eran diminutos: indexar el texto completo.
+            return _merge_segments(
+                segmenter.segment_text(md_text.strip(), max_tokens=max_tokens),
+                chapter_id=None,
+                max_tokens=max_tokens,
             )
         return chunks
     finally:
@@ -2354,6 +2374,34 @@ def _index_document_analysis(
                 "has_images": False,
             }
         ]
+
+    # ── Regla determinista: eliminar capítulos diminutos (< MIN_CHAPTER_TOKENS) ──
+    # El LLM a veces alucina capítulos de 1-2 líneas (separadores, portadas,
+    # "PART X" sin contenido). Se estiman los tokens del slice de cada capítulo
+    # y se descartan los que no llegan al umbral. Solo se aplica si el documento
+    # es suficientemente grande (un doc diminuto no tiene "ruido" que quitar).
+    # Si TODOS se descartan, se conserva un capítulo único con todo el rango del
+    # documento (el texto sigue indexándose; el segmentador ya degrada el
+    # vocabulario vacío).
+    if len(clean_chapters) > 1 and estimate_tokens(slice_text) >= MIN_CHAPTER_TOKENS:
+        slice_lines = slice_text.splitlines()
+        kept = []
+        for ch in clean_chapters:
+            ch_text = "\n".join(slice_lines[ch["line_start"] - 1 : ch["line_end"]])
+            if estimate_tokens(ch_text) >= MIN_CHAPTER_TOKENS:
+                kept.append(ch)
+        if kept:
+            clean_chapters = kept
+        else:
+            clean_chapters = [
+                {
+                    "chapter_id": "",
+                    "title": title,
+                    "line_start": 1,
+                    "line_end": total_lines,
+                    "has_images": False,
+                }
+            ]
 
     # ── Enriquecimiento best-effort (LCC/LCSH) + scope_thematic ────────────
     ficha = _enrich_library_of_congress(ficha, verbose=verbose)

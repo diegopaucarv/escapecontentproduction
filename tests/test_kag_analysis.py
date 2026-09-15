@@ -65,6 +65,26 @@ def _md_text() -> str:
     )
 
 
+def _md_text_largo() -> str:
+    """Texto de documento con capítulos reales (cada uno > MIN_CHAPTER_TOKENS)
+    y separadores diminutos intercalados — para ejercitar la regla determinista
+    de eliminación de capítulos < 50 tokens."""
+    parrafo = (
+        "Este es un párrafo de contenido sustancial con varias oraciones "
+        "completas que describen el tema del capítulo en detalle. "
+        "Se repite para alcanzar el umbral de tokens mínimos. "
+    )
+    cuerpo = parrafo * 6  # ~600 chars ≈ 150 tokens por capítulo
+    return (
+        "# Libro Uno\n"
+        "\n"
+        "--- separador ---\n"
+        "\n"
+        "## Capítulo 1\n"
+        "\n" + cuerpo + "\n## Capítulo 2\n\n" + cuerpo + "\n"
+    )
+
+
 # ---------------------------------------------------------------------
 # _scope_thematic_from_thematic
 # ---------------------------------------------------------------------
@@ -475,6 +495,118 @@ def test_analysis_has_images_string_normalizado(monkeypatch):
     inserts = [c for c in session.calls if "INSERT INTO kag_chapters" in c[0]]
     assert inserts[0][1]["has_images"] is False
     assert inserts[1][1]["has_images"] is True
+
+
+def test_analysis_elimina_capitulos_menos_50_tokens(monkeypatch):
+    """Regla determinista: capítulos con < MIN_CHAPTER_TOKENS se eliminan.
+
+    El LLM a veces alucina capítulos de 1-2 líneas (separadores, portadas,
+    "PART X" sin contenido). El slice de cada capítulo se estima en tokens y
+    los que no llegan al umbral se descartan de sections_json y kag_chapters.
+    """
+
+    def fake_call_with_retries(session, **kwargs):
+        return (
+            json.dumps(
+                {
+                    "ficha": {"title": "Libro Uno"},
+                    "chapters": [
+                        {
+                            "chapter_id": "sep1",
+                            "title": "--- separador ---",
+                            "line_start": 3,
+                            "line_end": 3,
+                            "has_images": False,
+                        },
+                        {
+                            "chapter_id": "cap1",
+                            "title": "Capítulo 1",
+                            "line_start": 5,
+                            "line_end": 7,
+                            "has_images": False,
+                        },
+                        {
+                            "chapter_id": "sep2",
+                            "title": "PARTE I",
+                            "line_start": 8,
+                            "line_end": 8,
+                            "has_images": False,
+                        },
+                        {
+                            "chapter_id": "cap2",
+                            "title": "Capítulo 2",
+                            "line_start": 9,
+                            "line_end": 11,
+                            "has_images": False,
+                        },
+                    ],
+                }
+            ),
+            "fake-large",
+            False,
+        )
+
+    monkeypatch.setattr("src.kag_ingest.call_with_retries", fake_call_with_retries)
+    session = _FakeSession()
+    chapter_map = _index_document_analysis(
+        session, "doc-1", "libro_uno.md", _md_text_largo(), verbose=False
+    )
+
+    # Los capítulos diminutos (1 línea) se eliminan; los reales se conservan.
+    assert chapter_map == {"cap1": "chap-uuid-1", "cap2": "chap-uuid-2"}
+    updates = [c for c in session.calls if "UPDATE kag_documents" in c[0]]
+    sections = json.loads(updates[0][1]["sections"])
+    assert [s["chapter_id"] for s in sections] == ["cap1", "cap2"]
+    inserts = [c for c in session.calls if "INSERT INTO kag_chapters" in c[0]]
+    assert [i[1]["chapter_id"] for i in inserts] == ["cap1", "cap2"]
+
+
+def test_analysis_todos_los_capitulos_diminutos_capitulo_unico(monkeypatch):
+    """Si TODOS los capítulos son < MIN_CHAPTER_TOKENS, se conserva un
+    capítulo único con todo el rango del documento (el texto se indexa igual).
+    """
+
+    def fake_call_with_retries(session, **kwargs):
+        return (
+            json.dumps(
+                {
+                    "ficha": {"title": "Libro Uno"},
+                    "chapters": [
+                        {
+                            "chapter_id": "sep1",
+                            "title": "---",
+                            "line_start": 3,
+                            "line_end": 3,
+                            "has_images": False,
+                        },
+                        {
+                            "chapter_id": "sep2",
+                            "title": "PARTE I",
+                            "line_start": 8,
+                            "line_end": 8,
+                            "has_images": False,
+                        },
+                    ],
+                }
+            ),
+            "fake-large",
+            False,
+        )
+
+    monkeypatch.setattr("src.kag_ingest.call_with_retries", fake_call_with_retries)
+    session = _FakeSession()
+    chapter_map = _index_document_analysis(
+        session, "doc-1", "libro_uno.md", _md_text_largo(), verbose=False
+    )
+
+    # Un solo capítulo con todo el rango (chapter_id vacío).
+    assert len(chapter_map) == 1
+    assert "" in chapter_map
+    updates = [c for c in session.calls if "UPDATE kag_documents" in c[0]]
+    sections = json.loads(updates[0][1]["sections"])
+    assert len(sections) == 1
+    assert sections[0]["line_start"] == 1
+    assert sections[0]["line_end"] == len(_md_text_largo().splitlines())
 
 
 # ---------------------------------------------------------------------
