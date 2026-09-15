@@ -528,15 +528,12 @@ def _store_entities_relations(session, doc_id, chunk_id, data):
     norms = [n for n in norms if n]
     existing = {}
     if norms:
-        norms_dedup = list(dict.fromkeys(norms))
-        print(f"[KAG-DEBUG] doc_id={doc_id} chunk_id={chunk_id} norms={norms_dedup!r}")
-        print(f"[KAG-DEBUG] norms types: {[type(n).__name__ for n in norms_dedup]}")
         rows = session.execute(
             text(
                 "SELECT name_norm, id FROM kag_entities "
                 "WHERE doc_id = :doc_id AND name_norm = ANY(:norms)"
             ),
-            {"doc_id": doc_id, "norms": norms_dedup},
+            {"doc_id": doc_id, "norms": list(dict.fromkeys(norms))},
         ).fetchall()
         existing = {r.name_norm: r.id for r in rows}
 
@@ -562,24 +559,33 @@ def _store_entities_relations(session, doc_id, chunk_id, data):
             )
         )
     if new_entities:
+        # Un solo INSERT multi-VALUES con UN set de parámetros. Pasar una
+        # lista de dicts haría executemany, y psycopg2 no devuelve filas con
+        # executemany + RETURNING (ResourceClosedError "does not return rows").
+        placeholders = ", ".join(
+            f"(:d{i}, :c{i}, :n{i}, :nn{i}, :e{i}, :de{i})"
+            for i in range(len(new_entities))
+        )
+        params: dict = {}
+        for i, (d, c, n, nn, et, de) in enumerate(new_entities):
+            params.update(
+                {
+                    f"d{i}": d,
+                    f"c{i}": c,
+                    f"n{i}": n,
+                    f"nn{i}": nn,
+                    f"e{i}": et,
+                    f"de{i}": de,
+                }
+            )
         rows = session.execute(
             text(
                 "INSERT INTO kag_entities "
                 "(doc_id, chunk_id, name, name_norm, entity_type, description) "
-                "VALUES (:doc_id, :chunk_id, :name, :nn, :etype, :desc) "
+                f"VALUES {placeholders} "
                 "RETURNING id, name_norm"
             ),
-            [
-                {
-                    "doc_id": d,
-                    "chunk_id": c,
-                    "name": n,
-                    "nn": nn,
-                    "etype": et,
-                    "desc": de,
-                }
-                for d, c, n, nn, et, de in new_entities
-            ],
+            params,
         ).fetchall()
         for r in rows:
             entity_ids[r.name_norm] = r.id
@@ -605,24 +611,30 @@ def _store_entities_relations(session, doc_id, chunk_id, data):
             )
         )
     if new_relations:
+        placeholders = ", ".join(
+            f"(:d{i}, :c{i}, :s{i}, :t{i}, :rt{i}, :de{i})"
+            for i in range(len(new_relations))
+        )
+        params = {}
+        for i, (d, c, s, t, rt, de) in enumerate(new_relations):
+            params.update(
+                {
+                    f"d{i}": d,
+                    f"c{i}": c,
+                    f"s{i}": s,
+                    f"t{i}": t,
+                    f"rt{i}": rt,
+                    f"de{i}": de,
+                }
+            )
         session.execute(
             text(
                 "INSERT INTO kag_relations "
                 "(doc_id, chunk_id, source_entity_id, target_entity_id, "
                 "relation_type, description) "
-                "VALUES (:doc_id, :chunk_id, :src, :tgt, :rtype, :desc)"
+                f"VALUES {placeholders}"
             ),
-            [
-                {
-                    "doc_id": d,
-                    "chunk_id": c,
-                    "src": s,
-                    "tgt": t,
-                    "rtype": rt,
-                    "desc": de,
-                }
-                for d, c, s, t, rt, de in new_relations
-            ],
+            params,
         )
 
 
@@ -1138,7 +1150,7 @@ def index_document(
             print(f"[KAG] ❌ Error indexando {doc_path}: {exc}")
             import traceback
 
-            traceback.print_exc()
+            traceback.print_exc(file=sys.stdout)
         raise
 
 
