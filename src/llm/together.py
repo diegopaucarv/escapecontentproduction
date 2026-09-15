@@ -214,8 +214,11 @@ def complete_vision(
     Igual que `complete`, pero el mensaje de usuario es una lista de
     contenido multimodal estilo OpenAI: texto + image_url. El modelo se
     resuelve desde `llm_models` con is_vision=True (e is_active=True),
-    priorizando 'large' sobre 'small' si hay varios; si no hay ninguno,
-    degrada a cfg.large_model (comportamiento histórico).
+    priorizando 'large' sobre 'small' si hay varios. Regla del usuario:
+    la lectura de imágenes SOLO puede usar un VLM — si no hay modelo
+    is_vision=True activo, lanza LLMConfigError (nunca degrada a un
+    modelo de chat no-visión). El caller degrada con gracia (p. ej.
+    describe_figure devuelve '' y _describe_image devuelve {}).
     """
     if model_size not in ("small", "large", "vision"):
         raise ValueError(
@@ -227,14 +230,12 @@ def complete_vision(
         model = cfg.small_model
     else:
         vision_model = get_vision_model(session)
-        if vision_model is not None:
-            model = vision_model
-        else:
-            print(
-                "[LLM] ⚠️ Sin modelo is_vision=True en llm_models; "
-                "usando large_model como fallback"
+        if vision_model is None:
+            raise LLMConfigError(
+                "No hay modelo is_vision=True activo en llm_models; "
+                "la lectura de imágenes requiere un VLM."
             )
-            model = cfg.large_model
+        model = vision_model
     temp = (
         temperature
         if temperature is not None

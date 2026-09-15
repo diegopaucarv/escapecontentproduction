@@ -5,13 +5,15 @@ import os
 import uuid
 from types import SimpleNamespace
 
+import pytest
+
 from src.db.seed_vision import (
     VISION_API_KEY,
     VISION_MODELS,
     VISION_TEMPLATES,
     seed,
 )
-from src.llm.compiler import compile_prompts
+from src.llm.compiler import GenericPromptAdapter, _content_hash, compile_prompts
 from src.llm.together import TOGETHER_CHAT_URL, complete_vision
 
 
@@ -258,6 +260,116 @@ def test_compile_prompts_includes_vision_models():
     assert artifact.is_active is True
 
 
+def test_compile_prompts_stores_user_template_and_hash():
+    """El artefacto (0021) congela el user_template y su hash (idempotencia)."""
+    model = _model()
+    spec = _spec(user_template="Describe: {image_url}")
+    session = _CompileSession([model], [spec])
+
+    result = compile_prompts(session)
+
+    assert result["compiled"] == 1
+    artifact = session.added[0]
+    assert artifact.user_template == "Describe: {image_url}"
+    assert artifact.user_template_hash == _content_hash("Describe: {image_url}")
+
+
+class _IdempotentCompileSession:
+    """Sesión falsa para compile_prompts con artefactos existentes."""
+
+    def __init__(self, models, templates, artifacts):
+        self._models = models
+        self._templates = templates
+        self._artifacts = artifacts
+        self.added = []
+
+    def execute(self, stmt):
+        class _Result:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def scalars(self):
+                return self
+
+            def all(self):
+                return self._rows
+
+        if hasattr(stmt, "_where_criteria") and stmt._where_criteria:
+            col = stmt._where_criteria[0].left
+            table = getattr(col, "table", None)
+            table_name = getattr(table, "name", "")
+            if table_name == "llm_models":
+                return _Result(self._models)
+            if table_name == "prompt_templates":
+                return _Result(self._templates)
+            if table_name == "prompt_artifacts":
+                return _Result(self._artifacts)
+        return _Result([])
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    def commit(self):
+        pass
+
+
+def test_compile_prompts_skips_when_both_hashes_match():
+    """Idempotencia dual: skip solo si content_hash Y user_template_hash coinciden."""
+    model = _model()
+    spec = _spec(user_template="Describe: {image_url}")
+    adapter = GenericPromptAdapter(model.syntax_profile)
+    prompt_text = adapter.render_prompt(spec, model)
+    existing = SimpleNamespace(
+        id=uuid.uuid4(),
+        llm_model_id=model.id,
+        task_key=spec.task_key,
+        spec_version=spec.version,
+        artifact_version=1,
+        prompt_text=prompt_text,
+        content_hash=_content_hash(prompt_text),
+        user_template=spec.user_template,
+        user_template_hash=_content_hash(spec.user_template),
+        is_active=True,
+    )
+    session = _IdempotentCompileSession([model], [spec], [existing])
+
+    result = compile_prompts(session)
+
+    assert result["compiled"] == 0
+    assert result["skipped"] == 1
+    assert session.added == []
+
+
+def test_compile_prompts_recompiles_when_user_template_changes():
+    """Si cambia el user_template, se recompila (nueva versión, se desactiva la vieja)."""
+    model = _model()
+    spec = _spec(user_template="Describe: {image_url}")
+    adapter = GenericPromptAdapter(model.syntax_profile)
+    prompt_text = adapter.render_prompt(spec, model)
+    existing = SimpleNamespace(
+        id=uuid.uuid4(),
+        llm_model_id=model.id,
+        task_key=spec.task_key,
+        spec_version=spec.version,
+        artifact_version=1,
+        prompt_text=prompt_text,
+        content_hash=_content_hash(prompt_text),
+        user_template="Template viejo",
+        user_template_hash=_content_hash("Template viejo"),
+        is_active=True,
+    )
+    session = _IdempotentCompileSession([model], [spec], [existing])
+
+    result = compile_prompts(session)
+
+    assert result["compiled"] == 1
+    assert len(session.added) == 1
+    artifact = session.added[0]
+    assert artifact.artifact_version == 2
+    assert artifact.user_template == "Describe: {image_url}"
+    assert existing.is_active is False  # la versión anterior se desactiva
+
+
 # ---------------------------------------------------------------------
 # complete_vision: body multimodal
 # ---------------------------------------------------------------------
@@ -327,6 +439,10 @@ def test_complete_vision_builds_multimodal_body(monkeypatch):
         return _Resp()
 
     monkeypatch.setattr("src.llm.together.httpx.post", fake_post)
+    monkeypatch.setattr(
+        "src.llm.together.get_vision_model",
+        lambda session: "meta-llama/Llama-3.2-11B-Vision-Instruct-Turbo",
+    )
 
     text = complete_vision(
         session,
@@ -352,3 +468,62 @@ def test_complete_vision_builds_multimodal_body(monkeypatch):
     }
     assert captured["json"]["temperature"] == 0.4
     assert captured["json"]["max_tokens"] == 2048
+
+
+def test_complete_vision_raises_without_vision_model(monkeypatch):
+    """Regla del usuario: sin modelo is_vision=True, complete_vision lanza
+    LLMConfigError en vez de degradar a un modelo de chat no-visión."""
+    from src.db.models import ApiKey, SessionSettings
+    from src.llm.together import LLMConfigError
+
+    key = ApiKey(
+        id=uuid.uuid4(),
+        provider="together",
+        key_name="together_vision",
+        api_key="tgp_v1_test_key_1234567890",
+        is_active=True,
+    )
+    settings = SessionSettings(
+        id=uuid.uuid4(),
+        api_key_id=key.id,
+        small_model="meta-models/Muse-Glimmer-30B",
+        large_model="meta-llama/Llama-3.2-11B-Vision-Instruct-Turbo",
+        temperature_small=0.7,
+        temperature_large=0.4,
+        max_tokens_small=2048,
+        max_tokens_large=2048,
+        is_active=True,
+    )
+
+    class _Session:
+        def __init__(self):
+            self._settings = [settings]
+            self._keys = {key.id: key}
+
+        def execute(self, stmt):
+            class _Result:
+                def __init__(self, rows):
+                    self._rows = rows
+
+                def scalars(self):
+                    return self
+
+                def first(self):
+                    return self._rows[0] if self._rows else None
+
+            return _Result(self._settings)
+
+        def get(self, model, ident):
+            if model is ApiKey:
+                return self._keys.get(ident)
+            return None
+
+    session = _Session()
+    monkeypatch.setattr("src.llm.together.get_vision_model", lambda session: None)
+
+    with pytest.raises(LLMConfigError, match="is_vision=True"):
+        complete_vision(
+            session,
+            "Describe esta imagen",
+            image_url="https://example.com/asset.png",
+        )

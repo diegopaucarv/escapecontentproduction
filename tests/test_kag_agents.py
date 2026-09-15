@@ -385,6 +385,53 @@ def test_fts_tsquery_escapes_quotes_and_skips_empty():
 
 
 # ---------------------------------------------------------------------
+# Helper: _get_prompt_pair (prompt-as-code 0021)
+# ---------------------------------------------------------------------
+
+
+def test_get_prompt_pair_fallback_without_artifact():
+    """Sin artefacto (tests sin DB) -> constantes actuales (comportamiento exacto)."""
+    session = _FakeSession()
+    system, user = ka._get_prompt_pair(
+        session, "model", ka.TASK_SYNTHESIS, "SYS_FB", "USER_FB"
+    )
+    assert system == "SYS_FB"
+    assert user == "USER_FB"
+
+
+def test_get_prompt_pair_uses_artifact():
+    """Con artefacto -> (prompt_text, user_template) congelados en 0021."""
+
+    class _ArtifactSession:
+        def execute(self, stmt, params=None):
+            return _FakeResult(
+                rows=[SimpleNamespace(prompt_text="SYS_ART", user_template="USER_ART")]
+            )
+
+    system, user = ka._get_prompt_pair(
+        _ArtifactSession(), "model", ka.TASK_SYNTHESIS, "SYS_FB", "USER_FB"
+    )
+    assert system == "SYS_ART"
+    assert user == "USER_ART"
+
+
+def test_get_prompt_pair_ignores_artifact_without_user_template():
+    """Artefacto con user_template vacío (pre-0021) -> fallback a constantes."""
+
+    class _ArtifactSession:
+        def execute(self, stmt, params=None):
+            return _FakeResult(
+                rows=[SimpleNamespace(prompt_text="SYS_ART", user_template="")]
+            )
+
+    system, user = ka._get_prompt_pair(
+        _ArtifactSession(), "model", ka.TASK_SYNTHESIS, "SYS_FB", "USER_FB"
+    )
+    assert system == "SYS_FB"
+    assert user == "USER_FB"
+
+
+# ---------------------------------------------------------------------
 # 1. Recuperación proposicional (Nivel 1)
 # ---------------------------------------------------------------------
 

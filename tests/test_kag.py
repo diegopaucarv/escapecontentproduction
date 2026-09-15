@@ -1268,6 +1268,74 @@ def test_noun_chunk_fallback_no_phrases_degrades(monkeypatch):
 # ---------------------------------------------------------------------
 
 
+def test_get_prompt_pair_fallback_without_artifact():
+    """Sin artefacto (tests sin DB) -> constantes actuales (comportamiento exacto)."""
+    import src.kag_query as kq
+
+    class _EmptySession:
+        def execute(self, stmt, params=None):
+            class _R:
+                def scalars(self):
+                    return self
+
+                def first(self):
+                    return None
+
+            return _R()
+
+    system, user = kq._get_prompt_pair(
+        _EmptySession(), "model", kq.TASK_CRITIC_REGEX, "SYS_FB", "USER_FB"
+    )
+    assert system == "SYS_FB"
+    assert user == "USER_FB"
+
+
+def test_get_prompt_pair_uses_artifact():
+    """Con artefacto -> (prompt_text, user_template) congelados en 0021."""
+    import src.kag_query as kq
+
+    class _ArtifactSession:
+        def execute(self, stmt, params=None):
+            class _R:
+                def scalars(self):
+                    return self
+
+                def first(self):
+                    return SimpleNamespace(
+                        prompt_text="SYS_ART", user_template="USER_ART"
+                    )
+
+            return _R()
+
+    system, user = kq._get_prompt_pair(
+        _ArtifactSession(), "model", kq.TASK_CRITIC_REGEX, "SYS_FB", "USER_FB"
+    )
+    assert system == "SYS_ART"
+    assert user == "USER_ART"
+
+
+def test_get_prompt_pair_ignores_artifact_without_user_template():
+    """Artefacto con user_template vacío (pre-0021) -> fallback a constantes."""
+    import src.kag_query as kq
+
+    class _ArtifactSession:
+        def execute(self, stmt, params=None):
+            class _R:
+                def scalars(self):
+                    return self
+
+                def first(self):
+                    return SimpleNamespace(prompt_text="SYS_ART", user_template="")
+
+            return _R()
+
+    system, user = kq._get_prompt_pair(
+        _ArtifactSession(), "model", kq.TASK_CRITIC_REGEX, "SYS_FB", "USER_FB"
+    )
+    assert system == "SYS_FB"
+    assert user == "USER_FB"
+
+
 class _RegexSession:
     """Sesión falsa: responde a la query FTS combinada (tsq) por término.
 

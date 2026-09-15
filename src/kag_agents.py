@@ -23,7 +23,7 @@ import json
 import re
 
 from rapidfuzz import fuzz
-from sqlalchemy import bindparam, text
+from sqlalchemy import text
 
 from src.kag_ingest import embedding_to_sql
 from src.llm.base import call_with_retries, load_settings, parse_llm_output
@@ -176,6 +176,21 @@ def _get_system_prompt(session, model_name: str, task_key: str, fallback: str) -
     return fallback
 
 
+def _get_prompt_pair(
+    session, model_name: str, task_key: str, system_fallback: str, user_fallback: str
+) -> tuple[str, str]:
+    """(system, user) desde el artefacto compilado, o los fallbacks actuales.
+
+    El artefacto (0021) congela el SYSTEM renderizado en `prompt_text` y el
+    USER template parametrizable en `user_template`. Sin artefacto (tests sin
+    DB) devuelve las constantes actuales — comportamiento EXACTO de hoy.
+    """
+    artifact = _get_prompt_artifact(session, model_name, task_key)
+    if artifact is not None and artifact.prompt_text and artifact.user_template:
+        return artifact.prompt_text, artifact.user_template
+    return system_fallback, user_fallback
+
+
 def _json_dumps(obj) -> str:
     """json.dumps con ensure_ascii=False y fallback a repr si serializar falla."""
     try:
@@ -266,7 +281,7 @@ def escalate_to_parent_context(session, chapter_ids) -> dict:
             "SELECT id, summary, line_start, line_end "
             "FROM document_chapters WHERE id = ANY(:ids)"
         ),
-        {"ids": bindparam("ids", expanding=True, value=chapter_ids)},
+        {"ids": chapter_ids},
     ).fetchall()
     return {r.id: r.summary for r in rows}
 
@@ -287,18 +302,12 @@ def synthesize_chunks(session, query, chunks, verbose=False) -> list[dict]:
     retries, fallback = _settings_retries(session)
     small_model, _large_model = _settings_models(session)
     candidate_chunks_json = _json_dumps(chunks)
-    system = _get_system_prompt(
-        session, small_model, TASK_SYNTHESIS, SYNTHESIS_SYSTEM_SHORT
+    system, user_template = _get_prompt_pair(
+        session, small_model, TASK_SYNTHESIS, SYNTHESIS_SYSTEM_SHORT, SYNTHESIS_PROMPT
     )
-    if system == SYNTHESIS_SYSTEM_SHORT:
-        # Sin artefacto: comportamiento exacto de hoy (prompt combinado).
-        prompt = SYNTHESIS_PROMPT.format(
-            query=query, candidate_chunks_json=candidate_chunks_json
-        )
-    else:
-        prompt = SYNTHESIS_USER.format(
-            query=query, candidate_chunks_json=candidate_chunks_json
-        )
+    prompt = user_template.format(
+        query=query, candidate_chunks_json=candidate_chunks_json
+    )
     try:
         text_out, _model, _used_fallback = call_with_retries(
             session,
@@ -357,18 +366,16 @@ def resolve_contradictions(session, query, synthesized_facts, verbose=False) -> 
         return {"contradictions_detected": False, "analysis_cases": []}
     retries, fallback = _settings_retries(session)
     small_model, _large_model = _settings_models(session)
-    system = _get_system_prompt(
-        session, small_model, TASK_CONTRADICTIONS, CONTRADICTION_SYSTEM_SHORT
+    system, user_template = _get_prompt_pair(
+        session,
+        small_model,
+        TASK_CONTRADICTIONS,
+        CONTRADICTION_SYSTEM_SHORT,
+        CONTRADICTION_PROMPT,
     )
-    if system == CONTRADICTION_SYSTEM_SHORT:
-        # Sin artefacto: comportamiento exacto de hoy (prompt combinado).
-        prompt = CONTRADICTION_PROMPT.format(
-            query=query, synthesized_facts_json=_json_dumps(synthesized_facts)
-        )
-    else:
-        prompt = CONTRADICTION_USER.format(
-            query=query, synthesized_facts_json=_json_dumps(synthesized_facts)
-        )
+    prompt = user_template.format(
+        query=query, synthesized_facts_json=_json_dumps(synthesized_facts)
+    )
     try:
         text_out, _model, _used_fallback = call_with_retries(
             session,
@@ -414,24 +421,19 @@ def evaluate_sufficiency(
     """
     retries, fallback = _settings_retries(session)
     small_model, _large_model = _settings_models(session)
-    system = _get_system_prompt(
-        session, small_model, TASK_SUFFICIENCY, SUFFICIENCY_SYSTEM_SHORT
+    system, user_template = _get_prompt_pair(
+        session,
+        small_model,
+        TASK_SUFFICIENCY,
+        SUFFICIENCY_SYSTEM_SHORT,
+        SUFFICIENCY_PROMPT,
     )
-    if system == SUFFICIENCY_SYSTEM_SHORT:
-        # Sin artefacto: comportamiento exacto de hoy (prompt combinado).
-        prompt = SUFFICIENCY_PROMPT.format(
-            query=query,
-            active_corpus_metadata=_json_dumps(corpus_metadata),
-            synthesized_propositions_json=_json_dumps(synthesized_facts),
-            parent_contexts_json="[]",
-        )
-    else:
-        prompt = SUFFICIENCY_USER.format(
-            query=query,
-            active_corpus_metadata=_json_dumps(corpus_metadata),
-            synthesized_propositions_json=_json_dumps(synthesized_facts),
-            parent_contexts_json="[]",
-        )
+    prompt = user_template.format(
+        query=query,
+        active_corpus_metadata=_json_dumps(corpus_metadata),
+        synthesized_propositions_json=_json_dumps(synthesized_facts),
+        parent_contexts_json="[]",
+    )
     try:
         text_out, _model, _used_fallback = call_with_retries(
             session,
@@ -519,11 +521,9 @@ class BranchBOrchestrator:
                         "OR scope_thematic ILIKE ANY(:terms)) LIMIT 3"
                     ),
                     {
-                        "visited_docs": bindparam(
-                            "visited_docs", expanding=True, value=visited_docs
-                        ),
+                        "visited_docs": visited_docs,
                         "terms_jsonb": terms_jsonb,
-                        "terms": bindparam("terms", expanding=True, value=terms),
+                        "terms": terms,
                     },
                 ).fetchall()
                 new_doc_ids = [r.id for r in rows]
@@ -545,11 +545,7 @@ class BranchBOrchestrator:
                         "WHERE r.source_entity_id = ANY(:entity_ids) "
                         "ORDER BY r.id DESC LIMIT 10"
                     ),
-                    {
-                        "entity_ids": bindparam(
-                            "entity_ids", expanding=True, value=entity_ids
-                        )
-                    },
+                    {"entity_ids": entity_ids},
                 ).fetchall()
                 neighbor_names = [r.name for r in rows]
                 if neighbor_names:
@@ -882,20 +878,14 @@ def ask_propositional(
     retries, fallback = _settings_retries(session)
     _small_model, large_model = _settings_models(session)
     used_fallback = False
-    system = _get_system_prompt(session, large_model, TASK_ANSWER, ANSWER_SYSTEM_SHORT)
-    if system == ANSWER_SYSTEM_SHORT:
-        # Sin artefacto: comportamiento exacto de hoy (prompt combinado).
-        prompt = ANSWER_PROMPT.format(
-            query=query,
-            grounded_evidence_json=_json_dumps(final_context["grounded_evidence"]),
-            epistemic_tensions_json=_json_dumps(final_context["epistemic_tensions"]),
-        )
-    else:
-        prompt = ANSWER_USER.format(
-            query=query,
-            grounded_evidence_json=_json_dumps(final_context["grounded_evidence"]),
-            epistemic_tensions_json=_json_dumps(final_context["epistemic_tensions"]),
-        )
+    system, user_template = _get_prompt_pair(
+        session, large_model, TASK_ANSWER, ANSWER_SYSTEM_SHORT, ANSWER_PROMPT
+    )
+    prompt = user_template.format(
+        query=query,
+        grounded_evidence_json=_json_dumps(final_context["grounded_evidence"]),
+        epistemic_tensions_json=_json_dumps(final_context["epistemic_tensions"]),
+    )
     try:
         text_out, _model, used_fallback = call_with_retries(
             session,

@@ -176,6 +176,15 @@ class GenericPromptAdapter:
         )
         return header + "\n" + body
 
+    def render_user_template(self, spec) -> str:
+        """El USER prompt parametrizable (placeholders {..}) de la spec.
+
+        Se congela tal cual en prompt_artifacts.user_template; el runtime lo
+        rellena con _fill/str.replace (nunca .format(): los prompts contienen
+        llaves JSON literales). Devuelve "" si la spec no define user_template.
+        """
+        return getattr(spec, "user_template", "") or ""
+
 
 # ---------------------------------------------------------------------
 # Validación de critic_checklist
@@ -296,10 +305,16 @@ def compile_prompts(session: Session) -> dict:
 
             prompt_text = adapter.render_prompt(spec, model)
             content_hash = _content_hash(prompt_text)
+            user_template = adapter.render_user_template(spec)
+            user_template_hash = _content_hash(user_template)
 
             existing = _existing_versions(session, model.id, spec.task_key)
             active = next((a for a in existing if a.is_active), None)
-            if active is not None and active.content_hash == content_hash:
+            if (
+                active is not None
+                and active.content_hash == content_hash
+                and active.user_template_hash == user_template_hash
+            ):
                 result.skipped += 1
                 continue
 
@@ -314,6 +329,8 @@ def compile_prompts(session: Session) -> dict:
                     artifact_version=new_version,
                     prompt_text=prompt_text,
                     content_hash=content_hash,
+                    user_template=user_template,
+                    user_template_hash=user_template_hash,
                     compiled_by="compiler",
                     is_active=True,
                 )
@@ -325,6 +342,7 @@ def compile_prompts(session: Session) -> dict:
                     "task": spec.task_key,
                     "version": new_version,
                     "hash": content_hash,
+                    "user_template_hash": user_template_hash,
                 }
             )
 

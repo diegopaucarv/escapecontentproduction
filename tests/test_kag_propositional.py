@@ -72,7 +72,7 @@ class _FakeSession:
             return _FakeResult(rows=[])
         if "INSERT INTO documents" in sql:
             row_id = self._next_id()
-            self.documents.append({"id": row_id, **params})
+            self.documents.append({"id": row_id, "stage": "detected", **params})
             return _FakeResult(scalar=row_id)
         if "INSERT INTO document_chapters" in sql:
             row_id = self._next_id()
@@ -90,7 +90,7 @@ class _FakeSession:
             row_id = self._next_id()
             self.images.append({"id": row_id, **params})
             return _FakeResult(scalar=row_id)
-        if "SELECT id, content_hash, status FROM documents" in sql:
+        if "SELECT id, content_hash, status, stage FROM documents" in sql:
             did = params.get("did") or params.get("document_id")
             for d in self.documents:
                 if d.get("document_id") == did:
@@ -100,6 +100,7 @@ class _FakeSession:
                                 id=d["id"],
                                 content_hash=d["content_hash"],
                                 status=d["status"],
+                                stage=d.get("stage", "detected"),
                             )
                         ]
                     )
@@ -112,11 +113,34 @@ class _FakeSession:
                 for c in self.chunks
             ]
             return _FakeResult(rows=rows)
+        if "SELECT id, chapter_index, title, line_start, line_end" in sql:
+            rows = [
+                SimpleNamespace(
+                    id=c["id"],
+                    chapter_index=c["chapter_index"],
+                    title=c["title"],
+                    line_start=c["line_start"],
+                    line_end=c["line_end"],
+                )
+                for c in self.chapters
+            ]
+            return _FakeResult(rows=rows)
+        if "SELECT COUNT(*) FROM propositional_chunks" in sql:
+            return _FakeResult(scalar=len(self.chunks))
+        if "SELECT COUNT(*) FROM topic_tree_nodes" in sql:
+            return _FakeResult(scalar=len(self.topic_nodes))
+        if "SELECT COUNT(*) FROM document_images" in sql:
+            return _FakeResult(scalar=len(self.images))
         if "UPDATE documents" in sql:
             doc_id = params.get("id")
             for d in self.documents:
                 if d["id"] == doc_id:
-                    d["status"] = "ready"
+                    if "stage" in params:
+                        d["stage"] = params["stage"]
+                    if "status" in params:
+                        d["status"] = params["status"]
+                    else:
+                        d["status"] = "ready"
             return _FakeResult()
         if "DELETE FROM documents" in sql:
             doc_id = params.get("id")
@@ -128,6 +152,30 @@ class _FakeSession:
             self.topic_nodes = [
                 t for t in self.topic_nodes if t["document_id"] != doc_id
             ]
+            self.images = [i for i in self.images if i["document_id"] != doc_id]
+            return _FakeResult()
+        if "DELETE FROM document_chapters" in sql:
+            doc_id = params.get("doc_id")
+            self.chapters = [c for c in self.chapters if c["document_id"] != doc_id]
+            # Cascada: al borrar capítulos se borran sus chunks/nodos/imágenes.
+            self.chunks = [c for c in self.chunks if c["document_id"] != doc_id]
+            self.topic_nodes = [
+                t for t in self.topic_nodes if t["document_id"] != doc_id
+            ]
+            self.images = [i for i in self.images if i["document_id"] != doc_id]
+            return _FakeResult()
+        if "DELETE FROM propositional_chunks" in sql:
+            doc_id = params.get("doc_id")
+            self.chunks = [c for c in self.chunks if c["document_id"] != doc_id]
+            return _FakeResult()
+        if "DELETE FROM topic_tree_nodes" in sql:
+            doc_id = params.get("doc_id")
+            self.topic_nodes = [
+                t for t in self.topic_nodes if t["document_id"] != doc_id
+            ]
+            return _FakeResult()
+        if "DELETE FROM document_images" in sql:
+            doc_id = params.get("doc_id")
             self.images = [i for i in self.images if i["document_id"] != doc_id]
             return _FakeResult()
         return _FakeResult()
@@ -365,6 +413,53 @@ def _fake_call_valid(
 
 
 # ---------------------------------------------------------------------
+# Helper: _get_prompt_pair (prompt-as-code 0021)
+# ---------------------------------------------------------------------
+
+
+def test_get_prompt_pair_fallback_without_artifact():
+    """Sin artefacto (tests sin DB) -> constantes actuales (comportamiento exacto)."""
+    session = _FakeSession()
+    system, user = kp._get_prompt_pair(
+        session, "model", kp.TASK_DOCUMENT_ANALYSIS, "SYS_FB", "USER_FB"
+    )
+    assert system == "SYS_FB"
+    assert user == "USER_FB"
+
+
+def test_get_prompt_pair_uses_artifact():
+    """Con artefacto -> (prompt_text, user_template) congelados en 0021."""
+
+    class _ArtifactSession:
+        def execute(self, stmt, params=None):
+            return _FakeResult(
+                rows=[SimpleNamespace(prompt_text="SYS_ART", user_template="USER_ART")]
+            )
+
+    system, user = kp._get_prompt_pair(
+        _ArtifactSession(), "model", kp.TASK_DOCUMENT_ANALYSIS, "SYS_FB", "USER_FB"
+    )
+    assert system == "SYS_ART"
+    assert user == "USER_ART"
+
+
+def test_get_prompt_pair_ignores_artifact_without_user_template():
+    """Artefacto con user_template vacío (pre-0021) -> fallback a constantes."""
+
+    class _ArtifactSession:
+        def execute(self, stmt, params=None):
+            return _FakeResult(
+                rows=[SimpleNamespace(prompt_text="SYS_ART", user_template="")]
+            )
+
+    system, user = kp._get_prompt_pair(
+        _ArtifactSession(), "model", kp.TASK_DOCUMENT_ANALYSIS, "SYS_FB", "USER_FB"
+    )
+    assert system == "SYS_FB"
+    assert user == "USER_FB"
+
+
+# ---------------------------------------------------------------------
 # Pipeline completo (pasos 0-6)
 # ---------------------------------------------------------------------
 
@@ -461,6 +556,82 @@ def test_index_stacked_file_force_reindexes(tmp_path, monkeypatch):
     assert results[0]["status"] == "indexed"
     assert len(session.documents) == 1  # borrado + re-insertado
     assert len(session.chunks) == 1
+
+
+def test_index_document_resumes_from_interrupted_stage(tmp_path, monkeypatch):
+    """Interrupción en stage='analysis' -> reanuda desde 'chunks'.
+
+    La ficha y los capítulos YA están (no se re-insertan); solo se ejecutan
+    las etapas pendientes (chunks, topic_tree, images, ready).
+    """
+    md = _write_stacked_md(tmp_path)
+    monkeypatch.setattr("src.kag.tools.MultibookFinderTool", lambda: _FakeFinder(md))
+    monkeypatch.setattr("src.kag.tools.LibraryOfCongressAPITool", _FakeLoC)
+    monkeypatch.setattr(kp, "call_with_retries", _fake_call_valid)
+    monkeypatch.setattr("src.embeddings.embed_texts", _fake_embed_texts)
+    monkeypatch.setattr(kp, "MANIFEST_PATH", tmp_path / "stacked_manifest.json")
+
+    session = _FakeSession()
+    # Primera pasada completa (para tener la fila con hash correcto).
+    kp.index_stacked_file(session, str(md), verbose=False)
+    assert len(session.documents) == 1
+    doc = session.documents[0]
+
+    # Simular interrupción: el proceso murió en stage='analysis' (ficha y
+    # capítulos hechos, chunks NO). Se borran los datos de etapas posteriores
+    # y se deja la fila en 'analysis' con status != 'ready'.
+    session.chunks = []
+    session.topic_nodes = []
+    session.images = []
+    doc["stage"] = "analysis"
+    doc["status"] = "pending"
+    n_docs_before = len(session.documents)
+    n_chapters_before = len(session.chapters)
+
+    # Segunda pasada: reanuda desde 'chunks' (no re-inserta ficha/capítulos).
+    results = kp.index_stacked_file(session, str(md), verbose=False)
+    assert results[0]["status"] == "indexed"
+    # La fila de documents NO se duplicó ni se re-insertó.
+    assert len(session.documents) == n_docs_before
+    assert len(session.chapters) == n_chapters_before
+    # Las etapas pendientes SÍ se completaron.
+    assert len(session.chunks) == 1
+    assert len(session.topic_nodes) == 1
+    assert session.documents[0]["status"] == "ready"
+    assert session.documents[0]["stage"] == "ready"
+
+
+def test_index_document_resumes_from_chunks_stage(tmp_path, monkeypatch):
+    """Interrupción en stage='chunks' -> reanuda desde 'topic_tree'.
+
+    Ficha, capítulos y chunks YA están; solo se ejecutan topic_tree, images
+    y ready. Los chunks existentes NO se re-insertan.
+    """
+    md = _write_stacked_md(tmp_path)
+    monkeypatch.setattr("src.kag.tools.MultibookFinderTool", lambda: _FakeFinder(md))
+    monkeypatch.setattr("src.kag.tools.LibraryOfCongressAPITool", _FakeLoC)
+    monkeypatch.setattr(kp, "call_with_retries", _fake_call_valid)
+    monkeypatch.setattr("src.embeddings.embed_texts", _fake_embed_texts)
+    monkeypatch.setattr(kp, "MANIFEST_PATH", tmp_path / "stacked_manifest.json")
+
+    session = _FakeSession()
+    kp.index_stacked_file(session, str(md), verbose=False)
+    doc = session.documents[0]
+
+    # Simular interrupción en 'chunks': topic_tree/images pendientes.
+    session.topic_nodes = []
+    session.images = []
+    doc["stage"] = "chunks"
+    doc["status"] = "pending"
+    n_chunks_before = len(session.chunks)
+
+    results = kp.index_stacked_file(session, str(md), verbose=False)
+    assert results[0]["status"] == "indexed"
+    # Los chunks existentes se conservan (no se re-insertan).
+    assert len(session.chunks) == n_chunks_before
+    assert len(session.topic_nodes) == 1
+    assert session.documents[0]["status"] == "ready"
+    assert session.documents[0]["stage"] == "ready"
 
 
 # ---------------------------------------------------------------------

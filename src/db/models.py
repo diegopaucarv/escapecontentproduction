@@ -490,6 +490,10 @@ class PromptTemplate(Base):
     input_schema: Mapped[dict] = mapped_column(JSONB, default=dict)
     output_schema: Mapped[dict] = mapped_column(JSONB, default=dict)
     few_shot: Mapped[list] = mapped_column(JSONB, default=list)
+    # USER prompt parametrizable (placeholders {..}) — 0021. El SYSTEM vive en
+    # intent/rules; el USER (con sus placeholders) vive aquí, versionado con
+    # la spec y congelado en el artefacto compilado.
+    user_template: Mapped[str] = mapped_column(Text, default="")
     is_active: Mapped[bool] = mapped_column(default=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
@@ -516,6 +520,11 @@ class PromptArtifact(Base):
     artifact_version: Mapped[int] = mapped_column(default=1)
     prompt_text: Mapped[str] = mapped_column(Text)
     content_hash: Mapped[str] = mapped_column(String(64))
+    # USER prompt congelado junto al SYSTEM (0021). user_template_hash permite
+    # la idempotencia del compilador: el artefacto se recompila si cambia el
+    # SYSTEM renderizado O el USER template.
+    user_template: Mapped[str] = mapped_column(Text, default="")
+    user_template_hash: Mapped[str] = mapped_column(String(64), default="")
     compiled_by: Mapped[str] = mapped_column(String(100), default="compiler")
     is_active: Mapped[bool] = mapped_column(default=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())

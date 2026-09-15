@@ -31,6 +31,13 @@ from pathlib import Path
 import httpx
 from sqlalchemy import bindparam, text
 
+from src.kag.stages import (
+    KAG_INGEST_STAGES,
+    cleanup_stage,
+    get_stage,
+    resume_from,
+    set_stage,
+)
 from src.llm.base import call_with_retries, load_settings, parse_llm_output
 from src.llm.together import complete_vision
 
@@ -61,6 +68,26 @@ def _get_system_prompt(session, model_name, task_key, fallback: str) -> str:
     except Exception:  # noqa: BLE001 — degradación natural
         pass
     return fallback
+
+
+def _get_prompt_pair(
+    session, model_name, task_key, system_fallback: str, user_fallback: str
+) -> tuple[str, str]:
+    """(system, user) desde el artefacto compilado, o los fallbacks actuales.
+
+    El artefacto (0021) congela el SYSTEM renderizado en `prompt_text` y el
+    USER template parametrizable en `user_template`. Sin artefacto (tests sin
+    DB) devuelve las constantes actuales — comportamiento EXACTO de hoy.
+    """
+    try:
+        from src.llm.compiler import get_active_prompt
+
+        artifact = get_active_prompt(session, model_name, task_key)
+        if artifact is not None and artifact.prompt_text and artifact.user_template:
+            return artifact.prompt_text, artifact.user_template
+    except Exception:  # noqa: BLE001 — degradación natural
+        pass
+    return system_fallback, user_fallback
 
 
 # Raíces del repositorio de conocimiento (relativas a la raíz del proyecto).
@@ -457,16 +484,21 @@ def extract_entities_relations(session, chunk_text):
     retries = int(getattr(settings, "llm_retries", 3) or 3) if settings else 3
     fallback = getattr(settings, "fallback_model", None) if settings else None
     small_model = getattr(settings, "small_model", None) if settings else None
+    system, user_template = _get_prompt_pair(
+        session,
+        small_model,
+        TASK_EXTRACT_ENTITIES,
+        EXTRACT_SYSTEM_SHORT,
+        EXTRACT_PROMPT,
+    )
     # str.replace en vez de .format(): el prompt contiene llaves JSON literales
     # que .format() interpretaría como placeholders (KeyError).
-    prompt = EXTRACT_PROMPT.replace("{chunk}", chunk_text[:8000])
+    prompt = user_template.replace("{chunk}", chunk_text[:8000])
     try:
         text_out, _model, _used_fallback = call_with_retries(
             session,
             prompt=prompt,
-            system=_get_system_prompt(
-                session, small_model, TASK_EXTRACT_ENTITIES, EXTRACT_SYSTEM_SHORT
-            ),
+            system=system,
             model_size="small",
             response_format={"type": "json_object"},
             retries=retries,
@@ -638,14 +670,18 @@ def summarize_document(session, text, doc_type):
     try:
         settings = load_settings(session)
         small_model = getattr(settings, "small_model", None) if settings else None
-        summary_system = _get_system_prompt(
-            session, small_model, TASK_QWEN_SUMMARY, QWEN_SUMMARY_SYSTEM
+        summary_system, summary_user = _get_prompt_pair(
+            session,
+            small_model,
+            TASK_QWEN_SUMMARY,
+            QWEN_SUMMARY_SYSTEM,
+            QWEN_SUMMARY_USER,
         )
         if doc_type == "short":
             truncated = text[:SUMMARY_MAX_CHARS]
             return complete_local(
                 session,
-                QWEN_SUMMARY_USER.format(text=truncated),
+                summary_user.format(text=truncated),
                 system=summary_system,
                 max_tokens=200,
             ).strip()
@@ -654,7 +690,7 @@ def summarize_document(session, text, doc_type):
             truncated = sec[:SUMMARY_MAX_CHARS]
             s = complete_local(
                 session,
-                QWEN_SUMMARY_USER.format(text=truncated),
+                summary_user.format(text=truncated),
                 system=summary_system,
                 max_tokens=60,
             ).strip()
@@ -665,7 +701,7 @@ def summarize_document(session, text, doc_type):
         combined = "\n".join(f"- {s}" for s in section_summaries)
         return complete_local(
             session,
-            QWEN_SUMMARY_USER.format(text=combined),
+            summary_user.format(text=combined),
             system=summary_system,
             max_tokens=200,
         ).strip()
@@ -770,6 +806,13 @@ def index_document(
 
     Idempotente por content_hash; --force re-indexa. Devuelve dict resumen.
 
+    Atomicidad POR ETAPA (máquina de estados, src/kag/stages.py):
+      pending -> segmented -> chunked -> figures -> ready
+
+    Cada etapa commitea su trabajo y actualiza `stage`. Si el proceso se
+    interrumpe (p. ej. durante la segmentación, que es lenta), al reanudar
+    se saltan las etapas ya completadas y se continúa desde la interrumpida.
+
     `llm_entities=True` usa la extracción LLM por chunk (Together, costosa);
     por defecto se usa la extracción determinista con spaCy (gratis).
     """
@@ -786,14 +829,15 @@ def index_document(
     doc_type = "long" if token_estimate >= LONG_DOC_THRESHOLD else "short"
 
     existing = session.execute(
-        text("SELECT id, content_hash, status FROM kag_documents WHERE doc_path = :p"),
+        text(
+            "SELECT id, content_hash, status, stage FROM kag_documents "
+            "WHERE doc_path = :p"
+        ),
         {"p": doc_path},
     ).first()
+
+    # ── Idempotencia / reanudación ─────────────────────────────────────────
     if existing and existing.content_hash == content_hash and not force:
-        # ── Graceful degradation ────────────────────────────────────────────
-        # Solo se salta un doc si está COMPLETO (status='ready' y sin chunks
-        # con embedding NULL). Si quedó pending/failed (proceso interrumpido)
-        # o con embeddings incompletos, se re-procesa en vez de saltar.
         if existing.status == "ready":
             null_emb = session.execute(
                 text(
@@ -838,114 +882,162 @@ def index_document(
                 )
             session.commit()
             return {"status": "reembedded", "doc_path": doc_path}
+
+        # No está 'ready': reanudar desde la última etapa completada (NO se
+        # borra nada — la máquina de estados salta lo ya hecho).
+        resume = resume_from(KAG_INGEST_STAGES, existing.stage or "pending")
         if verbose:
             print(
-                f"[KAG] ♻ {doc_path} en estado '{existing.status}' (proceso "
-                "interrumpido?) — re-indexando..."
+                f"[KAG] ♻ {doc_path} en stage '{existing.stage}' — reanudando "
+                f"desde '{resume}'..."
             )
-
-    if existing:
-        session.execute(
-            text("DELETE FROM kag_documents WHERE id = :id"), {"id": existing.id}
-        )
-        session.commit()
+    else:
+        # Fuerza o hash cambiado (o fila inexistente): borrar y empezar de cero.
+        if existing:
+            session.execute(
+                text("DELETE FROM kag_documents WHERE id = :id"), {"id": existing.id}
+            )
+            session.commit()
+        resume = "pending"
 
     title = _title_from_md(md_text, doc_path)
     doc_id = None
     try:
-        # El INSERT va DENTRO del try: si algo falla temprano (p. ej. descarga
-        # de modelos del segmentador), la fila queda con status='failed' y el
-        # error visible en la DB en lugar de desaparecer sin rastro.
-        doc_id = session.execute(
-            text(
-                "INSERT INTO kag_documents "
-                "(doc_path, title, doc_type, status, content_hash, token_estimate) "
-                "VALUES (:doc_path, :title, :doc_type, 'pending', :content_hash, "
-                ":token_estimate) RETURNING id"
-            ),
-            {
-                "doc_path": doc_path,
-                "title": title,
-                "doc_type": doc_type,
-                "content_hash": content_hash,
-                "token_estimate": token_estimate,
-            },
-        ).scalar()
-        session.commit()
+        if resume == "pending":
+            # El INSERT va DENTRO del try: si algo falla temprano (p. ej. descarga
+            # de modelos del segmentador), la fila queda con status='failed' y el
+            # error visible en la DB en lugar de desaparecer sin rastro.
+            doc_id = session.execute(
+                text(
+                    "INSERT INTO kag_documents "
+                    "(doc_path, title, doc_type, status, content_hash, token_estimate, stage) "
+                    "VALUES (:doc_path, :title, :doc_type, 'pending', :content_hash, "
+                    ":token_estimate, 'pending') RETURNING id"
+                ),
+                {
+                    "doc_path": doc_path,
+                    "title": title,
+                    "doc_type": doc_type,
+                    "content_hash": content_hash,
+                    "token_estimate": token_estimate,
+                },
+            ).scalar()
+            session.commit()
+        else:
+            doc_id = existing.id
 
-        # Segmentación (import perezoso: el segmentador carga torch/spacy).
-        from src.kag.segmentador import build_segmenter
-
+        # ── Etapa: segmented (segmentación + chunks sin embedding) ──────────
+        # La segmentación es la etapa LENTA (torch/spacy). Se persisten los
+        # chunks con embedding NULL ANTES de embeker: si se interrumpe aquí,
+        # al reanudar NO se re-segmenta.
+        # lang/segmenter se calculan UNA vez: los necesitan tanto la
+        # segmentación como la extracción determinista de entidades (nlp).
         lang = detect_language(md_text)
         if verbose:
             print(
                 f"[KAG] 📄 {doc_path} | {doc_type} | ~{token_estimate} tokens | idioma {lang}"
             )
-        segmenter = build_segmenter(session, lang=lang, verbose=verbose)
-        # Coref Stanza: docs cortos lo usan (costo acotado); book stacks lo
-        # omiten (prohibitivo: ~11s por segmento).
-        use_coref = doc_type == "short"
-        chunks = chunk_markdown(
-            md_text,
-            doc_type,
-            segmenter,
-            max_tokens=CHUNK_MAX_TOKENS,
-            use_coref=use_coref,
-        )
+        if resume in ("pending", "segmented"):
+            if resume == "segmented":
+                # Re-ejecutar la etapa: limpiar chunks parciales primero.
+                cleanup_stage(session, "kag_documents", doc_id, "segmented")
+            from src.kag.segmentador import build_segmenter
 
-        chunk_count = 0
-        # Import perezoso: src.embeddings importa src.db.session (que lee .env
-        # al importar) — debe ocurrir DESPUÉS de _fix_db_host().
-        from src.embeddings import embed_texts
+            segmenter = build_segmenter(session, lang=lang, verbose=verbose)
+            # Coref Stanza: docs cortos lo usan (costo acotado); book stacks lo
+            # omiten (prohibitivo: ~11s por segmento).
+            use_coref = doc_type == "short"
+            chunks = chunk_markdown(
+                md_text,
+                doc_type,
+                segmenter,
+                max_tokens=CHUNK_MAX_TOKENS,
+                use_coref=use_coref,
+            )
 
-        # Batch de embeddings: una sola llamada al modelo por lote de chunks
-        # (en vez de N llamadas individuales — el cuello de botella real de la
-        # ingesta). El lote se parte en bloques de EMBED_BATCH_SIZE para no
-        # reventar la memoria del modelo.
-        EMBED_BATCH_SIZE = 32
-        for start in range(0, len(chunks), EMBED_BATCH_SIZE):
-            batch = chunks[start : start + EMBED_BATCH_SIZE]
-            try:
-                embs = embed_texts([c["content"] for c in batch], input_type="document")
-            except Exception as exc:  # noqa: BLE001 — chunk sin embedding
-                if verbose:
-                    print(f"[KAG] ⚠ Embedding falló (lote {start}): {exc}")
-                embs = [None] * len(batch)
-            for i, chunk in enumerate(batch):
-                chunk_id = session.execute(
+            chunk_count = 0
+            for i, chunk in enumerate(chunks):
+                session.execute(
                     text(
                         "INSERT INTO kag_chunks "
                         "(doc_id, chunk_index, section_path, content, token_estimate, "
                         "embedding) VALUES (:doc_id, :chunk_index, :section_path, "
-                        ":content, :token_estimate, CAST(:embedding AS vector)) "
-                        "RETURNING id"
+                        ":content, :token_estimate, NULL) "
                     ),
                     {
                         "doc_id": doc_id,
-                        "chunk_index": start + i,
+                        "chunk_index": i,
                         "section_path": chunk["section_path"],
                         "content": chunk["content"],
                         "token_estimate": chunk["token_estimate"],
-                        "embedding": embedding_to_sql(embs[i]),
                     },
-                ).scalar()
+                )
                 chunk_count += 1
-                if llm_entities:
-                    data = extract_entities_relations(session, chunk["content"])
-                else:
-                    # Extracción determinista con spaCy (gratis): reutiliza el nlp
-                    # del segmentador (ya cargado) y canonicaliza con el modelo de
-                    # embeddings de la DB (embed_texts, batch).
-                    from src.kag.entities import extract_entities_deterministic
+            set_stage(session, "kag_documents", doc_id, "segmented")
+            if verbose:
+                print(f"[KAG] ✂ {doc_path}: {chunk_count} chunks segmentados.")
 
-                    data = extract_entities_deterministic(
-                        segmenter.nlp,
-                        chunk["content"],
-                        embed_fn=embed_texts,
-                        lang=lang,
+        # ── Etapa: chunked (embeddings + entidades + relaciones) ────────────
+        if resume in ("pending", "segmented", "chunked"):
+            if resume == "chunked":
+                cleanup_stage(session, "kag_documents", doc_id, "chunked")
+            # Import perezoso: src.embeddings importa src.db.session (que lee
+            # .env al importar) — debe ocurrir DESPUÉS de _fix_db_host().
+            from src.embeddings import embed_texts
+
+            # Si se reanuda desde 'chunked' (segmentación ya hecha), el
+            # segmenter no está en memoria: reconstruirlo solo para el nlp.
+            if "segmenter" not in locals():
+                from src.kag.segmentador import build_segmenter
+
+                segmenter = build_segmenter(session, lang=lang, verbose=verbose)
+
+            # Batch de embeddings: una sola llamada al modelo por lote de chunks
+            # (en vez de N llamadas individuales — el cuello de botella real de
+            # la ingesta). El lote se parte en bloques de EMBED_BATCH_SIZE para
+            # no reventar la memoria del modelo.
+            EMBED_BATCH_SIZE = 32
+            chunk_rows = session.execute(
+                text(
+                    "SELECT id, content FROM kag_chunks "
+                    "WHERE doc_id = :id ORDER BY chunk_index"
+                ),
+                {"id": doc_id},
+            ).fetchall()
+            for start in range(0, len(chunk_rows), EMBED_BATCH_SIZE):
+                batch = chunk_rows[start : start + EMBED_BATCH_SIZE]
+                try:
+                    embs = embed_texts(
+                        [r.content for r in batch], input_type="document"
                     )
-                _store_entities_relations(session, doc_id, chunk_id, data)
-        session.commit()
+                except Exception as exc:  # noqa: BLE001 — chunk sin embedding
+                    if verbose:
+                        print(f"[KAG] ⚠ Embedding falló (lote {start}): {exc}")
+                    embs = [None] * len(batch)
+                for i, row in enumerate(batch):
+                    session.execute(
+                        text(
+                            "UPDATE kag_chunks SET embedding = CAST(:emb AS vector) "
+                            "WHERE id = :id"
+                        ),
+                        {"emb": embedding_to_sql(embs[i]), "id": row.id},
+                    )
+                    if llm_entities:
+                        data = extract_entities_relations(session, row.content)
+                    else:
+                        # Extracción determinista con spaCy (gratis): reutiliza
+                        # el nlp del segmentador (ya cargado) y canonicaliza con
+                        # el modelo de embeddings de la DB (embed_texts, batch).
+                        from src.kag.entities import extract_entities_deterministic
+
+                        data = extract_entities_deterministic(
+                            segmenter.nlp,
+                            row.content,
+                            embed_fn=embed_texts,
+                            lang=lang,
+                        )
+                    _store_entities_relations(session, doc_id, row.id, data)
+            set_stage(session, "kag_documents", doc_id, "chunked")
 
         entity_count = session.execute(
             text("SELECT COUNT(*) FROM kag_entities WHERE doc_id = :id"),
@@ -956,29 +1048,47 @@ def index_document(
             {"id": doc_id},
         ).scalar()
 
-        figure_count = _index_figures(session, doc_id, md_path, md_text, verbose)
-        session.commit()
+        # ── Etapa: figures ──────────────────────────────────────────────────
+        if resume in ("pending", "segmented", "chunked", "figures"):
+            if resume == "figures":
+                cleanup_stage(session, "kag_documents", doc_id, "figures")
+            figure_count = _index_figures(session, doc_id, md_path, md_text, verbose)
+            set_stage(session, "kag_documents", doc_id, "figures")
 
-        summary = ""
-        if not no_summary:
-            summary = summarize_document(session, md_text, doc_type)
+        # ── Etapa: ready (resumen + cierre) ─────────────────────────────────
+        if resume in ("pending", "segmented", "chunked", "figures", "ready"):
+            # Si se reanuda desde una etapa posterior, los contadores locales
+            # no se definieron en esta ejecución: leerlos de la DB.
+            if "chunk_count" not in locals():
+                chunk_count = session.execute(
+                    text("SELECT COUNT(*) FROM kag_chunks WHERE doc_id = :id"),
+                    {"id": doc_id},
+                ).scalar()
+            if "figure_count" not in locals():
+                figure_count = session.execute(
+                    text("SELECT COUNT(*) FROM kag_figures WHERE doc_id = :id"),
+                    {"id": doc_id},
+                ).scalar()
+            summary = ""
+            if not no_summary:
+                summary = summarize_document(session, md_text, doc_type)
 
-        session.execute(
-            text(
-                "UPDATE kag_documents SET status = 'ready', chunk_count = :cc, "
-                "entity_count = :ec, relation_count = :rc, figure_count = :fc, "
-                "summary = :summary, updated_at = now() WHERE id = :id"
-            ),
-            {
-                "cc": chunk_count,
-                "ec": entity_count,
-                "rc": relation_count,
-                "fc": figure_count,
-                "summary": summary,
-                "id": doc_id,
-            },
-        )
-        session.commit()
+            session.execute(
+                text(
+                    "UPDATE kag_documents SET status = 'ready', chunk_count = :cc, "
+                    "entity_count = :ec, relation_count = :rc, figure_count = :fc, "
+                    "summary = :summary, updated_at = now() WHERE id = :id"
+                ),
+                {
+                    "cc": chunk_count,
+                    "ec": entity_count,
+                    "rc": relation_count,
+                    "fc": figure_count,
+                    "summary": summary,
+                    "id": doc_id,
+                },
+            )
+            set_stage(session, "kag_documents", doc_id, "ready")
 
         if verbose:
             print(

@@ -38,6 +38,13 @@ from pathlib import Path
 
 from sqlalchemy import bindparam, text
 
+from src.kag.stages import (
+    KAG_PROPOSITIONAL_STAGES,
+    cleanup_stage,
+    get_stage,
+    resume_from,
+    set_stage,
+)
 from src.llm.base import call_with_retries, load_settings, parse_llm_output
 
 # Raíz del repositorio de conocimiento (relativa a la raíz del proyecto).
@@ -262,6 +269,27 @@ def _get_system_prompt(session, model_name: str, task_key: str, fallback: str) -
     except Exception:  # noqa: BLE001 — degradación natural
         pass
     return fallback
+
+
+def _get_prompt_pair(
+    session, model_name: str, task_key: str, system_fallback: str, user_fallback: str
+) -> tuple[str, str]:
+    """(system, user) desde el artefacto compilado, o los fallbacks actuales.
+
+    El artefacto (0021) congela el SYSTEM renderizado en `prompt_text` y el
+    USER template parametrizable en `user_template`. Si no hay DB/artefacto
+    (tests sin DB), devuelve las constantes actuales — comportamiento EXACTO
+    de hoy.
+    """
+    try:
+        from src.llm.compiler import get_active_prompt
+
+        artifact = get_active_prompt(session, model_name, task_key)
+        if artifact is not None and artifact.prompt_text and artifact.user_template:
+            return artifact.prompt_text, artifact.user_template
+    except Exception:  # noqa: BLE001 — degradación natural
+        pass
+    return system_fallback, user_fallback
 
 
 def _fill(template: str, **kwargs) -> str:
@@ -601,6 +629,7 @@ def _index_document_analysis(
     doc_text: str,
     content_hash: str,
     verbose: bool = False,
+    doc_row_id: int | None = None,
 ) -> tuple[int, list[dict]]:
     """Pasos 1+2 unificados: ficha + capítulos + resumen global + entidades.
 
@@ -609,6 +638,9 @@ def _index_document_analysis(
     (documents.summary), la estructura de capítulos con micro-resúmenes y las
     entidades rectoras. Inserta la fila en `documents` (status='pending') y
     los capítulos en `document_chapters`.
+
+    Si `doc_row_id` se provee (reanudación desde la etapa 'analysis'), se
+    actualiza la fila existente en vez de insertar una nueva.
 
     Degradación crítica: si la llamada unificada falla (data vacío o sin
     `chapters`), se insertan los defaults crudos EXACTOS de hoy — ficha con
@@ -625,8 +657,11 @@ def _index_document_analysis(
     settings = load_settings(session)
     small_model = getattr(settings, "small_model", None) if settings else None
 
+    system, user_template = _get_prompt_pair(
+        session, small_model, TASK_DOCUMENT_ANALYSIS, ANALYSIS_SYSTEM, ANALYSIS_USER
+    )
     prompt = _fill(
-        ANALYSIS_USER,
+        user_template,
         source_file=source_file,
         document_id=document_id,
         line_start=line_start,
@@ -636,9 +671,7 @@ def _index_document_analysis(
     data = _llm_json(
         session,
         prompt,
-        _get_system_prompt(
-            session, small_model, TASK_DOCUMENT_ANALYSIS, ANALYSIS_SYSTEM
-        ),
+        system,
         model_size="small",
     )
     data = _enrich_library_of_congress(data)
@@ -659,33 +692,63 @@ def _index_document_analysis(
         key_entities = []
     summary = str(data.get("summary") or "")
 
-    doc_row_id = session.execute(
-        text(
-            "INSERT INTO documents "
-            "(source_file, document_id, title, technical_level, bibtex, "
-            "thematic_areas_iso25964, library_of_congress, key_entities, "
-            "scope_thematic, summary, line_start, line_end, status, content_hash) "
-            "VALUES (:source_file, :document_id, :title, :technical_level, :bibtex, "
-            "CAST(:thematic AS jsonb), CAST(:loc AS jsonb), CAST(:key_entities AS jsonb), "
-            ":scope_thematic, :summary, :line_start, :line_end, 'pending', :content_hash) "
-            "RETURNING id"
-        ),
-        {
-            "source_file": source_file,
-            "document_id": document_id,
-            "title": title,
-            "technical_level": technical_level,
-            "bibtex": str(data.get("bibtex") or ""),
-            "thematic": json.dumps(thematic, ensure_ascii=False),
-            "loc": json.dumps(loc, ensure_ascii=False),
-            "key_entities": json.dumps(key_entities, ensure_ascii=False),
-            "scope_thematic": _scope_thematic_from_thematic(thematic),
-            "summary": summary,
-            "line_start": line_start,
-            "line_end": line_end,
-            "content_hash": content_hash,
-        },
-    ).scalar()
+    if doc_row_id is None:
+        doc_row_id = session.execute(
+            text(
+                "INSERT INTO documents "
+                "(source_file, document_id, title, technical_level, bibtex, "
+                "thematic_areas_iso25964, library_of_congress, key_entities, "
+                "scope_thematic, summary, line_start, line_end, status, content_hash) "
+                "VALUES (:source_file, :document_id, :title, :technical_level, :bibtex, "
+                "CAST(:thematic AS jsonb), CAST(:loc AS jsonb), CAST(:key_entities AS jsonb), "
+                ":scope_thematic, :summary, :line_start, :line_end, 'pending', :content_hash) "
+                "RETURNING id"
+            ),
+            {
+                "source_file": source_file,
+                "document_id": document_id,
+                "title": title,
+                "technical_level": technical_level,
+                "bibtex": str(data.get("bibtex") or ""),
+                "thematic": json.dumps(thematic, ensure_ascii=False),
+                "loc": json.dumps(loc, ensure_ascii=False),
+                "key_entities": json.dumps(key_entities, ensure_ascii=False),
+                "scope_thematic": _scope_thematic_from_thematic(thematic),
+                "summary": summary,
+                "line_start": line_start,
+                "line_end": line_end,
+                "content_hash": content_hash,
+            },
+        ).scalar()
+    else:
+        session.execute(
+            text(
+                "UPDATE documents SET source_file = :source_file, "
+                "title = :title, technical_level = :technical_level, "
+                "bibtex = :bibtex, thematic_areas_iso25964 = CAST(:thematic AS jsonb), "
+                "library_of_congress = CAST(:loc AS jsonb), "
+                "key_entities = CAST(:key_entities AS jsonb), "
+                "scope_thematic = :scope_thematic, summary = :summary, "
+                "line_start = :line_start, line_end = :line_end, "
+                "status = 'pending', content_hash = :content_hash, "
+                "updated_at = now() WHERE id = :id"
+            ),
+            {
+                "source_file": source_file,
+                "title": title,
+                "technical_level": technical_level,
+                "bibtex": str(data.get("bibtex") or ""),
+                "thematic": json.dumps(thematic, ensure_ascii=False),
+                "loc": json.dumps(loc, ensure_ascii=False),
+                "key_entities": json.dumps(key_entities, ensure_ascii=False),
+                "scope_thematic": _scope_thematic_from_thematic(thematic),
+                "summary": summary,
+                "line_start": line_start,
+                "line_end": line_end,
+                "content_hash": content_hash,
+                "id": doc_row_id,
+            },
+        )
 
     # --- Capítulos (degradación: capítulo único con todo el rango) ---
     chapters = data.get("chapters") or []
@@ -798,9 +861,16 @@ def _index_propositional_chunks(
             continue
 
         context_blocks = _split_text_blocks(chapter_text, ch_start, MAX_CONTEXT_CHARS)
+        system, user_template = _get_prompt_pair(
+            session,
+            small_model,
+            TASK_PROPOSITIONAL_CHUNKING,
+            PROPOSITIONAL_SYSTEM,
+            PROPOSITIONAL_USER,
+        )
         for block_text, block_start, block_end in context_blocks:
             prompt = _fill(
-                PROPOSITIONAL_USER,
+                user_template,
                 source_file=source_file,
                 document_id=document_id,
                 chapter_index=ch_index,
@@ -812,12 +882,7 @@ def _index_propositional_chunks(
             data = _llm_json(
                 session,
                 prompt,
-                _get_system_prompt(
-                    session,
-                    small_model,
-                    TASK_PROPOSITIONAL_CHUNKING,
-                    PROPOSITIONAL_SYSTEM,
-                ),
+                system,
                 model_size="small",
             )
             core_ideas = data.get("core_ideas") if isinstance(data, dict) else None
@@ -970,8 +1035,11 @@ def _index_topic_tree(
         start_chunk_id = int(cluster_rows[0].id)
         end_chunk_id = int(cluster_rows[-1].id)
 
+        system, user_template = _get_prompt_pair(
+            session, small_model, TASK_TOPIC_LABEL, TOPIC_LABEL_SYSTEM, TOPIC_LABEL_USER
+        )
         prompt = _fill(
-            TOPIC_LABEL_USER,
+            user_template,
             source_file=source_file,
             document_id=document_id,
             sequential_order=order,
@@ -983,9 +1051,7 @@ def _index_topic_tree(
         data = _llm_json(
             session,
             prompt,
-            _get_system_prompt(
-                session, small_model, TASK_TOPIC_LABEL, TOPIC_LABEL_SYSTEM
-            ),
+            system,
             model_size="small",
         )
 
@@ -1038,19 +1104,12 @@ def _index_topic_tree(
 # ---------------------------------------------------------------------
 
 
-def _describe_image(session, prompt: str, image_path: str, caption: str) -> dict:
+def _describe_image(session, prompt: str, system: str, image_path: str) -> dict:
     """Describe una imagen con el VLM vía complete_vision (data URL base64).
 
     Mismo patrón que describe_figure en kag_ingest.py. Devuelve {} si falla
     (la imagen se registra igual, con descripción vacía).
     """
-    vision_model = None
-    try:
-        from src.llm.together import get_vision_model
-
-        vision_model = get_vision_model(session)
-    except Exception:  # noqa: BLE001 — sin DB: fallback a la constante
-        pass
     try:
         from src.llm.together import complete_vision
 
@@ -1062,9 +1121,7 @@ def _describe_image(session, prompt: str, image_path: str, caption: str) -> dict
             session,
             prompt,
             image_url=data_url,
-            system=_get_system_prompt(
-                session, vision_model, TASK_VISION_ANALYSIS, VISION_SYSTEM
-            ),
+            system=system,
             response_format={"type": "json_object"},
         )
         return parse_llm_output(text_out)
@@ -1099,6 +1156,16 @@ def _index_images(
         return 0
 
     count = 0
+    vision_model = None
+    try:
+        from src.llm.together import get_vision_model
+
+        vision_model = get_vision_model(session)
+    except Exception:  # noqa: BLE001 — sin DB: fallback a la constante
+        pass
+    system, user_template = _get_prompt_pair(
+        session, vision_model, TASK_VISION_ANALYSIS, VISION_SYSTEM, VISION_USER
+    )
     for img in images:
         if not img.get("exists_on_disk"):
             continue
@@ -1112,13 +1179,13 @@ def _index_images(
             doc_text, line_start, anchor_line, CONTEXT_RADIUS_LINES
         )
         prompt = _fill(
-            VISION_USER,
+            user_template,
             document_id=document_id,
             anchor_line=anchor_line,
             markdown_tag=markdown_tag,
             surrounding_text_context=context,
         )
-        data = _describe_image(session, prompt, file_path, caption)
+        data = _describe_image(session, prompt, system, file_path)
 
         faq = data.get("faq_indexing") or []
         if not isinstance(faq, list):
@@ -1165,7 +1232,17 @@ def _index_images(
 def _index_document(
     session, md_path: Path, doc_info: dict, force: bool = False, verbose: bool = False
 ) -> dict:
-    """Procesa un documento detectado por MultibookFinderTool (pasos 1-6)."""
+    """Procesa un documento detectado por MultibookFinderTool (pasos 1-6).
+
+    Atomicidad POR ETAPA (máquina de estados, src/kag/stages.py):
+      detected -> analysis -> chunks -> topic_tree -> images -> ready
+
+    Cada etapa commitea su trabajo y actualiza `stage`. Si el proceso se
+    interrumpe (p. ej. durante el chunking proposicional, que es lento), al
+    reanudar se saltan las etapas ya completadas y se continúa desde la
+    interrumpida (con limpieza idempotente de los datos parciales de esa
+    etapa).
+    """
     document_id = doc_info["document_id"]
     line_start = int(doc_info["line_start"])
     line_end = int(doc_info["line_end"])
@@ -1176,7 +1253,10 @@ def _index_document(
 
     # Idempotencia: mismo hash + status='ready' -> salta (log).
     existing = session.execute(
-        text("SELECT id, content_hash, status FROM documents WHERE document_id = :did"),
+        text(
+            "SELECT id, content_hash, status, stage FROM documents "
+            "WHERE document_id = :did"
+        ),
         {"did": document_id},
     ).first()
     if (
@@ -1189,31 +1269,112 @@ def _index_document(
             print(f"[KAG-P] ⏭ {document_id} ya indexado (hash idéntico).")
         return {"status": "skipped", "document_id": document_id}
 
-    if existing:
+    if existing and (force or existing.content_hash != content_hash):
+        # Fuerza o hash cambiado: borrar y empezar de cero.
         session.execute(
             text("DELETE FROM documents WHERE id = :id"), {"id": existing.id}
         )
         session.commit()
+        existing = None
 
-    doc_row_id, chapters = _index_document_analysis(
-        session, md_path, doc_info, doc_text, content_hash, verbose
-    )
-    chunk_count = _index_propositional_chunks(
-        session, md_path, doc_info, doc_text, doc_row_id, chapters, verbose
-    )
-    topic_count = _index_topic_tree(session, md_path, doc_info, doc_row_id, verbose)
-    image_count = _index_images(
-        session, md_path, doc_info, doc_text, doc_row_id, verbose
-    )
+    if existing:
+        # No está 'ready' (proceso interrumpido): reanudar desde la última
+        # etapa completada (NO se borra nada — la máquina de estados salta
+        # lo ya hecho).
+        resume = resume_from(KAG_PROPOSITIONAL_STAGES, existing.stage or "detected")
+        doc_row_id = existing.id
+        if verbose:
+            print(
+                f"[KAG-P] ♻ {document_id} en stage '{existing.stage}' — "
+                f"reanudando desde '{resume}'..."
+            )
+    else:
+        resume = "detected"
+        doc_row_id = None
 
-    # Paso 6 — Cierre.
+    # ── Etapa: analysis (ficha + capítulos) ────────────────────────────────
+    if resume in ("detected", "analysis"):
+        if resume == "analysis":
+            cleanup_stage(session, "documents", doc_row_id, "analysis")
+        doc_row_id, chapters = _index_document_analysis(
+            session,
+            md_path,
+            doc_info,
+            doc_text,
+            content_hash,
+            verbose,
+            doc_row_id=doc_row_id,
+        )
+        set_stage(session, "documents", doc_row_id, "analysis")
+    else:
+        # Reanudación desde una etapa posterior: recargar los capítulos.
+        chapter_rows = session.execute(
+            text(
+                "SELECT id, chapter_index, title, line_start, line_end "
+                "FROM document_chapters WHERE document_id = :did "
+                "ORDER BY chapter_index"
+            ),
+            {"did": doc_row_id},
+        ).fetchall()
+        chapters = [
+            {
+                "id": r.id,
+                "chapter_index": r.chapter_index,
+                "title": r.title,
+                "line_start": r.line_start,
+                "line_end": r.line_end,
+            }
+            for r in chapter_rows
+        ]
+
+    # ── Etapa: chunks (proposiciones atómicas + embeddings) ─────────────────
+    if resume in ("detected", "analysis", "chunks"):
+        if resume == "chunks":
+            cleanup_stage(session, "documents", doc_row_id, "chunks")
+        chunk_count = _index_propositional_chunks(
+            session, md_path, doc_info, doc_text, doc_row_id, chapters, verbose
+        )
+        set_stage(session, "documents", doc_row_id, "chunks")
+    else:
+        chunk_count = session.execute(
+            text("SELECT COUNT(*) FROM propositional_chunks WHERE document_id = :did"),
+            {"did": doc_row_id},
+        ).scalar()
+
+    # ── Etapa: topic_tree (árbol temático secuencial) ──────────────────────
+    if resume in ("detected", "analysis", "chunks", "topic_tree"):
+        if resume == "topic_tree":
+            cleanup_stage(session, "documents", doc_row_id, "topic_tree")
+        topic_count = _index_topic_tree(session, md_path, doc_info, doc_row_id, verbose)
+        set_stage(session, "documents", doc_row_id, "topic_tree")
+    else:
+        topic_count = session.execute(
+            text("SELECT COUNT(*) FROM topic_tree_nodes WHERE document_id = :did"),
+            {"did": doc_row_id},
+        ).scalar()
+
+    # ── Etapa: images (VLM + FAQ Reverse HyDE) ─────────────────────────────
+    if resume in ("detected", "analysis", "chunks", "topic_tree", "images"):
+        if resume == "images":
+            cleanup_stage(session, "documents", doc_row_id, "images")
+        image_count = _index_images(
+            session, md_path, doc_info, doc_text, doc_row_id, verbose
+        )
+        set_stage(session, "documents", doc_row_id, "images")
+    else:
+        image_count = session.execute(
+            text("SELECT COUNT(*) FROM document_images WHERE document_id = :did"),
+            {"did": doc_row_id},
+        ).scalar()
+
+    # ── Etapa: ready (cierre) ──────────────────────────────────────────────
     session.execute(
         text(
             "UPDATE documents SET status = 'ready', updated_at = now() WHERE id = :id"
         ),
         {"id": doc_row_id},
     )
-    session.commit()
+    set_stage(session, "documents", doc_row_id, "ready")
 
     if verbose:
         print(

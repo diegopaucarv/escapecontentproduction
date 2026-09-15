@@ -174,6 +174,26 @@ def _get_system_prompt(session, model_name: str, task_key: str, fallback: str) -
     return fallback
 
 
+def _get_prompt_pair(
+    session, model_name: str, task_key: str, system_fallback: str, user_fallback: str
+) -> tuple[str, str]:
+    """(system, user) desde el artefacto compilado, o los fallbacks actuales.
+
+    El artefacto (0021) congela el SYSTEM renderizado en `prompt_text` y el
+    USER template parametrizable en `user_template`. Sin artefacto (tests sin
+    DB) devuelve las constantes actuales — comportamiento EXACTO de hoy.
+    """
+    try:
+        from src.llm.compiler import get_active_prompt
+
+        artifact = get_active_prompt(session, model_name, task_key)
+        if artifact is not None and artifact.prompt_text and artifact.user_template:
+            return artifact.prompt_text, artifact.user_template
+    except Exception:  # noqa: BLE001 — degradación natural
+        pass
+    return system_fallback, user_fallback
+
+
 # ---------------------------------------------------------------------
 # Clasificación de la consulta
 # ---------------------------------------------------------------------
@@ -416,19 +436,21 @@ def grounded_entity_linking(session, query: str) -> list:
     retries = int(getattr(settings, "llm_retries", 3) or 3) if settings else 3
     fallback = getattr(settings, "fallback_model", None) if settings else None
     small_model = getattr(settings, "small_model", None) if settings else None
+    system, user_template = _get_prompt_pair(
+        session,
+        small_model,
+        TASK_GROUNDED_ENTITIES,
+        GROUNDED_ENTITIES_SYSTEM_SHORT,
+        GROUNDED_ENTITIES_PROMPT,
+    )
     try:
         text_out, _model, _used_fallback = call_with_retries(
             session,
-            prompt=GROUNDED_ENTITIES_PROMPT.format(
+            prompt=user_template.format(
                 candidates="\n".join(f"- {c}" for c in candidates),
                 query=query,
             ),
-            system=_get_system_prompt(
-                session,
-                small_model,
-                TASK_GROUNDED_ENTITIES,
-                GROUNDED_ENTITIES_SYSTEM_SHORT,
-            ),
+            system=system,
             model_size="small",
             response_format={"type": "json_object"},
             retries=retries,
@@ -888,7 +910,7 @@ def chunks_by_ids(session, chunk_ids):
             "JOIN kag_documents d ON d.id = c.doc_id "
             "WHERE c.id = ANY(:ids) AND d.status = 'ready' "
             "ORDER BY array_position(:ids, c.id)"
-        ).bindparams(bindparam("ids", expanding=True)),
+        ),
         {"ids": ids},
     ).fetchall()
     by_id = {r.id: r for r in rows}
@@ -1185,13 +1207,18 @@ def critic_regex_search(session, query, top_k=10, verbose=False):
     retries = int(getattr(settings, "llm_retries", 3) or 3) if settings else 3
     fallback = getattr(settings, "fallback_model", None) if settings else None
     small_model = getattr(settings, "small_model", None) if settings else None
+    system, user_template = _get_prompt_pair(
+        session,
+        small_model,
+        TASK_CRITIC_REGEX,
+        CRITIC_SYSTEM_SHORT,
+        CRITIC_PROMPT,
+    )
     try:
         text_out, _model, _used_fallback = call_with_retries(
             session,
-            prompt=CRITIC_PROMPT.format(query=query),
-            system=_get_system_prompt(
-                session, small_model, TASK_CRITIC_REGEX, CRITIC_SYSTEM_SHORT
-            ),
+            prompt=user_template.format(query=query),
+            system=system,
             model_size="small",
             response_format={"type": "json_object"},
             retries=retries,
@@ -1283,17 +1310,22 @@ def critic_and_linking(session, query, top_k=10, verbose=False):
     small_model = getattr(settings, "small_model", None) if settings else None
     terms = None
     names = None
+    system, user_template = _get_prompt_pair(
+        session,
+        small_model,
+        TASK_CRITIC_LINKING,
+        COMBINED_SYSTEM_SHORT,
+        COMBINED_PROMPT,
+    )
     try:
         text_out, _model, _used_fallback = call_with_retries(
             session,
-            prompt=COMBINED_PROMPT.format(
+            prompt=user_template.format(
                 candidates="\n".join(f"- {c}" for c in candidates)
                 or "(sin candidatos)",
                 query=query,
             ),
-            system=_get_system_prompt(
-                session, small_model, TASK_CRITIC_LINKING, COMBINED_SYSTEM_SHORT
-            ),
+            system=system,
             model_size="small",
             response_format={"type": "json_object"},
             retries=retries,
@@ -1435,13 +1467,14 @@ def generate_answer(session, context, query):
     retries = int(getattr(settings, "llm_retries", 3) or 3) if settings else 3
     fallback = getattr(settings, "fallback_model", None) if settings else None
     large_model = getattr(settings, "large_model", None) if settings else None
+    system, user_template = _get_prompt_pair(
+        session, large_model, TASK_QUERY_ANSWER, ANSWER_SYSTEM_SHORT, ANSWER_PROMPT
+    )
     try:
         text_out, _model, _used_fallback = call_with_retries(
             session,
-            prompt=ANSWER_PROMPT.format(context=context, query=query),
-            system=_get_system_prompt(
-                session, large_model, TASK_QUERY_ANSWER, ANSWER_SYSTEM_SHORT
-            ),
+            prompt=user_template.format(context=context, query=query),
+            system=system,
             model_size="large",
             response_format=None,
             retries=retries,

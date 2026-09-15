@@ -36,6 +36,17 @@ KAG_TEMPLATES = [
     # --- A. src/kag_propositional.py -----------------------------------
     {
         "task_key": "kag_metadata",
+        "user_template": """Archivo: {source_file}
+ID de Documento: {document_id}
+Rango de Líneas: {line_start} a {line_end}
+
+Contenido inicial del documento:
+---
+{document_head_snippet}
+---
+
+Genera el JSON estricto con este schema:
+{"source_file": str, "document_id": str, "title": str, "technical_level": "introductory|intermediate|advanced|research", "bibtex": str, "thematic_areas_iso25964": [{"preferred_term": str, "non_preferred_terms": [str], "scope_note_disambiguation": str, "broader_term": str, "narrower_term": str, "related_terms": [str]}], "library_of_congress": {"lcsh_terms": [{"term": str, "uri": str}], "lcc_classification": {"class_code": str, "class_title": str, "uri": str}}, "key_entities": [str]}""",
         "version": "1.0",
         "intent": (
             "Eres un indexador bibliografico especializado en Ciencias Sociales "
@@ -78,6 +89,14 @@ KAG_TEMPLATES = [
     },
     {
         "task_key": "kag_chapters",
+        "user_template": """Archivo maestro: {source_file}
+ID de documento: {document_id}
+Límites del documento: {line_start} a {line_end}
+
+Líneas del documento numeradas:
+{numbered_text_block}
+
+Devuelve el JSON: {"source_file": str, "document_id": str, "total_chapters": int, "chapters": [{"chapter_index": int, "title": str, "line_start": int, "line_end": int, "main_theme": str, "subsections": [{"title": str, "line_start": int, "line_end": int}]}]}""",
         "version": "1.0",
         "intent": (
             "Eres un parser de estructura textual. Analizas el archivo Markdown "
@@ -116,6 +135,17 @@ KAG_TEMPLATES = [
     },
     {
         "task_key": "kag_document_analysis",
+        "user_template": """Archivo: {source_file}
+ID de Documento: {document_id}
+Rango de Líneas: {line_start} a {line_end}
+
+Esqueleto del documento (primeras líneas + encabezados H1/H2/H3 con su número de línea real):
+---
+{document_skeleton}
+---
+
+Genera el JSON estricto con este schema:
+{"source_file": str, "document_id": str, "title": str, "technical_level": "introductory|intermediate|advanced|research", "bibtex": str, "thematic_areas_iso25964": [{"preferred_term": str, "non_preferred_terms": [str], "scope_note_disambiguation": str, "broader_term": str, "narrower_term": str, "related_terms": [str]}], "library_of_congress": {"lcsh_terms": [{"term": str, "uri": str}], "lcc_classification": {"class_code": str, "class_title": str, "uri": str}}, "key_entities": [str], "summary": str, "chapters": [{"chapter_index": int, "title": str, "line_start": int, "line_end": int, "main_theme": str, "summary": str, "subsections": [{"title": str, "line_start": int, "line_end": int}]}]}""",
         "version": "1.0",
         "intent": (
             "Eres un indexador bibliografico especializado en Ciencias Sociales "
@@ -181,6 +211,17 @@ KAG_TEMPLATES = [
     },
     {
         "task_key": "kag_propositional_chunking",
+        "user_template": """Archivo: {source_file}
+Documento: {document_id}
+Capítulo: {chapter_index} - {chapter_title}
+Rango: Línea {line_start} a Línea {line_end}
+
+Texto a procesar:
+---
+{chapter_text_content}
+---
+
+Genera el JSON: {"source_file": str, "document_id": str, "chapter_index": int, "chapter_title": str, "core_ideas": [{"core_idea_id": str, "central_claim": str, "supporting_arguments": [{"argument_id": str, "argument_type": "empirical_evidence|theoretical_deduction|methodological_critique|comparative_analysis", "argument_statement": str, "propositional_chunks": [{"chunk_id": str, "proposition": str, "verbatim_span": str, "line_start": int, "line_end": int, "char_start": int, "char_end": int, "citations_references": [str]}]}]}]}""",
         "version": "1.0",
         "intent": (
             "Eres un analista de epistemologia y analisis del discurso. Tu objetivo "
@@ -232,6 +273,18 @@ KAG_TEMPLATES = [
     },
     {
         "task_key": "kag_topic_label",
+        "user_template": """Archivo: {source_file}
+Documento: {document_id}
+Orden secuencial: Fase {sequential_order}
+Palabras representativas c-TF-IDF: {top_ctfidf_keywords}
+Rango de chunks: {start_chunk_id} a {end_chunk_id}
+
+Proposiciones constitutivas del cluster:
+---
+{cluster_statements_text}
+---
+
+Genera el JSON: {"source_file": str, "document_id": str, "sequential_order": int, "macro_phase_label": str, "representative_keywords": [str], "start_chunk_id": str, "end_chunk_id": str, "epistemic_summary": str}""",
         "version": "1.0",
         "intent": (
             "Eres un analista bibliometrico y de modelado de topicos. Se te presenta "
@@ -278,6 +331,15 @@ KAG_TEMPLATES = [
     },
     {
         "task_key": "kag_vision_analysis",
+        "user_template": """Documento: {document_id}
+Línea de inserción: {anchor_line}
+Etiqueta Markdown original: {markdown_tag}
+Texto de contexto circundante (±15 líneas):
+---
+{surrounding_text_context}
+---
+
+Examina la imagen cargada y devuelve el JSON: {"image_id": str, "document_id": str, "file_path": str, "anchor_line": int, "caption": str, "image_type": "diagram|chart_or_plot|flowchart|conceptual_illustration|screenshot|table_image|photograph", "dense_visual_description": str, "epistemic_contribution": str, "faq_indexing": [str], "associated_entities": [str]}""",
         "version": "1.0",
         "intent": (
             "Eres un asistente de investigacion visual especializado en analisis de "
@@ -326,6 +388,12 @@ KAG_TEMPLATES = [
     # --- B. src/kag_agents.py -------------------------------------------
     {
         "task_key": "kag_synthesis",
+        "user_template": """Consulta del usuario: "{query}"
+
+Fragmentos recuperados para análisis:
+{candidate_chunks_json}
+
+Devuelve el JSON: {{"query": str, "total_chunks_processed": int, "synthesized_facts": [{{"chunk_id": str, "document_id": str, "source_file": str, "relevance_level": "direct_answer|supporting_evidence|contextual_background|irrelevant", "atomic_summary": str, "verbatim_evidence": str, "academic_citations": [str]}}]}}""",
         "version": "1.0",
         "intent": (
             "Eres un agente de consolidacion factual de alta precision. Tu tarea es "
@@ -367,6 +435,12 @@ KAG_TEMPLATES = [
     },
     {
         "task_key": "kag_contradictions",
+        "user_template": """Consulta: "{query}"
+
+Hechos sintetizados:
+{synthesized_facts_json}
+
+Devuelve el JSON: {{"contradictions_detected": bool, "analysis_cases": [{{"conflict_type": "paradigmatic_theoretical_divergence|empirical_contextual_boundary|temporal_diachronic_shift|terminological_homonymy", "divergence_summary": str, "thesis_a": {{"proposition_id": str, "document_id": str, "claim": str, "author_or_framework": str, "empirical_context": str}}, "thesis_b": {{"proposition_id": str, "document_id": str, "claim": str, "author_or_framework": str, "empirical_context": str}}, "epistemic_reconciliation": str}}]}}""",
         "version": "1.0",
         "intent": (
             "Eres un analista epistemologico. En ciencias sociales las "
@@ -400,6 +474,18 @@ KAG_TEMPLATES = [
     },
     {
         "task_key": "kag_sufficiency",
+        "user_template": """Consulta: "{query}"
+
+Metadatos del Corpus Disponible (Descriptores ISO 25964 y LCC presentes en DB):
+{active_corpus_metadata}
+
+Proposiciones recuperadas (Nivel 1):
+{synthesized_propositions_json}
+
+Contextos escalados (Nivel 2, si aplicó):
+{parent_contexts_json}
+
+Emite tu evaluación formal: {{"verdict": "SUFFICIENT_FOR_SYNTHESIS|INSUFFICIENT_TRIGGER_BRANCH_B|NEGATIVE_REJECTION", "confidence_score": float, "negative_rejection_details": {{"reason": "out_of_thematic_scope_iso25964|classification_mismatch_lcc|total_absence_in_knowledge_graph|unsupported_technical_granularity", "closest_available_topics": [str], "formal_abstention_statement": str}}, "branch_b_instructions": {{"unresolved_subqueries": [str], "target_thesaurus_concepts": [str]}}}}""",
         "version": "1.0",
         "intent": (
             "Eres el Agente Auditor Epistemologico de un sistema de recuperacion "
@@ -445,6 +531,13 @@ KAG_TEMPLATES = [
     },
     {
         "task_key": "kag_answer",
+        "user_template": """Consulta del usuario: "{query}"
+
+Evidencia verificada (grounded_evidence):
+{grounded_evidence_json}
+
+Tensiones epistémicas (epistemic_tensions):
+{epistemic_tensions_json}""",
         "version": "1.0",
         "intent": (
             "Eres un asistente de conocimiento con estandares epistemicos estrictos. "
@@ -478,6 +571,17 @@ KAG_TEMPLATES = [
     # --- C. src/kag_query.py --------------------------------------------
     {
         "task_key": "kag_grounded_entities",
+        "user_template": """Entidades candidatas del grafo de conocimiento:
+{candidates}
+
+Pregunta: {query}
+
+Devuelve SOLO JSON:
+{{"entities": ["Entidad 1", "Entidad 2"]}}
+
+Elige SOLO de la lista de candidatas. Si ninguna se menciona en la
+pregunta, devuelve {{"entities": []}}.
+""",
         "version": "1.0",
         "intent": (
             "Eres un selector de entidades. Seleccionas las entidades canonicas del "
@@ -500,6 +604,21 @@ KAG_TEMPLATES = [
     },
     {
         "task_key": "kag_critic_regex",
+        "user_template": """Eres un crítico de búsqueda. Dada una pregunta, decide si
+contiene términos EXACTOS que requieren búsqueda textual (regex/FTS) en vez
+de búsqueda semántica: nombres propios, países, ciudades, organizaciones,
+códigos alfanuméricos (CVE-2024-3094, SKU-123), acrónimos, fechas, cifras,
+identificadores o términos técnicos raros.
+
+Devuelve SOLO JSON:
+{{"needs_regex": true/false, "terms": ["término1", "término2"]}}
+
+- needs_regex: true si hay al menos un término exacto que buscar.
+- terms: los términos exactos (máx 5), tal como aparecen en la pregunta.
+- Si no hay términos exactos, devuelve {{"needs_regex": false, "terms": []}}.
+
+Pregunta: {query}
+""",
         "version": "1.0",
         "intent": (
             "Eres un critico de busqueda. Dada una pregunta, decides si contiene "
@@ -531,6 +650,30 @@ KAG_TEMPLATES = [
     },
     {
         "task_key": "kag_critic_linking",
+        "user_template": """Eres un crítico de búsqueda y selector de entidades.
+Dada una pregunta:
+
+1. Decide si contiene términos EXACTOS que requieren búsqueda textual
+   (regex/FTS): nombres propios, países, ciudades, organizaciones, códigos
+   alfanuméricos (CVE-2024-3094, SKU-123), acrónimos, fechas, cifras,
+   identificadores o términos técnicos raros.
+2. Selecciona las entidades canónicas SOLO entre los candidatos del grafo
+   que se mencionan en la pregunta.
+
+Candidatos del grafo:
+{candidates}
+
+Devuelve SOLO JSON:
+{{"needs_regex": true/false, "terms": ["término1"], "entities": ["Entidad 1"]}}
+
+- needs_regex: true si hay al menos un término exacto que buscar.
+- terms: los términos exactos (máx 5), tal como aparecen en la pregunta.
+- entities: las entidades de la lista de candidatos que se mencionan en la
+  pregunta. Si ninguna, [].
+- Si no hay términos exactos, devuelve {{"needs_regex": false, "terms": []}}.
+
+Pregunta: {query}
+""",
         "version": "1.0",
         "intent": (
             "Eres un critico de busqueda y selector de entidades. Dada una pregunta, "
@@ -568,6 +711,12 @@ KAG_TEMPLATES = [
     },
     {
         "task_key": "kag_query_answer",
+        "user_template": """Contexto:
+{context}
+
+Pregunta: {query}
+
+Responde con precisión basándote en el contexto.""",
         "version": "1.0",
         "intent": (
             "Eres un asistente de conocimiento. Responde la pregunta del usuario "
@@ -590,6 +739,28 @@ KAG_TEMPLATES = [
     # --- D. src/kag_ingest.py --------------------------------------------
     {
         "task_key": "kag_extract_entities",
+        "user_template": """Extrae las entidades y relaciones del siguiente fragmento de texto.
+
+Devuelve SOLO JSON con esta forma exacta:
+{
+  "entities": [
+    {"name": "Nombre de la entidad", "type": "concept|method|law|person|org|figure", "description": "breve descripción"}
+  ],
+  "relations": [
+    {"source": "Entidad origen", "target": "Entidad destino", "type": "RELACIÓN_EN_MAYÚSCULAS", "description": "breve descripción"}
+  ]
+}
+
+Reglas:
+- Entidades: conceptos, métodos, leyes, personas, organizaciones o figuras relevantes.
+- Relaciones: solo entre entidades presentes en el fragmento.
+- Si no hay entidades, devuelve {"entities": [], "relations": []}.
+
+Texto:
+<text>
+{chunk}
+</text>
+""",
         "version": "1.0",
         "intent": (
             "Eres un extractor de conocimiento. Extraes las entidades y relaciones "
@@ -615,6 +786,11 @@ KAG_TEMPLATES = [
     },
     {
         "task_key": "kag_qwen_summary",
+        "user_template": """<text>
+{text}
+</text>
+
+Summary:""",
         "version": "1.0",
         "intent": (
             "You are a summarization assistant. You produce a single-sentence "
