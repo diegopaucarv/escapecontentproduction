@@ -528,12 +528,15 @@ def _store_entities_relations(session, doc_id, chunk_id, data):
     norms = [n for n in norms if n]
     existing = {}
     if norms:
+        norms_dedup = list(dict.fromkeys(norms))
+        print(f"[KAG-DEBUG] doc_id={doc_id} chunk_id={chunk_id} norms={norms_dedup!r}")
+        print(f"[KAG-DEBUG] norms types: {[type(n).__name__ for n in norms_dedup]}")
         rows = session.execute(
             text(
                 "SELECT name_norm, id FROM kag_entities "
                 "WHERE doc_id = :doc_id AND name_norm = ANY(:norms)"
             ),
-            {"doc_id": doc_id, "norms": list(dict.fromkeys(norms))},
+            {"doc_id": doc_id, "norms": norms_dedup},
         ).fetchall()
         existing = {r.name_norm: r.id for r in rows}
 
@@ -1133,6 +1136,9 @@ def index_document(
             pass
         if verbose:
             print(f"[KAG] ❌ Error indexando {doc_path}: {exc}")
+            import traceback
+
+            traceback.print_exc()
         raise
 
 
