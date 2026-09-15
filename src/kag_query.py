@@ -400,7 +400,34 @@ def _noun_chunk_fallback(session, query: str) -> list:
         for r in rows:
             if r.name not in found:
                 found.append(r.name)
-    return found[:10]
+    if found:
+        return found[:10]
+    # Sin matches por LIKE (p. ej. query en otro idioma que el grafo):
+    # devolver los noun chunks crudos (sin artículos) como candidatos. El
+    # entity linking los resolverá por similitud coseno (name_embedding).
+    raw = []
+    for phrase in phrases:
+        nn = normalize_entity_name(phrase)
+        # Quitar artículos/determinantes iniciales: "la cultura" -> "cultura".
+        for art in (
+            "el ",
+            "la ",
+            "los ",
+            "las ",
+            "un ",
+            "una ",
+            "unos ",
+            "unas ",
+            "the ",
+            "a ",
+            "an ",
+        ):
+            if nn.startswith(art):
+                nn = nn[len(art) :].strip()
+                break
+        if len(nn) >= 3 and nn not in raw:
+            raw.append(nn)
+    return raw[:10]
 
 
 # ---------------------------------------------------------------------
@@ -1291,8 +1318,10 @@ Dada una pregunta:
    (regex/FTS): nombres propios, países, ciudades, organizaciones, códigos
    alfanuméricos (CVE-2024-3094, SKU-123), acrónimos, fechas, cifras,
    identificadores o términos técnicos raros.
-2. Selecciona las entidades canónicas SOLO entre los candidatos del grafo
-   que se mencionan en la pregunta.
+2. Selecciona las entidades canónicas que se mencionan en la pregunta. Si la
+   lista de candidatos no está vacía, elige SOLO de ella. Si está vacía,
+   propón las entidades tú mismo: pueden estar en otro idioma que el grafo
+   (el sistema las resolverá por similitud).
 
 Candidatos del grafo:
 {candidates}
@@ -1303,7 +1332,8 @@ Devuelve SOLO JSON:
 - needs_regex: true si hay al menos un término exacto que buscar.
 - terms: los términos exactos (máx 5), tal como aparecen en la pregunta.
 - entities: las entidades de la lista de candidatos que se mencionan en la
-  pregunta. Si ninguna, [].
+  pregunta. Si la lista está vacía, propón las entidades relevantes tú mismo
+  (nombres canónicos, posiblemente en inglés). Si ninguna, [].
 - Si no hay términos exactos, devuelve {{"needs_regex": false, "terms": []}}.
 
 Pregunta: {query}
@@ -1360,8 +1390,8 @@ def critic_and_linking(session, query, top_k=10, verbose=False):
         ]
         # Anclaje: si el pool determinista está vacío (p. ej. query en otro
         # idioma que no matchea por léxico), confiamos en los nombres del LLM
-        # multilingüe tal cual — el embedding fallback los resolverá. Si hay
-        # pool, solo nombres anclados (normalizados).
+        # multilingüe tal cual — el match exacto/LIKE/embeddings los resuelve.
+        # Si hay pool, solo nombres anclados (normalizados).
         if not candidates:
             names = raw_names
         else:
