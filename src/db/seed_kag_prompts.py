@@ -610,16 +610,24 @@ de búsqueda semántica: nombres propios, países, ciudades, organizaciones,
 códigos alfanuméricos (CVE-2024-3094, SKU-123), acrónimos, fechas, cifras,
 identificadores o términos técnicos raros.
 
+El corpus es MULTILINGÜE. Para cada término exacto, incluye su traducción a
+TODOS los idiomas soportados: {languages}. Los códigos y nombres propios no
+se traducen (se repiten igual en todos los idiomas).
+
+Palabras muy frecuentes en el corpus (NO las propongas: matchearían
+demasiados chunks y no aportan precisión): {common_words}
+
 Devuelve SOLO JSON:
-{{"needs_regex": true/false, "terms": ["término1", "término2"]}}
+{{"needs_regex": true/false, "terms": ["término y sus traducciones..."]}}
 
 - needs_regex: true si hay al menos un término exacto que buscar.
-- terms: los términos exactos (máx 5), tal como aparecen en la pregunta.
+- terms: máx 3 términos, cada uno con su traducción a todos los idiomas
+  (ej. ["discriminación negativa", "negative discrimination", ...]).
 - Si no hay términos exactos, devuelve {{"needs_regex": false, "terms": []}}.
 
 Pregunta: {query}
 """,
-        "version": "1.0",
+        "version": "1.1",
         "intent": (
             "Eres un critico de busqueda. Dada una pregunta, decides si contiene "
             "terminos EXACTOS que requieren busqueda textual (regex/FTS) en vez de "
@@ -636,11 +644,22 @@ Pregunta: {query}
                 "needs_regex: true si hay al menos un termino exacto que buscar; "
                 "false en caso contrario"
             ),
-            "terms: los terminos exactos (max 5), tal como aparecen en la pregunta",
+            (
+                "El corpus es multilingue: cada termino exacto se traduce a TODOS "
+                "los idiomas soportados; los codigos y nombres propios no se "
+                "traducen"
+            ),
+            (
+                "No proponer palabras muy frecuentes del corpus (contexto "
+                "common_words): matchearian demasiados chunks"
+            ),
+            "terms: max 3 terminos, cada uno con su traduccion a todos los idiomas",
             "Salida JSON estricta con el schema indicado",
         ],
         "input_schema": {
             "query": "string",
+            "languages": "string",
+            "common_words": "string",
         },
         "output_schema": {
             "needs_regex": "boolean",
@@ -662,14 +681,22 @@ Dada una pregunta:
    o está vacía, propón entidades adicionales tú mismo (nombres canónicos,
    posiblemente en inglés — el sistema las resolverá por similitud).
 
+El corpus es MULTILINGÜE. Para cada término exacto, incluye su traducción a
+TODOS los idiomas soportados: {languages}. Los códigos y nombres propios no
+se traducen (se repiten igual en todos los idiomas).
+
+Palabras muy frecuentes en el corpus (NO las propongas: matchearían
+demasiados chunks y no aportan precisión): {common_words}
+
 Candidatos del grafo:
 {{candidates}}
 
 Devuelve SOLO JSON:
-{{"needs_regex": true/false, "terms": ["término1"], "entities": ["Entidad 1"]}}
+{{"needs_regex": true/false, "terms": ["término y sus traducciones..."], "entities": ["Entidad 1"]}}
 
 - needs_regex: true si hay al menos un término exacto que buscar.
-- terms: los términos exactos (máx 5), tal como aparecen en la pregunta.
+- terms: máx 3 términos, cada uno con su traducción a todos los idiomas
+  (ej. ["discriminación negativa", "negative discrimination", ...]).
 - entities: 3-5 entidades relevantes. Prefiere las de la lista de candidatos;
   si la lista es insuficiente o está vacía, propón entidades adicionales tú
   mismo (nombres canónicos, posiblemente en inglés). Si ninguna, [].
@@ -677,7 +704,7 @@ Devuelve SOLO JSON:
 
 Pregunta: {query}
 """,
-        "version": "1.0",
+        "version": "1.1",
         "intent": (
             "Eres un critico de busqueda y selector de entidades. Dada una pregunta, "
             "decides si contiene terminos EXACTOS que requieren busqueda textual "
@@ -696,14 +723,26 @@ Pregunta: {query}
                 "grafo que se mencionan en la pregunta; si ninguna, []"
             ),
             (
+                "El corpus es multilingue: cada termino exacto se traduce a TODOS "
+                "los idiomas soportados; los codigos y nombres propios no se "
+                "traducen"
+            ),
+            (
+                "No proponer palabras muy frecuentes del corpus (contexto "
+                "common_words): matchearian demasiados chunks"
+            ),
+            (
                 "needs_regex: true si hay al menos un termino exacto que buscar; "
-                "terms: los terminos exactos (max 5)"
+                "terms: max 3 terminos, cada uno con su traduccion a todos los "
+                "idiomas"
             ),
             "Salida JSON estricta con el schema indicado",
         ],
         "input_schema": {
             "candidates": "string",
             "query": "string",
+            "languages": "string",
+            "common_words": "string",
         },
         "output_schema": {
             "needs_regex": "boolean",
