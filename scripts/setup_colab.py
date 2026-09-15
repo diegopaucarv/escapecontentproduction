@@ -123,6 +123,11 @@ def _migrate_and_seed(together_key: str) -> None:
             "quedará sin api_key de Together)."
         )
     _run([py, "-m", "src.db.seed_kag"])
+    # Prompt-as-code: specs KAG (11) + compilación a prompt_artifacts.
+    # Sin esto el runtime cae a las constantes del código y NO usa la spec
+    # kag_proposition_chunking v2.0 (schema por divisiones del batching).
+    _run([py, "-m", "src.db.seed_kag_prompts"])
+    _run([py, "-m", "src.llm.compile_prompts"])
 
 
 def _ingest() -> None:
