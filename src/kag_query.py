@@ -536,7 +536,7 @@ def match_entities_candidates(session, names: list, embed_fn=None) -> list:
                         "JOIN kag_documents d ON d.id = e.doc_id "
                         "WHERE d.status = 'ready' AND e.name_embedding IS NOT NULL "
                         "ORDER BY e.name_embedding <=> CAST(:emb AS vector) "
-                        "LIMIT 3"
+                        "LIMIT 5"
                     ),
                     {"emb": embedding_to_sql(emb)},
                 ).fetchall()
@@ -1318,10 +1318,10 @@ Dada una pregunta:
    (regex/FTS): nombres propios, países, ciudades, organizaciones, códigos
    alfanuméricos (CVE-2024-3094, SKU-123), acrónimos, fechas, cifras,
    identificadores o términos técnicos raros.
-2. Selecciona las entidades canónicas que se mencionan en la pregunta. Si la
-   lista de candidatos no está vacía, elige SOLO de ella. Si está vacía,
-   propón las entidades tú mismo: pueden estar en otro idioma que el grafo
-   (el sistema las resolverá por similitud).
+2. Selecciona las entidades canónicas que se mencionan en la pregunta. Elige
+   de la lista de candidatos cuando sea posible; si la lista es insuficiente
+   o está vacía, propón entidades adicionales tú mismo (nombres canónicos,
+   posiblemente en inglés — el sistema las resolverá por similitud).
 
 Candidatos del grafo:
 {candidates}
@@ -1331,9 +1331,9 @@ Devuelve SOLO JSON:
 
 - needs_regex: true si hay al menos un término exacto que buscar.
 - terms: los términos exactos (máx 5), tal como aparecen en la pregunta.
-- entities: las entidades de la lista de candidatos que se mencionan en la
-  pregunta. Si la lista está vacía, propón las entidades relevantes tú mismo
-  (nombres canónicos, posiblemente en inglés). Si ninguna, [].
+- entities: 3-5 entidades relevantes. Prefiere las de la lista de candidatos;
+  si la lista es insuficiente o está vacía, propón entidades adicionales tú
+  mismo (nombres canónicos, posiblemente en inglés). Si ninguna, [].
 - Si no hay términos exactos, devuelve {{"needs_regex": false, "terms": []}}.
 
 Pregunta: {query}
@@ -1388,17 +1388,13 @@ def critic_and_linking(session, query, top_k=10, verbose=False):
         raw_names = [
             str(e).strip() for e in (data.get("entities") or []) if str(e).strip()
         ]
-        # Anclaje: si el pool determinista está vacío (p. ej. query en otro
-        # idioma que no matchea por léxico), confiamos en los nombres del LLM
-        # multilingüe tal cual — el match exacto/LIKE/embeddings los resuelve.
-        # Si hay pool, solo nombres anclados (normalizados).
-        if not candidates:
-            names = raw_names
-        else:
-            pool_norm = {normalize_entity_name(c) for c in candidates}
-            anchored = [n for n in raw_names if normalize_entity_name(n) in pool_norm]
-            if anchored:
-                names = anchored
+        # Fusión de candidatos: anclados al pool + propuestas del LLM
+        # (multilingüe, puede proponer nombres en el idioma del grafo) + pool
+        # determinista. Más candidatos → más chances de resolver el cruce de
+        # idiomas; la desambiguación por copresencia filtra el ruido.
+        pool_norm = {normalize_entity_name(c) for c in candidates}
+        anchored = [n for n in raw_names if normalize_entity_name(n) in pool_norm]
+        names = list(dict.fromkeys(anchored + raw_names + candidates))[:12]
     except Exception:  # noqa: BLE001 — LLM no disponible: degradación
         pass
     if not terms:

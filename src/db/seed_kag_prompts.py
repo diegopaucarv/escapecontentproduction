@@ -657,10 +657,10 @@ Dada una pregunta:
    (regex/FTS): nombres propios, países, ciudades, organizaciones, códigos
    alfanuméricos (CVE-2024-3094, SKU-123), acrónimos, fechas, cifras,
    identificadores o términos técnicos raros.
-2. Selecciona las entidades canónicas que se mencionan en la pregunta. Si la
-   lista de candidatos no está vacía, elige SOLO de ella. Si está vacía,
-   propón las entidades tú mismo: pueden estar en otro idioma que el grafo
-   (el sistema las resolverá por similitud).
+2. Selecciona las entidades canónicas que se mencionan en la pregunta. Elige
+   de la lista de candidatos cuando sea posible; si la lista es insuficiente
+   o está vacía, propón entidades adicionales tú mismo (nombres canónicos,
+   posiblemente en inglés — el sistema las resolverá por similitud).
 
 Candidatos del grafo:
 {{candidates}}
@@ -670,9 +670,9 @@ Devuelve SOLO JSON:
 
 - needs_regex: true si hay al menos un término exacto que buscar.
 - terms: los términos exactos (máx 5), tal como aparecen en la pregunta.
-- entities: las entidades de la lista de candidatos que se mencionan en la
-  pregunta. Si la lista está vacía, propón las entidades relevantes tú mismo
-  (nombres canónicos, posiblemente en inglés). Si ninguna, [].
+- entities: 3-5 entidades relevantes. Prefiere las de la lista de candidatos;
+  si la lista es insuficiente o está vacía, propón entidades adicionales tú
+  mismo (nombres canónicos, posiblemente en inglés). Si ninguna, [].
 - Si no hay términos exactos, devuelve {{"needs_regex": false, "terms": []}}.
 
 Pregunta: {query}

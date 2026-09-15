@@ -1723,10 +1723,10 @@ def test_critic_and_linking_llm_fails_degrades(monkeypatch):
     assert hits == [(7, 3.0)]
 
 
-def test_critic_and_linking_discards_out_of_pool_entities(monkeypatch):
+def test_critic_and_linking_merges_llm_and_pool_entities(monkeypatch):
     import src.kag_query as kq
 
-    # Pool: solo "Red Neuronal". El LLM alucina "Red de Petri" (fuera del pool).
+    # Pool: solo "Red Neuronal". El LLM propone "Red de Petri" (fuera del pool).
     session = _CombinedSession(
         like={"red": [(1, "Red Neuronal")], "neuronal": [(1, "Red Neuronal")]},
         hits_by_term={},
@@ -1763,8 +1763,9 @@ def test_critic_and_linking_discards_out_of_pool_entities(monkeypatch):
     hits, terms, names = kq.critic_and_linking(
         session, "¿Qué es la red neuronal?", top_k=5
     )
-    # "Red de Petri" no está en el pool → se descarta → cae al pool determinista.
-    assert names == ["Red Neuronal"]
+    # Fusión: propuesta del LLM (multilingüe) + pool determinista. La
+    # desambiguación por copresencia filtra el ruido aguas abajo.
+    assert names == ["Red de Petri", "Red Neuronal"]
     assert terms == []  # needs_regex false y sin términos exactos
     assert hits == []
 
