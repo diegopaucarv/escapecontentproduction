@@ -23,6 +23,8 @@ import re
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from pathlib import Path
 
 from sqlalchemy import bindparam, text
@@ -49,6 +51,7 @@ TASK_QUERY_ANSWER = "kag_query_answer"
 TASK_SYNTHESIS = "kag_synthesis"
 TASK_CONTRADICTIONS = "kag_contradictions"
 TASK_SUFFICIENCY = "kag_sufficiency"
+TASK_AUDIT_FUSED = "kag_audit_fused"
 TASK_ANSWER = "kag_answer"
 
 # System prompts cortos actuales — fallback EXACTO de hoy cuando no hay
@@ -70,6 +73,11 @@ SYNTHESIS_SYSTEM_SHORT = "Eres un agente de consolidación fáctica de alta prec
 CONTRADICTION_SYSTEM_SHORT = "Eres un analista epistemológico."
 SUFFICIENCY_SYSTEM_SHORT = (
     "Eres el Agente Auditor Epistemológico de un sistema de recuperación avanzada."
+)
+AUDIT_FUSED_SYSTEM_SHORT = (
+    "Eres el Agente Auditor Epistemológico de un sistema de recuperación avanzada. "
+    "Consolida hechos, tipifica contradicciones y dictamina suficiencia en UNA "
+    "respuesta JSON."
 )
 AUDITED_ANSWER_SYSTEM_SHORT = (
     "Eres un asistente de conocimiento con estándares epistémicos estrictos."
@@ -689,6 +697,21 @@ def disambiguate_by_cooccurrence(
 # ---------------------------------------------------------------------
 
 
+def _read_graph_version(session):
+    """Versión actual del grafo (kag_graph_state, migración 0016).
+
+    Devuelve None si la migración no está aplicada o la sesión no soporta
+    el SELECT (misma degradación que build_adjacency).
+    """
+    try:
+        return session.execute(
+            text("SELECT version FROM kag_graph_state WHERE id = 1")
+        ).scalar()
+    except Exception:
+        # Migración 0016 sin aplicar, o sesión falsa de tests sin .scalar().
+        return None
+
+
 def build_adjacency(session):
     """Grafo desde kag_relations: {entity_id: {neighbor_id: weight}}.
 
@@ -701,13 +724,7 @@ def build_adjacency(session):
     """
     global _adjacency_cache, _adjacency_version
 
-    try:
-        version = session.execute(
-            text("SELECT version FROM kag_graph_state WHERE id = 1")
-        ).scalar()
-    except Exception:
-        # Migración 0016 sin aplicar, o sesión falsa de tests sin .scalar().
-        version = None
+    version = _read_graph_version(session)
 
     if (
         version is not None
@@ -815,6 +832,93 @@ def ego_network(adjacency, seed, hops=2):
         if neighbors:
             sub[node] = neighbors
     return sub
+
+
+class _GraphVersionNotCached(Exception):
+    """La matriz de adyacencia de esta versión no está en memoria.
+
+    Solo ocurre en una carrera: el grafo cambió entre la lectura de versión
+    y la construcción de la matriz. El wrapper público degrada al cálculo
+    directo (la excepción nunca se cachea en lru_cache).
+    """
+
+
+def _adjacency_for_version(graph_version):
+    """Matriz de adyacencia cacheada para `graph_version`.
+
+    build_adjacency mantiene el invariante: _adjacency_cache corresponde a
+    _adjacency_version. Si la versión pedida no es la cacheada, devuelve
+    None y el wrapper degrada al cálculo directo.
+    """
+    if _adjacency_version == graph_version and _adjacency_cache is not None:
+        return _adjacency_cache
+    return None
+
+
+@lru_cache(maxsize=256)
+def _ego_network_cached(entity_ids: frozenset, graph_version, hops=2):
+    """Ego-network de `hops` saltos cacheado por (semilla, versión del grafo).
+
+    La matriz de adyacencia se lee del caché module-level de build_adjacency
+    (invariante garantizada por el wrapper público). Mismas entidades semilla
+    en consultas del mismo dominio → el BFS de 2 saltos no se repite.
+    """
+    adj = _adjacency_for_version(graph_version)
+    if adj is None:
+        raise _GraphVersionNotCached(graph_version)
+    return ego_network(adj, list(entity_ids), hops=hops)
+
+
+@lru_cache(maxsize=256)
+def _ppr_cached(entity_ids: frozenset, graph_version, alpha):
+    """Power iteration de PPR cacheada por (semilla, versión, alpha).
+
+    Reutiliza el caché de ego-network: la extracción del subgrafo y la
+    power iteration solo se recalculan cuando cambia la semilla, la
+    versión del grafo o alpha.
+    """
+    sub = _ego_network_cached(entity_ids, graph_version, 2)
+    return personalized_pagerank(sub, list(entity_ids), alpha=alpha)
+
+
+def ego_network_cached(session, entity_ids, hops=2):
+    """ego_network con LRU cache por (frozenset(entity_ids), graph_version).
+
+    Lee la versión del grafo (kag_graph_state) y delega en el core cacheado.
+    Sin tabla de versión → cálculo directo (degradación, sin cachear).
+    """
+    graph_version = _read_graph_version(session)
+    if graph_version is None:
+        adj = build_adjacency(session)
+        return ego_network(adj, entity_ids, hops=hops)
+    build_adjacency(session)  # garantiza _adjacency_cache para esta versión
+    try:
+        return _ego_network_cached(frozenset(entity_ids), graph_version, hops)
+    except _GraphVersionNotCached:
+        adj = build_adjacency(session)
+        return ego_network(adj, entity_ids, hops=hops)
+
+
+def personalized_pagerank_cached(session, entity_ids, alpha=None):
+    """personalized_pagerank con LRU cache por (semilla, versión, alpha).
+
+    `alpha` viene de KAG_PPR_ALPHA (src/kag/config.py) si no se pasa
+    explícito. Sin tabla de versión → cálculo directo (degradación).
+    """
+    if alpha is None:
+        alpha = _kag_config_value(session, "KAG_PPR_ALPHA", 0.15)
+    graph_version = _read_graph_version(session)
+    if graph_version is None:
+        adj = build_adjacency(session)
+        sub = ego_network(adj, entity_ids, hops=2)
+        return personalized_pagerank(sub, entity_ids, alpha=alpha)
+    build_adjacency(session)  # garantiza _adjacency_cache para esta versión
+    try:
+        return _ppr_cached(frozenset(entity_ids), graph_version, float(alpha))
+    except _GraphVersionNotCached:
+        adj = build_adjacency(session)
+        sub = ego_network(adj, entity_ids, hops=2)
+        return personalized_pagerank(sub, entity_ids, alpha=alpha)
 
 
 def ppr_entity_selection(
@@ -935,20 +1039,35 @@ def fts_search(session, query_text, top_k):
 def hybrid_search(session, query_text, query_embedding, top_k, rrf_k=60, verbose=False):
     """Búsqueda híbrida: densa (pgvector) + léxica (FTS) + RRF.
 
+    La búsqueda densa y la FTS son lecturas read-only independientes y
+    corren en paralelo (ThreadPoolExecutor). El resultado es idéntico al
+    secuencial: mismo RRF, mismo orden, mismo score.
+
     Si query_embedding es None (embeddings no disponibles), degrada a solo
     FTS. Si la migración 0014 no está aplicada (columna content_tsv ausente,
     ProgrammingError), degrada a solo búsqueda densa. Otros errores se
     propagan al caller (ask() los degrada a vec_hits=[]).
     """
     dense_hits = []
-    if query_embedding is not None:
-        dense_hits = vector_search(session, query_embedding, top_k)
-    try:
-        sparse_hits = fts_search(session, query_text, top_k)
-    except ProgrammingError as exc:  # migración 0014 sin aplicar
+    sparse_hits = []
+    fts_error = None
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        dense_future = None
+        if query_embedding is not None:
+            dense_future = pool.submit(vector_search, session, query_embedding, top_k)
+        sparse_future = pool.submit(fts_search, session, query_text, top_k)
+        if dense_future is not None:
+            # Esperar primero la densa: si falla, su error se propaga (misma
+            # precedencia que el flujo secuencial, donde la densa corre antes).
+            dense_hits = dense_future.result()
+        try:
+            sparse_hits = sparse_future.result()
+        except ProgrammingError as exc:  # migración 0014 sin aplicar
+            fts_error = exc
+    if fts_error is not None:
         session.rollback()
         if verbose:
-            print(f"[KAG] ⚠ FTS no disponible ({exc}); solo búsqueda densa.")
+            print(f"[KAG] ⚠ FTS no disponible ({fts_error}); solo búsqueda densa.")
         return dense_hits
     if not dense_hits:
         return sparse_hits
@@ -1773,6 +1892,23 @@ Contextos escalados (Nivel 2, si aplicó):
 
 Emite tu evaluación formal: {{"verdict": "SUFFICIENT_FOR_SYNTHESIS|INSUFFICIENT_TRIGGER_BRANCH_B|NEGATIVE_REJECTION", "confidence_score": float, "negative_rejection_details": {{"reason": "out_of_thematic_scope_iso25964|classification_mismatch_lcc|total_absence_in_knowledge_graph|unsupported_technical_granularity", "closest_available_topics": [str], "formal_abstention_statement": str}}, "branch_b_instructions": {{"unresolved_subqueries": [str], "target_thesaurus_concepts": [str]}}}}"""
 
+AUDIT_FUSED_PROMPT = """Consulta del usuario: "{query}"
+
+Metadatos del Corpus Disponible (Descriptores ISO 25964 y LCC presentes en DB):
+{active_corpus_metadata}
+
+Proposiciones recuperadas para análisis:
+{candidate_chunks_json}
+
+Realiza la auditoría epistémica completa en UNA sola respuesta JSON con esta forma EXACTA:
+{{"facts": [{{"statement": str, "verbatim_evidence": str, "relevance": "direct_answer|supporting_evidence|contextual_background|irrelevant"}}], "contradictions": [{{"type": "paradigmatic_theoretical_divergence|empirical_contextual_boundary|temporal_diachronic_shift|terminological_homonymy", "resolution": str}}], "sufficiency": {{"verdict": "SUFFICIENT|INSUFFICIENT|NEGATIVE_REJECTION", "confidence": float}}}}
+
+Reglas:
+- `facts`: un objeto por proposición relevante. `statement` es el resumen atómico; `verbatim_evidence` es la cita textual EXACTA tal como aparece en la proposición (se verificará carácter por carácter contra la DB); `relevance` clasifica el hecho.
+- `contradictions`: solo si hay tensiones epistémicas reales entre hechos; si no, lista vacía.
+- `sufficiency.verdict`: SUFFICIENT si los hechos bastan para responder; INSUFFICIENT si falta material y se requiere expansión iterativa; NEGATIVE_REJECTION si el corpus no cubre el dominio.
+- `sufficiency.confidence`: float 0.0–1.0."""
+
 AUDITED_ANSWER_PROMPT = """Consulta del usuario: "{query}"
 
 Evidencia verificada (grounded_evidence):
@@ -2041,10 +2177,198 @@ def _evaluate_sufficiency(
     return {"verdict": verdict, "confidence_score": 0.5}
 
 
+def _audit_epistemic_fused(
+    session, query, propositions, corpus_metadata, verbose=False
+) -> tuple:
+    """Auditoría epistémica en UNA llamada al LLM pequeño (fusión de
+    síntesis + contradicciones + suficiencia).
+
+    Devuelve (facts, contradiction_report, evaluation) con los MISMOS shapes
+    que _synthesize_facts / _resolve_contradictions / _evaluate_sufficiency.
+    Si el JSON del LLM falla o viene malformado, degrada a las llamadas
+    separadas actuales — nunca romper.
+    """
+    if not propositions:
+        return (
+            [],
+            {"contradictions_detected": False, "analysis_cases": []},
+            {
+                "verdict": "INSUFFICIENT_TRIGGER_BRANCH_B",
+                "confidence_score": 0.5,
+            },
+        )
+    retries, fallback = _settings_retries(session)
+    small_model, _large_model = _settings_models(session)
+    system, user_template = _get_prompt_pair(
+        session,
+        small_model,
+        TASK_AUDIT_FUSED,
+        AUDIT_FUSED_SYSTEM_SHORT,
+        AUDIT_FUSED_PROMPT,
+    )
+    prompt = (
+        user_template.replace("{query}", query)
+        .replace("{active_corpus_metadata}", _json_dumps(corpus_metadata))
+        .replace("{candidate_chunks_json}", _json_dumps(propositions))
+    )
+    try:
+        text_out, _model, _used_fallback = call_with_retries(
+            session,
+            prompt=prompt,
+            system=system,
+            model_size="small",
+            response_format={"type": "json_object"},
+            retries=retries,
+            fallback_model=fallback,
+        )
+        data = parse_llm_output(text_out)
+        facts_raw = data.get("facts")
+        if not isinstance(facts_raw, list):
+            raise ValueError("fused audit: facts ausente o no-lista")
+        facts_out = _fused_facts_to_shape(facts_raw, propositions)
+        contradictions = data.get("contradictions") or []
+        report = {
+            "contradictions_detected": bool(contradictions),
+            "analysis_cases": [
+                {
+                    "conflict_type": c.get(
+                        "type", "paradigmatic_theoretical_divergence"
+                    ),
+                    "divergence_summary": c.get("resolution", ""),
+                    "thesis_a": {},
+                    "thesis_b": {},
+                    "epistemic_reconciliation": c.get("resolution", ""),
+                }
+                for c in contradictions
+                if isinstance(c, dict)
+            ],
+        }
+        suff = data.get("sufficiency") or {}
+        verdict_raw = str(suff.get("verdict", "")).strip().upper()
+        verdict_map = {
+            "SUFFICIENT": "SUFFICIENT_FOR_SYNTHESIS",
+            "INSUFFICIENT": "INSUFFICIENT_TRIGGER_BRANCH_B",
+            "NEGATIVE_REJECTION": "NEGATIVE_REJECTION",
+        }
+        verdict = verdict_map.get(verdict_raw)
+        if verdict not in (
+            "SUFFICIENT_FOR_SYNTHESIS",
+            "INSUFFICIENT_TRIGGER_BRANCH_B",
+            "NEGATIVE_REJECTION",
+        ):
+            raise ValueError(f"fused audit: veredicto inválido {verdict_raw!r}")
+        try:
+            confidence = float(suff.get("confidence", 0.5))
+        except (TypeError, ValueError):
+            confidence = 0.5
+        evaluation = {"verdict": verdict, "confidence_score": confidence}
+        if verdict == "NEGATIVE_REJECTION":
+            evaluation["negative_rejection_details"] = {
+                "reason": "total_absence_in_knowledge_graph",
+                "closest_available_topics": [],
+                "formal_abstention_statement": (
+                    "El corpus disponible no cubre el dominio conceptual requerido "
+                    "por la consulta (abstención temprana)."
+                ),
+            }
+        if verbose:
+            print(
+                f"[KAG] Auditoría fusionada: {len(facts_out)} hechos, "
+                f"{len(report['analysis_cases'])} tensiones, "
+                f"verdict={verdict} (fallback={_used_fallback})"
+            )
+        return facts_out, report, evaluation
+    except Exception as exc:  # noqa: BLE001 — degradación natural
+        _safe_rollback(session)
+        if verbose:
+            print(
+                f"[KAG] ⚠ Auditoría fusionada falló ({exc}); degradando a llamadas separadas."
+            )
+    # Degradación: comportamiento actual (3 llamadas separadas).
+    facts = _synthesize_facts(session, query, propositions, verbose=verbose)
+    report = _resolve_contradictions(session, query, facts, verbose=verbose)
+    evaluation = _evaluate_sufficiency(
+        session, query, facts, corpus_metadata, verbose=verbose
+    )
+    return facts, report, evaluation
+
+
+def _fused_facts_to_shape(facts_raw, propositions) -> list:
+    """Convierte los hechos del JSON fusionado al shape de _synthesize_facts.
+
+    Re-ancla cada hecho a su proposición original (chunk_id, document_id,
+    source_file, academic_citations) buscando por statement/verbatim.
+    """
+    if not isinstance(facts_raw, list):
+        return []
+    by_statement: dict = {}
+    by_span: dict = {}
+    for p in propositions:
+        stmt = (p.get("statement") or "").strip()
+        span = (p.get("text_span") or "").strip()
+        if stmt:
+            by_statement.setdefault(stmt, p)
+        if span:
+            by_span.setdefault(span, p)
+    out: list = []
+    for f in facts_raw:
+        if not isinstance(f, dict):
+            continue
+        statement = (f.get("statement") or "").strip()
+        verbatim = (f.get("verbatim_evidence") or "").strip()
+        relevance = str(f.get("relevance") or "supporting_evidence").strip()
+        if relevance not in (
+            "direct_answer",
+            "supporting_evidence",
+            "contextual_background",
+            "irrelevant",
+        ):
+            relevance = "supporting_evidence"
+        prop = by_statement.get(statement) or by_span.get(verbatim) or {}
+        out.append(
+            {
+                "chunk_id": str(prop.get("chunk_id", "")),
+                "document_id": str(prop.get("document_id") or ""),
+                "source_file": str(prop.get("doc_title", "")),
+                "relevance_level": relevance,
+                "atomic_summary": statement[:500],
+                "verbatim_evidence": verbatim[:1000],
+                "academic_citations": prop.get("citation_references") or [],
+            }
+        )
+    return out
+
+
+def _kag_config_value(session, name, default=None):
+    """Lee una flag KAG_* de la config resuelta (env > DB > default).
+
+    Import perezoso: src.kag.config es puro (sin torch/spacy), pero se
+    mantiene el patrón lazy del módulo. Nunca lanza.
+    """
+    try:
+        from src.kag.config import get_config_value, resolve_config
+
+        config = resolve_config(session)
+        return get_config_value(config, name, default)
+    except Exception:  # noqa: BLE001 — degradación natural
+        return default
+
+
 def _verify_grounding(session, facts, verbose=False) -> list:
-    """Verifica el grounding verbatim de cada fact (rapidfuzz partial_ratio ≥95).
+    """Verifica el grounding verbatim de cada fact (rapidfuzz partial_ratio).
+
+    PODA: la verificación difusa (partial_ratio >= KAG_GROUNDING_THRESHOLD,
+    default 95.0) se aplica SOLO a hechos `direct_answer` o con citas
+    bibliográficas explícitas. El material puramente contextual de fondo
+    (supporting_evidence sin citas) NO requiere verificación carácter por
+    carácter: pasa con el chequeo barato de substring.
 
     Descarta los hechos que no pasan. Enriquecen con metadatos del doc.
+
+    Con KAG_GROUNDING_PARALLEL=True (default) y varios hechos, los cálculos
+    por fact (lectura read-only + partial_ratio) corren en ThreadPoolExecutor
+    (max_workers 2-4, CPU-bound en Python). El resultado es idéntico al
+    secuencial: mismo orden en `verified`, misma poda.
     """
     if not facts:
         return []
@@ -2052,14 +2376,18 @@ def _verify_grounding(session, facts, verbose=False) -> list:
         from rapidfuzz import fuzz
     except Exception:  # noqa: BLE001 — sin rapidfuzz: grounding por substring
         fuzz = None
-    verified = []
-    for f in facts:
+    threshold = float(_kag_config_value(session, "KAG_GROUNDING_THRESHOLD", 95.0))
+    parallel = bool(_kag_config_value(session, "KAG_GROUNDING_PARALLEL", True))
+
+    def _check_fact(f):
         if f.get("relevance_level") not in ("direct_answer", "supporting_evidence"):
-            continue
+            return None
         chunk_id = f.get("chunk_id")
         verbatim = f.get("verbatim_evidence") or ""
         if not chunk_id or not verbatim:
-            continue
+            return None
+        citations = f.get("academic_citations") or []
+        needs_fuzzy = f.get("relevance_level") == "direct_answer" or bool(citations)
         try:
             row = session.execute(
                 text(
@@ -2076,36 +2404,46 @@ def _verify_grounding(session, facts, verbose=False) -> list:
             _safe_rollback(session)
             if verbose:
                 print(f"[KAG] ⚠ Grounding falló para chunk {chunk_id}: {exc}")
-            continue
+            return None
         if not row:
-            continue
+            return None
         db_span = row.text_span or ""
         if verbatim in db_span:
             match_score = 100.0
-        elif fuzz is not None:
-            match_score = float(fuzz.partial_ratio(verbatim, db_span))
+        elif needs_fuzzy:
+            match_score = (
+                float(fuzz.partial_ratio(verbatim, db_span))
+                if fuzz is not None
+                else 0.0
+            )
         else:
-            match_score = 0.0
-        if match_score < 95.0:
+            # Contextual de fondo: sin verificación difusa carácter por carácter.
+            match_score = 100.0
+        if needs_fuzzy and match_score < threshold:
             if verbose:
                 print(
                     f"[KAG] Grounding rechazado: chunk {chunk_id} "
                     f"(score {match_score:.1f})."
                 )
-            continue
-        verified.append(
-            {
-                "claim_id": str(chunk_id),
-                "verified_fact": f.get("atomic_summary") or f.get("statement", ""),
-                "verbatim_quote": verbatim,
-                "document_id": row.doc_id,
-                "document_title": row.doc_title,
-                "chapter_title": row.chapter_title,
-                "bibtex_citation_key": None,
-                "academic_citations": row.citation_references or [],
-            }
-        )
-    return verified
+            return None
+        return {
+            "claim_id": str(chunk_id),
+            "verified_fact": f.get("atomic_summary") or f.get("statement", ""),
+            "verbatim_quote": verbatim,
+            "document_id": row.doc_id,
+            "document_title": row.doc_title,
+            "chapter_title": row.chapter_title,
+            "bibtex_citation_key": None,
+            "academic_citations": row.citation_references or [],
+        }
+
+    if parallel and len(facts) > 1:
+        with ThreadPoolExecutor(max_workers=min(4, len(facts))) as pool:
+            futures = [pool.submit(_check_fact, f) for f in facts]
+            results = [future.result() for future in futures]
+    else:
+        results = [_check_fact(f) for f in facts]
+    return [r for r in results if r is not None]
 
 
 def _branch_b_expand(
@@ -2146,16 +2484,25 @@ def _branch_b_expand(
             _safe_rollback(session)
             if verbose:
                 print(f"[KAG] ⚠ Branch B grafo falló: {exc}")
-    # (c) FTS sobre kag_propositions con los términos.
+    # (c) FTS sobre kag_propositions con los términos. Las subconsultas por
+    #      término son lecturas read-only independientes: con
+    #      KAG_QUERY_PARALLEL=True corren en ThreadPoolExecutor (max_workers
+    #      2-4). El resultado es idéntico al secuencial: los futures se
+    #      recogen en orden de envío y el dedup/append corre en el hilo
+    #      principal en ese mismo orden.
+    valid_terms = []
     for term in terms:
         if not term or not str(term).strip():
             continue
         tokens = [t for t in re.split(r"[\s,;]+", str(term).strip()) if t]
         if not tokens:
             continue
+        valid_terms.append((term, tokens))
+
+    def _fts_term(term, tokens):
         tsq = _fts_tsquery(tokens)
         try:
-            rows = session.execute(
+            return session.execute(
                 text(
                     "SELECT p.id AS prop_id, p.chunk_id, p.statement, p.text_span, "
                     "p.char_start, p.char_end, p.citation_references, "
@@ -2175,7 +2522,21 @@ def _branch_b_expand(
             _safe_rollback(session)
             if verbose:
                 print(f"[KAG] ⚠ Branch B FTS falló: {exc}")
-            continue
+            return []
+
+    if (
+        bool(_kag_config_value(session, "KAG_QUERY_PARALLEL", True))
+        and len(valid_terms) > 1
+    ):
+        with ThreadPoolExecutor(max_workers=min(4, len(valid_terms))) as pool:
+            futures = [
+                pool.submit(_fts_term, term, tokens) for term, tokens in valid_terms
+            ]
+            rowsets = [future.result() for future in futures]
+    else:
+        rowsets = [_fts_term(term, tokens) for term, tokens in valid_terms]
+
+    for rows in rowsets:
         for r in rows:
             if r.prop_id in seen:
                 continue
@@ -2218,23 +2579,48 @@ def _ask_audited(session, query, top_k=8, global_top_k=20, verbose=False) -> dic
         _safe_rollback(session)
         if verbose:
             print(f"[KAG] ⚠ Embeddings no disponibles ({exc}); solo FTS.")
-    try:
-        vec_hits = hybrid_search(session, query, q_emb, k, verbose=verbose)
-    except Exception as exc:  # noqa: BLE001 — degradación natural
-        _safe_rollback(session)
-        if verbose:
-            print(f"[KAG] ⚠ Búsqueda híbrida falló: {exc}")
-        vec_hits = []
-    vec_hits = apply_relevance_threshold(vec_hits, verbose=verbose)
+    # Búsqueda híbrida ∥ CRIT+EL (spaCy + LLM) en paralelo: mismo resultado
+    # que el secuencial; KAG_QUERY_PARALLEL=False restaura el orden viejo.
+    vec_hits = []
     regex_hits, regex_terms, names = [], [], []
-    try:
-        regex_hits, regex_terms, names = critic_and_linking(
-            session, query, top_k=k, verbose=verbose
-        )
-    except Exception as exc:  # noqa: BLE001 — degradación natural
-        _safe_rollback(session)
-        if verbose:
-            print(f"[KAG] ⚠ CRIT+EL fusionado falló: {exc}")
+    if _kag_config_value(session, "KAG_QUERY_PARALLEL", True):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            hybrid_future = pool.submit(
+                hybrid_search, session, query, q_emb, k, verbose=verbose
+            )
+            crit_future = pool.submit(
+                critic_and_linking, session, query, top_k=k, verbose=verbose
+            )
+            try:
+                vec_hits = hybrid_future.result()
+            except Exception as exc:  # noqa: BLE001 — degradación natural
+                _safe_rollback(session)
+                if verbose:
+                    print(f"[KAG] ⚠ Búsqueda híbrida falló: {exc}")
+                vec_hits = []
+            try:
+                regex_hits, regex_terms, names = crit_future.result()
+            except Exception as exc:  # noqa: BLE001 — degradación natural
+                _safe_rollback(session)
+                if verbose:
+                    print(f"[KAG] ⚠ CRIT+EL fusionado falló: {exc}")
+    else:
+        try:
+            vec_hits = hybrid_search(session, query, q_emb, k, verbose=verbose)
+        except Exception as exc:  # noqa: BLE001 — degradación natural
+            _safe_rollback(session)
+            if verbose:
+                print(f"[KAG] ⚠ Búsqueda híbrida falló: {exc}")
+            vec_hits = []
+        try:
+            regex_hits, regex_terms, names = critic_and_linking(
+                session, query, top_k=k, verbose=verbose
+            )
+        except Exception as exc:  # noqa: BLE001 — degradación natural
+            _safe_rollback(session)
+            if verbose:
+                print(f"[KAG] ⚠ CRIT+EL fusionado falló: {exc}")
+    vec_hits = apply_relevance_threshold(vec_hits, verbose=verbose)
     embed_fn = None
     try:
         from src.embeddings import embed_texts as _embed_texts
@@ -2254,8 +2640,7 @@ def _ask_audited(session, query, top_k=8, global_top_k=20, verbose=False) -> dic
     )
     ppr_scores = {}
     if entity_ids:
-        sub = ego_network(adj, entity_ids, hops=2)
-        ppr_scores = personalized_pagerank(sub, entity_ids)
+        ppr_scores = personalized_pagerank_cached(session, entity_ids)
     ppr_entities = ppr_entity_selection(ppr_scores, verbose=verbose)
     ppr_chunks = (
         chunks_for_entities(session, ppr_entities, top_n=10) if ppr_entities else []
@@ -2282,15 +2667,9 @@ def _ask_audited(session, query, top_k=8, global_top_k=20, verbose=False) -> dic
     if verbose:
         print(f"[KAG] Proposiciones: {len(propositions)}")
 
-    # 3. Síntesis fáctica.
-    facts = _synthesize_facts(session, query, propositions, verbose=verbose)
-
-    # 4. Contradicciones.
-    contradiction_report = _resolve_contradictions(
-        session, query, facts, verbose=verbose
-    )
-
-    # 5. Suficiencia + Branch B (hasta 2 iteraciones).
+    # 3-5. Auditoría epistémica FUSIONADA en UNA llamada al LLM pequeño
+    #       (síntesis + contradicciones + suficiencia). Si el JSON falla o
+    #       viene malformado, degrada a las 3 llamadas separadas.
     corpus_metadata = []
     try:
         rows = session.execute(
@@ -2311,8 +2690,8 @@ def _ask_audited(session, query, top_k=8, global_top_k=20, verbose=False) -> dic
         _safe_rollback(session)
         if verbose:
             print(f"[KAG] ⚠ Metadatos de corpus fallaron ({exc}).")
-    evaluation = _evaluate_sufficiency(
-        session, query, facts, corpus_metadata, verbose=verbose
+    facts, contradiction_report, evaluation = _audit_epistemic_fused(
+        session, query, propositions, corpus_metadata, verbose=verbose
     )
     verdict = evaluation.get("verdict", "SUFFICIENT_FOR_SYNTHESIS")
 
@@ -2332,16 +2711,40 @@ def _ask_audited(session, query, top_k=8, global_top_k=20, verbose=False) -> dic
             "used_fallback": False,
         }
 
+    # 5b. Branch B (expansión iterativa) — solo si el veredicto lo pide y
+    #      KAG_BRANCH_B_MAX_ITERS > 0. Aborta de inmediato si la expansión
+    #      no recupera doc_ids/entidades nuevos o si la ganancia de
+    #      suficiencia es marginal (Δ < 0.05).
     visited_chunks = [p.get("chunk_id") for p in propositions if p.get("chunk_id")]
-    max_iterations = 2
+    max_iterations = int(_kag_config_value(session, "KAG_BRANCH_B_MAX_ITERS", 2))
     iteration = 0
-    while verdict == "INSUFFICIENT_TRIGGER_BRANCH_B" and iteration <= max_iterations:
+    prev_confidence = float(evaluation.get("confidence_score") or 0.0)
+    while (
+        verdict == "INSUFFICIENT_TRIGGER_BRANCH_B"
+        and max_iterations > 0
+        and iteration < max_iterations
+    ):
         if verbose:
             print(f"[KAG] Branch B iteración {iteration} (max {max_iterations}).")
         extra = _branch_b_expand(
             session, query, entity_ids, visited_chunks, top_k=k, verbose=verbose
         )
         if not extra:
+            if verbose:
+                print("[KAG] Branch B abortado: sin proposiciones nuevas.")
+            break
+        new_doc_ids = {p.get("document_id") for p in extra if p.get("document_id")}
+        new_entities = set()
+        for p in extra:
+            for ent in p.get("entities") or []:
+                if ent:
+                    new_entities.add(str(ent))
+        if not new_doc_ids and not new_entities:
+            if verbose:
+                print(
+                    "[KAG] Branch B abortado: sin doc_ids ni entidades nuevos "
+                    "(short-circuit)."
+                )
             break
         extra_facts = _synthesize_facts(session, query, extra, verbose=verbose)
         facts = list(facts) + extra_facts
@@ -2352,10 +2755,19 @@ def _ask_audited(session, query, top_k=8, global_top_k=20, verbose=False) -> dic
             session, query, facts, corpus_metadata, verbose=verbose
         )
         verdict = evaluation.get("verdict", "SUFFICIENT_FOR_SYNTHESIS")
+        new_confidence = float(evaluation.get("confidence_score") or 0.0)
+        gain = new_confidence - prev_confidence
+        prev_confidence = new_confidence
         iteration += 1
         visited_chunks = list(
             dict.fromkeys(visited_chunks + [p.get("chunk_id") for p in extra])
         )
+        if gain < 0.05:
+            if verbose:
+                print(
+                    f"[KAG] Branch B abortado: ganancia marginal (Δ={gain:.3f} < 0.05)."
+                )
+            break
 
     # 6. Grounding verbatim.
     grounded_evidence = _verify_grounding(session, facts, verbose=verbose)
@@ -2470,34 +2882,55 @@ def ask(
         session.rollback()  # la transacción queda abortada tras el error
         if verbose:
             print(f"[KAG] ⚠ Embeddings no disponibles ({exc}); solo FTS.")
-    try:
-        vec_hits = hybrid_search(session, query, q_emb, k, verbose=verbose)
-    except Exception as exc:  # noqa: BLE001 — degradación natural
-        session.rollback()  # la transacción queda abortada tras el error
-        if verbose:
-            print(f"[KAG] ⚠ Búsqueda híbrida falló: {exc}")
-        vec_hits = []
+    # 2 + 2.5+3. Búsqueda híbrida ∥ CRIT+EL (spaCy + LLM) en paralelo: la
+    #      extracción de candidatos y la llamada al LLM pequeño corren
+    #      mientras la DB responde la búsqueda híbrida. Resultado idéntico
+    #      al secuencial; KAG_QUERY_PARALLEL=False restaura el orden viejo.
+    vec_hits = []
+    regex_hits, regex_terms, names = [], [], []
+    if _kag_config_value(session, "KAG_QUERY_PARALLEL", True):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            hybrid_future = pool.submit(
+                hybrid_search, session, query, q_emb, k, verbose=verbose
+            )
+            crit_future = pool.submit(
+                critic_and_linking, session, query, top_k=k, verbose=verbose
+            )
+            try:
+                vec_hits = hybrid_future.result()
+            except Exception as exc:  # noqa: BLE001 — degradación natural
+                session.rollback()  # la transacción queda abortada tras el error
+                if verbose:
+                    print(f"[KAG] ⚠ Búsqueda híbrida falló: {exc}")
+                vec_hits = []
+            try:
+                regex_hits, regex_terms, names = crit_future.result()
+            except Exception as exc:  # noqa: BLE001 — degradación natural
+                session.rollback()
+                if verbose:
+                    print(f"[KAG] ⚠ CRIT+EL fusionado falló: {exc}")
+    else:
+        try:
+            vec_hits = hybrid_search(session, query, q_emb, k, verbose=verbose)
+        except Exception as exc:  # noqa: BLE001 — degradación natural
+            session.rollback()  # la transacción queda abortada tras el error
+            if verbose:
+                print(f"[KAG] ⚠ Búsqueda híbrida falló: {exc}")
+            vec_hits = []
+        try:
+            regex_hits, regex_terms, names = critic_and_linking(
+                session, query, top_k=k, verbose=verbose
+            )
+        except Exception as exc:  # noqa: BLE001 — degradación natural
+            session.rollback()
+            if verbose:
+                print(f"[KAG] ⚠ CRIT+EL fusionado falló: {exc}")
     # Threshold de relevancia: descarta la cola larga irrelevante.
     vec_hits = apply_relevance_threshold(vec_hits, verbose=verbose)
     if verbose:
         print(f"[KAG] Búsqueda híbrida: {len(vec_hits)} chunks (tras threshold)")
         for cid, score in vec_hits[:5]:
             print(f"    - chunk {cid}: score {score:.4f}")
-
-    # 2.5 + 3. CRIT + EL fusionados en UNA llamada LLM (ahorra un round-trip):
-    #      el crítico decide los términos exactos (regex/FTS) y el entity
-    #      linking anclado selecciona las entidades canónicas del pool del
-    #      grafo. Devuelve (regex_hits, regex_terms, names). Si el LLM falla,
-    #      degrada por separado (heurística determinista + pool determinista).
-    regex_hits, regex_terms, names = [], [], []
-    try:
-        regex_hits, regex_terms, names = critic_and_linking(
-            session, query, top_k=k, verbose=verbose
-        )
-    except Exception as exc:  # noqa: BLE001 — degradación natural
-        session.rollback()
-        if verbose:
-            print(f"[KAG] ⚠ CRIT+EL fusionado falló: {exc}")
     if verbose and regex_hits:
         print(
             f"[KAG] Crítico: {len(regex_hits)} chunks textuales "
@@ -2537,8 +2970,7 @@ def ask(
     #    la señal relevante (ego_network extrae el subgrafo inducido).
     ppr_scores = {}
     if entity_ids:
-        sub = ego_network(adj, entity_ids, hops=2)
-        ppr_scores = personalized_pagerank(sub, entity_ids)
+        ppr_scores = personalized_pagerank_cached(session, entity_ids)
         if verbose:
             top_ppr = sorted(ppr_scores.items(), key=lambda x: -x[1])[:5]
             print(f"[KAG] PPR: {len(ppr_scores)} entidades rankeadas (ego 2-hop)")
@@ -2568,10 +3000,22 @@ def ask(
         top_k=len(vec_hits) + len(regex_hits) + len(ppr_chunks),
     )
     # Una sola consulta por todos los ids (en vez del loop N+1 por hit),
-    # preservando el orden de importancia del RRF (array_position).
+    # preservando el orden de importancia del RRF (array_position). El
+    # subgrafo de tripletas es independiente (solo usa las entidades PPR),
+    # así que ambas lecturas corren en paralelo.
     merged_ids = [cid for cid, _score in merged_hits]
-    fetched = chunks_by_ids(session, merged_ids)
     score_by_id = dict(merged_hits)
+    if _kag_config_value(session, "KAG_QUERY_PARALLEL", True):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            chunks_future = pool.submit(chunks_by_ids, session, merged_ids)
+            triples_future = pool.submit(
+                subgraph_triples, session, ppr_entities or entity_ids, 25
+            )
+            fetched = chunks_future.result()
+            triples = triples_future.result()
+    else:
+        fetched = chunks_by_ids(session, merged_ids)
+        triples = subgraph_triples(session, ppr_entities or entity_ids, limit=25)
     chunks = []
     for c in fetched:
         c["score"] = score_by_id.get(c["chunk_id"], 0.0)
@@ -2601,25 +3045,30 @@ def ask(
         )
 
     # 6. Subgrafo de tripletas (entidades PPR cercanas, no top-10 fijo)
-    triples = subgraph_triples(session, ppr_entities or entity_ids, limit=25)
     if verbose:
         print(f"[KAG] Subgrafo: {len(triples)} tripletas")
 
-    # 7. Figuras
+    # 7-8.5. Figuras, resúmenes y proposiciones: lecturas ortogonales sobre
+    #      los chunks ganadores (ya con ventana) — corren en paralelo.
     chunk_ids = [c["chunk_id"] for c in chunks]
-    figures = figures_for_chunks(session, chunk_ids)
+    doc_ids = list({c["doc_id"] for c in chunks})
+    if _kag_config_value(session, "KAG_QUERY_PARALLEL", True):
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            figures_future = pool.submit(figures_for_chunks, session, chunk_ids)
+            summaries_future = pool.submit(doc_summaries, session, doc_ids)
+            propositions_future = pool.submit(
+                propositions_for_chunks, session, chunk_ids
+            )
+            figures = figures_future.result()
+            summaries = summaries_future.result()
+            propositions = propositions_future.result()
+    else:
+        figures = figures_for_chunks(session, chunk_ids)
+        summaries = doc_summaries(session, doc_ids)
+        propositions = propositions_for_chunks(session, chunk_ids)
     if verbose:
         print(f"[KAG] Figuras: {len(figures)}")
-
-    # 8. Resúmenes (fuente secundaria, siempre)
-    doc_ids = list({c["doc_id"] for c in chunks})
-    summaries = doc_summaries(session, doc_ids)
-    if verbose:
         print(f"[KAG] Resúmenes: {len(summaries)} documentos")
-
-    # 8.5. Proposiciones atómicas de los chunks ganadores (capa micro).
-    propositions = propositions_for_chunks(session, chunk_ids)
-    if verbose:
         print(f"[KAG] Proposiciones: {len(propositions)}")
 
     # 9. Ensamblar contexto

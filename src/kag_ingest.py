@@ -27,11 +27,14 @@ import json
 import os
 import re
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
 from sqlalchemy import bindparam, text
 
+from src.kag.config import get_config_value, resolve_config
 from src.kag.stages import (
     KAG_INGEST_STAGES,
     cleanup_stage,
@@ -106,6 +109,11 @@ SUMMARY_MAX_CHARS = 16000 * 4
 # Límite de contexto del LLM por llamada (chars) para la extracción de
 # proposiciones atómicas (mismo valor que el proposicional).
 MAX_CONTEXT_CHARS = 12000
+# Umbral de agrupación por capítulo (tokens): un capítulo (section_path ya
+# detectado por chunk_markdown) con MÁS tokens que esto forma su propio
+# grupo de proposiciones; los capítulos ≤ umbral se agrupan a nivel de
+# archivo (una llamada LLM por capítulo grande, una por archivo para el resto).
+CHAPTER_TOKEN_THRESHOLD = 30000
 
 # ---------------------------------------------------------------------
 # Helpers de host / texto
@@ -729,7 +737,7 @@ PROPOSITIONAL_SYSTEM_SHORT = (
 
 PROPOSITIONAL_USER_SHORT = """Archivo: {source_file}
 Documento: {document_id}
-Chunk: {chunk_index} - {chunk_title}
+Capítulo/Sección: {section_path}
 Rango: Línea {line_start} a Línea {line_end}
 
 Texto a procesar:
@@ -737,7 +745,8 @@ Texto a procesar:
 {chapter_text_content}
 ---
 
-Genera el JSON: {"propositions": [{"core_idea_id": str, "argument_id": str, "statement": str, "text_span": str, "char_start": int, "char_end": int, "line_start": int, "line_end": int, "citations_references": [str]}]}"""
+Genera el JSON con las proposiciones organizadas por divisiones (capítulos/secciones del texto):
+{"divisions": [{"section_path": str, "propositions": [{"core_idea_id": str, "argument_id": str, "statement": str, "text_span": str, "char_start": int, "char_end": int, "line_start": int, "line_end": int, "citations_references": [str]}]}]}"""
 
 
 def _span_offsets(content: str, char_start: int, char_end: int):
@@ -790,6 +799,35 @@ def _locate_span_in_chunk(content: str, text_span: str):
     return _span_offsets(content, char_start, char_end)
 
 
+def _propositions_from_llm(data, default_section_path=""):
+    """Extrae las proposiciones del output del LLM (organizado por divisiones).
+
+    Formato nuevo (exigido por el prompt): {"divisions": [{"section_path":
+    str, "propositions": [...]}]}. Formato legacy (artefacto compilado
+    anterior a la agrupación por capítulo): {"propositions": [...]} — se
+    trata como una única división con `default_section_path`. Devuelve lista
+    de (section_path, prop_dict) o [] si no hay proposiciones.
+    """
+    if not isinstance(data, dict):
+        return []
+    divisions = data.get("divisions")
+    if isinstance(divisions, list) and divisions:
+        out = []
+        for div in divisions:
+            if not isinstance(div, dict):
+                continue
+            div_path = str(div.get("section_path") or "").strip()
+            div_path = div_path or default_section_path
+            for p in div.get("propositions") or []:
+                if isinstance(p, dict):
+                    out.append((div_path, p))
+        return out
+    propositions = data.get("propositions")
+    if isinstance(propositions, list):
+        return [(default_section_path, p) for p in propositions if isinstance(p, dict)]
+    return []
+
+
 def _extract_propositions(
     session, doc_id, chunk_id, content, doc_path, chunk_index, section_path, verbose
 ):
@@ -797,9 +835,9 @@ def _extract_propositions(
 
     Usa _get_prompt_pair (artefacto compilado o fallback a constantes) +
     call_with_retries (model_size="small"). Devuelve lista de dicts
-    {doc_id, chunk_id, core_idea_id, argument_id, statement, text_span,
-    char_start, char_end, line_start, line_end, citations}. Si el LLM falla
-    o devuelve JSON inválido → [] (degradación: la ingesta sigue).
+    {doc_id, chunk_id, section_path, core_idea_id, argument_id, statement,
+    text_span, char_start, char_end, line_start, line_end, citations}. Si el
+    LLM falla o devuelve JSON inválido → [] (degradación: la ingesta sigue).
     """
     settings = load_settings(session)
     retries = int(getattr(settings, "llm_retries", 3) or 3) if settings else 3
@@ -818,6 +856,7 @@ def _extract_propositions(
         user_template,
         source_file=doc_path,
         document_id=doc_id,
+        section_path=section_path or "",
         chunk_index=chunk_index,
         chunk_title=section_path or "",
         line_start=1,
@@ -839,13 +878,10 @@ def _extract_propositions(
         if verbose:
             print(f"[KAG] ⚠ Proposiciones fallaron (chunk {chunk_id}): {exc}")
         return []
-    propositions = data.get("propositions") if isinstance(data, dict) else None
-    if not isinstance(propositions, list) or not propositions:
-        return []
     out = []
-    for p in propositions:
-        if not isinstance(p, dict):
-            continue
+    for div_path, p in _propositions_from_llm(
+        data, default_section_path=section_path or ""
+    ):
         statement = str(p.get("statement") or "").strip()
         if not statement:
             continue
@@ -860,6 +896,7 @@ def _extract_propositions(
             {
                 "doc_id": doc_id,
                 "chunk_id": chunk_id,
+                "section_path": div_path,
                 "core_idea_id": str(p.get("core_idea_id") or "")[:50],
                 "argument_id": str(p.get("argument_id") or "")[:50],
                 "statement": statement,
@@ -894,7 +931,7 @@ def _store_propositions(session, doc_id, propositions, embed_fn=None):
     else:
         embs = [None] * len(propositions)
     placeholders = ", ".join(
-        f"(:d{i}, :c{i}, :ci{i}, :a{i}, :s{i}, :ts{i}, :cs{i}, :ce{i}, "
+        f"(:d{i}, :c{i}, :sp{i}, :ci{i}, :a{i}, :s{i}, :ts{i}, :cs{i}, :ce{i}, "
         f":ls{i}, :le{i}, CAST(:cr{i} AS jsonb), CAST(:emb{i} AS vector))"
         for i in range(len(propositions))
     )
@@ -904,6 +941,7 @@ def _store_propositions(session, doc_id, propositions, embed_fn=None):
             {
                 f"d{i}": p["doc_id"],
                 f"c{i}": p["chunk_id"],
+                f"sp{i}": p.get("section_path"),
                 f"ci{i}": p["core_idea_id"],
                 f"a{i}": p["argument_id"],
                 f"s{i}": sanitize_text(p["statement"]),
@@ -919,13 +957,387 @@ def _store_propositions(session, doc_id, propositions, embed_fn=None):
     session.execute(
         text(
             "INSERT INTO kag_propositions "
-            "(doc_id, chunk_id, core_idea_id, argument_id, statement, text_span, "
-            "char_start, char_end, line_start, line_end, citation_references, "
-            "embedding) "
+            "(doc_id, chunk_id, section_path, core_idea_id, argument_id, statement, "
+            "text_span, char_start, char_end, line_start, line_end, "
+            "citation_references, embedding) "
             f"VALUES {placeholders}"
         ),
         params,
     )
+
+
+def _chunk_content_hash(content: str) -> str:
+    """sha256 hex del contenido del chunk (cache de proposiciones, 0026)."""
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _proposition_flags(
+    session, extract_propositions: bool
+) -> tuple[bool, int, str, int]:
+    """Deriva las flags de proposiciones desde config (compatibilidad).
+
+    `extract_propositions` (param de index_document) se combina con la flag
+    KAG_EXTRACT_PROPOSITIONS de config: ambas deben estar activas. Devuelve
+    (enabled, batch_size_tokens, model_size, max_parallel) con
+    KAG_PROPOSITION_BATCH_SIZE (default 400000 tokens), KAG_PROPOSITION_MODEL
+    (default "large" — la respuesta de un lote de hasta 400k tokens es mucho
+    mayor en extensión que la de un chunk suelto, así que la extracción usa
+    el LLM grande) y KAG_PROPOSITION_PARALLEL (default 3 llamadas LLM
+    concurrentes, semáforo).
+    """
+    config = resolve_config(session)
+    enabled = bool(extract_propositions) and bool(
+        get_config_value(config, "KAG_EXTRACT_PROPOSITIONS", True)
+    )
+    batch_size = int(
+        get_config_value(config, "KAG_PROPOSITION_BATCH_SIZE", 400000) or 400000
+    )
+    model_size = get_config_value(config, "KAG_PROPOSITION_MODEL", "large")
+    if model_size not in ("small", "large"):
+        model_size = "large"
+    max_parallel = int(get_config_value(config, "KAG_PROPOSITION_PARALLEL", 3) or 3)
+    if max_parallel < 1:
+        max_parallel = 3
+    return enabled, batch_size, model_size, max_parallel
+
+
+def _batch_chunks_by_tokens(
+    chunks, batch_size_tokens: int, estimate_fn=estimate_tokens
+):
+    """Agrupa chunks consecutivos por presupuesto de tokens.
+
+    Acumula `estimate_fn(content)` hasta alcanzar `batch_size_tokens`; cada
+    lote = UNA llamada LLM. El corte es por el límite de tokens, NO por un
+    número fijo de chunks. Los chunks consecutivos de la misma `section_path`
+    quedan juntos (orden por chunk_index); un chunk que excede el presupuesto
+    forma su propio lote (no se parte).
+    """
+    batches: list[list[dict]] = []
+    current: list[dict] = []
+    current_tokens = 0
+    for chunk in chunks:
+        tokens = estimate_fn(chunk["content"])
+        if current and current_tokens + tokens > batch_size_tokens:
+            batches.append(current)
+            current = []
+            current_tokens = 0
+        current.append(chunk)
+        current_tokens += tokens
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _group_chunks_by_chapter(
+    chunks, chapter_token_threshold=CHAPTER_TOKEN_THRESHOLD, estimate_fn=estimate_tokens
+):
+    """Agrupa chunks por documento→capítulo (section_path ya detectado).
+
+    Los chunks llegan ordenados por chunk_index. Cada capítulo (section_path)
+    con > `chapter_token_threshold` tokens forma su propio grupo (una llamada
+    LLM por capítulo); los capítulos ≤ umbral se fusionan en un único grupo a
+    nivel de archivo (section_path ""). Devuelve lista de dicts
+    {"section_path": str, "chunks": [...]} en orden de aparición.
+    """
+    chapters: list[dict] = []
+    for ch in chunks:
+        path = ch["section_path"] or ""
+        if chapters and chapters[-1]["section_path"] == path:
+            chapters[-1]["chunks"].append(ch)
+        else:
+            chapters.append({"section_path": path, "chunks": [ch]})
+    groups: list[dict] = []
+    file_level: list = []
+    for chapter in chapters:
+        tokens = sum(estimate_fn(c["content"]) for c in chapter["chunks"])
+        if tokens > chapter_token_threshold:
+            groups.append(chapter)
+        else:
+            file_level.extend(chapter["chunks"])
+    if file_level:
+        groups.append({"section_path": "", "chunks": file_level})
+    return groups
+
+
+def _run_proposition_batches_parallel(
+    session,
+    doc_id,
+    doc_path,
+    units,
+    verbose,
+    model_size="large",
+    max_parallel=3,
+):
+    """Dispara las llamadas LLM de los lotes en paralelo (ThreadPoolExecutor).
+
+    `units`: lista de (section_path, chunks) — cada lote es UNA llamada LLM
+    independiente. `max_parallel` (semáforo) limita las llamadas LLM
+    concurrentes para respetar el rate limit del proveedor. Devuelve los
+    resultados en el MISMO orden que `units` (persistencia determinista por
+    chunk_index aunque se procesen en paralelo).
+    """
+    sem = threading.BoundedSemaphore(max_parallel)
+    results: list = [None] * len(units)
+
+    def work(i, section_path, batch):
+        with sem:
+            return i, _extract_propositions_batch(
+                session,
+                doc_id,
+                batch,
+                doc_path,
+                verbose,
+                model_size=model_size,
+                section_path=section_path,
+            )
+
+    # El pool admite hasta 2×N workers; el semáforo es quien limita la
+    # concurrencia real de llamadas LLM a N.
+    pool_size = min(len(units), max_parallel * 2)
+    with ThreadPoolExecutor(max_workers=pool_size) as ex:
+        futures = [ex.submit(work, i, sp, b) for i, (sp, b) in enumerate(units)]
+        for fut in futures:
+            i, props = fut.result()
+            results[i] = props
+    return results
+
+
+def _locate_span_in_batch(chunks, batch_text: str, offsets, text_span: str):
+    """Localiza `text_span` en el texto concatenado del lote y lo asigna al
+    chunk que lo contiene.
+
+    `offsets` es una lista de (chunk_id, start, end) — rangos de cada chunk
+    en `batch_text`. Devuelve (chunk_id, char_start, char_end, line_start,
+    line_end) relativos al chunk (1-based), o (None,)*5 si el span no
+    aparece (el LLM parafraseó) — la proposición se descarta (chunk_id es
+    NOT NULL en kag_propositions).
+    """
+    if not text_span:
+        return (None, None, None, None, None)
+    char_start, char_end, _ls, _le = _locate_span_in_chunk(batch_text, text_span)
+    if char_start is None:
+        return (None, None, None, None, None)
+    for chunk, (_cid, cstart, cend) in zip(chunks, offsets):
+        if cstart <= char_start < cend:
+            rel_start = char_start - cstart
+            rel_end = char_end - cstart
+            line_start = chunk["content"][:rel_start].count("\n") + 1
+            line_end = chunk["content"][:rel_end].count("\n") + 1
+            return (chunk["id"], rel_start, rel_end, line_start, line_end)
+    return (None, None, None, None, None)
+
+
+def _extract_propositions_batch(
+    session, doc_id, chunks, doc_path, verbose, model_size="large", section_path=""
+):
+    """Extrae proposiciones de un lote de chunks con UNA llamada LLM.
+
+    `chunks`: lista de dicts {id, content, chunk_index, section_path}.
+    `section_path`: capítulo/división del lote (metadata del prompt; "" =
+    nivel archivo). Concatena los contenidos (separador \n\n---\n\n) y pasa
+    el texto como `chapter_text_content`; el prompt exige el output
+    organizado por divisiones ({"divisions": [{"section_path",
+    "propositions"}]}) y cada proposición se asigna al chunk que contiene su
+    text_span (offsets relativos al chunk). `model_size` ("small" |
+    "large", default "large" vía KAG_PROPOSITION_MODEL): la respuesta de un
+    lote de hasta 400k tokens es mucho mayor en extensión que la de un chunk
+    suelto, así que se usa el LLM grande (max_tokens_large). Si el LLM falla
+    o devuelve JSON inválido → [] (degradación: la ingesta sigue).
+    """
+    if model_size not in ("small", "large"):
+        model_size = "large"
+    settings = load_settings(session)
+    retries = int(getattr(settings, "llm_retries", 3) or 3) if settings else 3
+    fallback = getattr(settings, "fallback_model", None) if settings else None
+    model_name = (
+        (
+            getattr(settings, "large_model", None)
+            if model_size == "large"
+            else getattr(settings, "small_model", None)
+        )
+        if settings
+        else None
+    )
+    system, user_template = _get_prompt_pair(
+        session,
+        model_name,
+        TASK_PROPOSITION_CHUNKING,
+        PROPOSITIONAL_SYSTEM_SHORT,
+        PROPOSITIONAL_USER_SHORT,
+    )
+    sep = "\n\n---\n\n"
+    batch_text = sep.join(ch["content"] for ch in chunks)
+    offsets = []
+    cursor = 0
+    for ch in chunks:
+        start = cursor
+        cursor += len(ch["content"])
+        offsets.append((ch["id"], start, cursor))
+        cursor += len(sep)
+    first_idx = chunks[0]["chunk_index"]
+    last_idx = chunks[-1]["chunk_index"]
+    chunk_index_label = (
+        f"{first_idx}-{last_idx}" if first_idx != last_idx else str(first_idx)
+    )
+    prompt = _fill_prompt(
+        user_template,
+        source_file=doc_path,
+        document_id=doc_id,
+        section_path=section_path or "(archivo completo)",
+        chunk_index=chunk_index_label,
+        chunk_title=chunks[0]["section_path"] or "",
+        line_start=1,
+        line_end=batch_text.count("\n") + 1,
+        chapter_text_content=batch_text,
+    )
+    try:
+        text_out, _model, _used_fallback = call_with_retries(
+            session,
+            prompt=prompt,
+            system=system,
+            model_size=model_size,
+            response_format={"type": "json_object"},
+            retries=retries,
+            fallback_model=fallback,
+        )
+        data = parse_llm_output(text_out)
+    except Exception as exc:  # noqa: BLE001 — LLM no disponible: degradación
+        if verbose:
+            print(f"[KAG] ⚠ Proposiciones fallaron (lote {chunk_index_label}): {exc}")
+        return []
+    chunk_sections = {ch["id"]: (ch["section_path"] or "") for ch in chunks}
+    out = []
+    for div_path, p in _propositions_from_llm(
+        data, default_section_path=section_path or ""
+    ):
+        statement = str(p.get("statement") or "").strip()
+        if not statement:
+            continue
+        text_span = str(p.get("text_span") or "")
+        chunk_id, char_start, char_end, line_start, line_end = _locate_span_in_batch(
+            chunks, batch_text, offsets, text_span
+        )
+        citations = p.get("citations_references") or []
+        if not isinstance(citations, list):
+            citations = []
+        # section_path: el del capítulo declarado por el LLM en la división;
+        # si falta, el del chunk asignado (o "").
+        prop_section = div_path or chunk_sections.get(chunk_id, "")
+        out.append(
+            {
+                "doc_id": doc_id,
+                "chunk_id": chunk_id,
+                "section_path": prop_section,
+                "core_idea_id": str(p.get("core_idea_id") or "")[:50],
+                "argument_id": str(p.get("argument_id") or "")[:50],
+                "statement": statement,
+                "text_span": text_span,
+                "char_start": char_start,
+                "char_end": char_end,
+                "line_start": line_start,
+                "line_end": line_end,
+                "citations": [str(c) for c in citations],
+            }
+        )
+    return out
+
+
+def _extract_propositions_for_doc(
+    session,
+    doc_id,
+    doc_path,
+    verbose,
+    batch_size_tokens,
+    embed_fn=None,
+    model_size="large",
+    max_parallel=3,
+):
+    """Extrae proposiciones de TODOS los chunks del doc (paso aparte del
+    chunking, etapa 'chunked').
+
+    Agrupación jerárquica doc→capítulo: los chunks se agrupan por documento
+    (uno por .md) y luego por capítulo = section_path (ya detectado por
+    chunk_markdown) SOLO si el capítulo tiene > CHAPTER_TOKEN_THRESHOLD (30k)
+    tokens; los capítulos ≤ umbral se agrupan a nivel de archivo. Cada grupo
+    se parte en lotes por presupuesto de tokens (KAG_PROPOSITION_BATCH_SIZE,
+    default 400k); cada lote = UNA llamada LLM. Los lotes se disparan en
+    paralelo (ThreadPoolExecutor + semáforo, KAG_PROPOSITION_PARALLEL) y se
+    persisten en orden de chunk_index (determinista). Cache por content_hash
+    (0026): los chunks que ya tienen proposiciones persistidas y cuyo
+    content_hash no cambió se saltan (no re-extraer en re-ingestas).
+    `model_size` ("small" | "large", default "large" vía
+    KAG_PROPOSITION_MODEL): la respuesta de un lote es mucho mayor en
+    extensión que la de un chunk suelto, por eso el default es el LLM grande.
+    """
+    rows = session.execute(
+        text(
+            "SELECT id, content, chunk_index, section_path, content_hash "
+            "FROM kag_chunks WHERE doc_id = :id ORDER BY chunk_index"
+        ),
+        {"id": doc_id},
+    ).fetchall()
+    if not rows:
+        return
+    cached_ids = {
+        r[0]
+        for r in session.execute(
+            text("SELECT DISTINCT chunk_id FROM kag_propositions WHERE doc_id = :id"),
+            {"id": doc_id},
+        ).fetchall()
+    }
+    pending = []
+    for r in rows:
+        h = _chunk_content_hash(r.content)
+        if r.id in cached_ids and r.content_hash == h:
+            continue  # ya extraído con hash idéntico (cache)
+        pending.append(
+            {
+                "id": r.id,
+                "content": r.content,
+                "chunk_index": r.chunk_index,
+                "section_path": r.section_path,
+            }
+        )
+    if not pending:
+        if verbose:
+            print("[KAG] ⏭ proposiciones: todos los chunks ya extraídos (cache).")
+        return
+    # Agrupación doc→capítulo: capítulos >30k tokens = grupo propio; el resto
+    # se fusiona a nivel de archivo. Cada grupo se parte en lotes por tokens.
+    units: list[tuple[str, list]] = []  # (section_path, chunks)
+    for group in _group_chunks_by_chapter(pending):
+        for batch in _batch_chunks_by_tokens(group["chunks"], batch_size_tokens):
+            units.append((group["section_path"], batch))
+    # Orden de persistencia determinista: por chunk_index (aunque los lotes
+    # se procesen en paralelo).
+    units.sort(key=lambda u: u[1][0]["chunk_index"])
+    if verbose:
+        for i, (sp, batch) in enumerate(units, 1):
+            total = sum(estimate_tokens(c["content"]) for c in batch)
+            print(
+                f"[KAG] ⚙ proposiciones: lote {i}/{len(units)} "
+                f"({len(batch)} chunks, ~{total} tokens, "
+                f"capítulo: {sp or '(archivo)'})..."
+            )
+    results = _run_proposition_batches_parallel(
+        session,
+        doc_id,
+        doc_path,
+        units,
+        verbose,
+        model_size=model_size,
+        max_parallel=max_parallel,
+    )
+    for (_sp, batch), props in zip(units, results):
+        # Degradación: proposiciones sin chunk asignable (span no localizable)
+        # se descartan — kag_propositions.chunk_id es NOT NULL.
+        props = [p for p in props if p["chunk_id"] is not None]
+        _store_propositions(session, doc_id, props, embed_fn=embed_fn)
+        for ch in batch:
+            session.execute(
+                text("UPDATE kag_chunks SET content_hash = :h WHERE id = :id"),
+                {"h": _chunk_content_hash(ch["content"]), "id": ch["id"]},
+            )
 
 
 # ---------------------------------------------------------------------
@@ -991,16 +1403,57 @@ def summarize_document(session, text, doc_type):
                 max_tokens=200,
             ).strip()
         section_summaries = []
-        for sec in _split_h1_h2(text):
-            truncated = sec[:SUMMARY_MAX_CHARS]
-            s = complete_local(
-                session,
-                summary_user.format(text=truncated),
-                system=summary_system,
-                max_tokens=60,
-            ).strip()
-            if s:
-                section_summaries.append(s)
+        sections = _split_h1_h2(text)
+        if not sections:
+            return ""
+        max_parallel = get_config_value(
+            resolve_config(session), "KAG_SUMMARY_PARALLEL", 3
+        )
+        if max_parallel and max_parallel > 1 and len(sections) > 1:
+            # Fase map en paralelo: cada sección es una llamada complete_local
+            # independiente. Se recolectan los resultados indexados para
+            # preservar el orden original de _split_h1_h2 (el combined va en
+            # el orden del documento). El reduce final sigue siendo secuencial.
+            def _map_section(i, sec):
+                truncated = sec[:SUMMARY_MAX_CHARS]
+                s = complete_local(
+                    session,
+                    summary_user.format(text=truncated),
+                    system=summary_system,
+                    max_tokens=60,
+                ).strip()
+                return i, s
+
+            try:
+                with ThreadPoolExecutor(max_workers=max_parallel) as ex:
+                    results = list(ex.map(_map_section, range(len(sections)), sections))
+                for i, s in results:
+                    if s:
+                        section_summaries.append(s)
+            except Exception as exc:  # noqa: BLE001 — degradación no bloqueante
+                print(f"[KAG] ⚠ Fase map paralela no disponible: {exc}")
+                # Fallback secuencial: mismo resultado, solo más lento.
+                for sec in sections:
+                    truncated = sec[:SUMMARY_MAX_CHARS]
+                    s = complete_local(
+                        session,
+                        summary_user.format(text=truncated),
+                        system=summary_system,
+                        max_tokens=60,
+                    ).strip()
+                    if s:
+                        section_summaries.append(s)
+        else:
+            for sec in sections:
+                truncated = sec[:SUMMARY_MAX_CHARS]
+                s = complete_local(
+                    session,
+                    summary_user.format(text=truncated),
+                    system=summary_system,
+                    max_tokens=60,
+                ).strip()
+                if s:
+                    section_summaries.append(s)
         if not section_summaries:
             return ""
         combined = "\n".join(f"- {s}" for s in section_summaries)
@@ -1059,18 +1512,58 @@ def _find_chunk_for_image(session, doc_id, image_name):
 
 
 def _index_figures(session, doc_id, md_path, md_text, verbose=True) -> int:
-    """Indexa las figuras de images/[docname]/ si la carpeta existe."""
+    """Indexa las figuras de images/[docname]/ si la carpeta existe.
+
+    Las figuras de un documento son independientes: se recolectan primero
+    (sin llamar al VLM) y se despachan en paralelo con ThreadPoolExecutor
+    (KAG_FIGURE_PARALLEL, default 3 hilos). La lectura base64 + complete_vision
+    no tienen dependencias entre sí. El INSERT se hace en orden determinista
+    (sorted por nombre de archivo). Si el pool falla, se degrada a secuencial
+    — nunca romper.
+    """
     docname = md_path.stem
     images_dir = IMAGES_DIR / docname
     if not images_dir.exists():
         return 0
-    count = 0
+    # 1. Recolectar TODAS las figuras sin llamar al VLM (caption/chunk_id son
+    #    baratos y dependen de la sesión — se hacen en el hilo principal).
+    figures = []
     for img in sorted(images_dir.iterdir()):
         if img.suffix.lower() not in (".jpg", ".jpeg", ".png"):
             continue
-        caption = _find_caption(md_text, img.name)
-        chunk_id = _find_chunk_for_image(session, doc_id, img.name)
-        description = sanitize_text(describe_figure(session, str(img), caption))
+        figures.append(
+            {
+                "img": img,
+                "caption": _find_caption(md_text, img.name),
+                "chunk_id": _find_chunk_for_image(session, doc_id, img.name),
+            }
+        )
+    if not figures:
+        return 0
+    # 2. Despachar describe_figure en paralelo (VLM). Orden determinista:
+    #    results[i] corresponde a figures[i] (sorted por nombre).
+    config = resolve_config(session)
+    max_workers = int(get_config_value(config, "KAG_FIGURE_PARALLEL", 3) or 3)
+    if max_workers < 1:
+        max_workers = 3
+    results: list[str] = [""] * len(figures)
+    try:
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(figures))) as ex:
+            futures = [
+                ex.submit(describe_figure, session, str(f["img"]), f["caption"])
+                for f in figures
+            ]
+            for i, fut in enumerate(futures):
+                results[i] = fut.result()
+    except Exception as exc:  # noqa: BLE001 — degradación: secuencial
+        if verbose:
+            print(f"[KAG] ⚠ Pool de figuras falló ({exc}) — secuencial.")
+        results = [
+            describe_figure(session, str(f["img"]), f["caption"]) for f in figures
+        ]
+    # 3. INSERT por figura en orden determinista (como antes).
+    count = 0
+    for f, description in zip(figures, results):
         session.execute(
             text(
                 "INSERT INTO kag_figures "
@@ -1079,10 +1572,10 @@ def _index_figures(session, doc_id, md_path, md_text, verbose=True) -> int:
             ),
             {
                 "doc_id": doc_id,
-                "chunk_id": chunk_id,
-                "image_path": f"images/{docname}/{img.name}",
-                "caption": caption,
-                "description": description,
+                "chunk_id": f["chunk_id"],
+                "image_path": f"images/{docname}/{f['img'].name}",
+                "caption": f["caption"],
+                "description": sanitize_text(description),
             },
         )
         count += 1
@@ -1128,13 +1621,26 @@ def index_document(
     por defecto se usa la extracción determinista con spaCy (gratis).
 
     `extract_propositions=True` (default) extrae y persiste proposiciones
-    atómicas por chunk en `kag_propositions` (capa micro, migración 0024).
-    Con False el hook se salta: comportamiento clásico EXACTO.
+    atómicas en `kag_propositions` (capa micro, migración 0024). La
+    extracción es un paso APARTE del chunking (etapa 'chunked', sobre TODOS
+    los chunks ya persistidos): agrupación doc→capítulo (section_path ya
+    detectado; capítulos >30k tokens = grupo propio, el resto a nivel de
+    archivo), batching por tokens (KAG_PROPOSITION_BATCH_SIZE, default 400k)
+    con UNA llamada LLM por lote, llamadas en paralelo (semáforo,
+    KAG_PROPOSITION_PARALLEL) y cache por content_hash (0026) — los chunks
+    ya extraídos con hash idéntico se saltan en re-ingestas. Con False el
+    hook se salta: comportamiento clásico EXACTO.
     """
     md_path = Path(md_path)
     if not md_path.exists():
         raise FileNotFoundError(f"No existe {md_path}")
     doc_path = str(md_path.relative_to(DOCS_DIR)).replace("\\", "/")
+    # Flags de proposiciones desde config (KAG_EXTRACT_PROPOSITIONS,
+    # KAG_PROPOSITION_BATCH_SIZE, KAG_PROPOSITION_MODEL,
+    # KAG_PROPOSITION_PARALLEL) combinadas con el param de compatibilidad.
+    extract_propositions, prop_batch_size, prop_model_size, prop_max_parallel = (
+        _proposition_flags(session, extract_propositions)
+    )
     # OJO: la variable se llama md_text (NO text) para no sombrear la función
     # text() de SQLAlchemy — un bug previo rompía la ingesta con
     # "'str' object is not callable" en el primer SELECT.
@@ -1278,8 +1784,8 @@ def index_document(
                     text(
                         "INSERT INTO kag_chunks "
                         "(doc_id, chunk_index, section_path, content, token_estimate, "
-                        "embedding) VALUES (:doc_id, :chunk_index, :section_path, "
-                        ":content, :token_estimate, NULL) "
+                        "content_hash, embedding) VALUES (:doc_id, :chunk_index, "
+                        ":section_path, :content, :token_estimate, :content_hash, NULL) "
                     ),
                     {
                         "doc_id": doc_id,
@@ -1287,6 +1793,7 @@ def index_document(
                         "section_path": chunk["section_path"],
                         "content": chunk["content"],
                         "token_estimate": chunk["token_estimate"],
+                        "content_hash": _chunk_content_hash(chunk["content"]),
                     },
                 )
                 chunk_count += 1
@@ -1315,6 +1822,15 @@ def index_document(
             # la ingesta). El lote se parte en bloques de EMBED_BATCH_SIZE para
             # no reventar la memoria del modelo.
             EMBED_BATCH_SIZE = 32
+            # nlp.pipe multi-core (KAG_ENTITY_N_PROCESS, default 1 — seguro en
+            # Windows/macOS donde multiprocessing necesita el guard
+            # if __name__ == "__main__"). >1 solo si el entorno lo soporta;
+            # extract_entities_deterministic_batch degrada a 1 si falla.
+            _config = resolve_config(session)
+            entity_n_process = int(
+                get_config_value(_config, "KAG_ENTITY_N_PROCESS", 1) or 1
+            )
+            entity_n_process = max(entity_n_process, 1)
             chunk_rows = session.execute(
                 text(
                     "SELECT id, content, chunk_index, section_path FROM kag_chunks "
@@ -1339,6 +1855,24 @@ def index_document(
                     if verbose:
                         print(f"[KAG] ⚠ Embedding falló (lote {start}): {exc}")
                     embs = [None] * len(batch)
+                # Extracción determinista con spaCy (gratis): reutiliza el nlp
+                # del segmentador (ya cargado) y canonicaliza con el modelo de
+                # embeddings de la DB (embed_texts, batch). Con nlp.pipe
+                # multi-core (KAG_ENTITY_N_PROCESS, default 1) se procesan
+                # TODOS los chunks del lote en paralelo (fuera del GIL para
+                # noun chunks, lematización y filtrado sintáctico).
+                if llm_entities:
+                    batch_data = None
+                else:
+                    from src.kag.entities import extract_entities_deterministic_batch
+
+                    batch_data = extract_entities_deterministic_batch(
+                        segmenter.nlp,
+                        [r.content for r in batch],
+                        embed_fn=embed_texts,
+                        lang=lang,
+                        n_process=entity_n_process,
+                    )
                 for i, row in enumerate(batch):
                     session.execute(
                         text(
@@ -1355,37 +1889,27 @@ def index_document(
                     if llm_entities:
                         data = extract_entities_relations(session, row.content)
                     else:
-                        # Extracción determinista con spaCy (gratis): reutiliza
-                        # el nlp del segmentador (ya cargado) y canonicaliza con
-                        # el modelo de embeddings de la DB (embed_texts, batch).
-                        from src.kag.entities import extract_entities_deterministic
-
-                        data = extract_entities_deterministic(
-                            segmenter.nlp,
-                            row.content,
-                            embed_fn=embed_texts,
-                            lang=lang,
-                        )
+                        data = batch_data[i]
                     _store_entities_relations(
                         session, doc_id, row.id, data, embed_fn=embed_texts
                     )
-                    if extract_propositions:
-                        # Capa micro: proposiciones atómicas por chunk (0024).
-                        # Degradación natural: si el LLM falla, _extract_propositions
-                        # devuelve [] y la ingesta sigue (comportamiento clásico).
-                        props = _extract_propositions(
-                            session,
-                            doc_id,
-                            row.id,
-                            row.content,
-                            doc_path,
-                            row.chunk_index,
-                            row.section_path,
-                            verbose,
-                        )
-                        _store_propositions(
-                            session, doc_id, props, embed_fn=embed_texts
-                        )
+            # ── Paso APARTE del chunking: proposiciones atómicas ──────────
+            # Opera sobre TODOS los chunks ya persistidos (no chunk por chunk
+            # en el bucle de embeddings). Batching por tokens
+            # (KAG_PROPOSITION_BATCH_SIZE, default 250k) con UNA llamada LLM
+            # por lote + cache por content_hash (0026): los chunks ya
+            # extraídos con hash idéntico se saltan en re-ingestas.
+            if extract_propositions:
+                _extract_propositions_for_doc(
+                    session,
+                    doc_id,
+                    doc_path,
+                    verbose,
+                    prop_batch_size,
+                    embed_fn=embed_texts,
+                    model_size=prop_model_size,
+                    max_parallel=prop_max_parallel,
+                )
             set_stage(session, "kag_documents", doc_id, "chunked")
 
         entity_count = session.execute(

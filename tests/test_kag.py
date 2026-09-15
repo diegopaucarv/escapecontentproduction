@@ -2223,3 +2223,400 @@ def test_maintain_word_freq_deletes_and_inserts():
     assert "INSERT INTO kag_word_freq" in insert_sql
     assert "unnest(c.content_tsv)" in insert_sql
     assert insert_params == {"doc_id": 42}
+
+
+# ---------------------------------------------------------------------
+# _index_figures — procesamiento paralelo de figuras (VLM)
+# ---------------------------------------------------------------------
+
+
+class _FiguresSession:
+    """Sesión falsa para _index_figures: captura los INSERTs en orden.
+
+    `_find_chunk_for_image` hace un SELECT con LIKE → devuelve un chunk_id
+    derivado del nombre de la imagen (determinista).
+    """
+
+    def __init__(self):
+        self.inserts = []
+
+    def execute(self, stmt, params=None):
+        sql = str(stmt)
+        if "INSERT INTO kag_figures" in sql:
+            self.inserts.append(dict(params))
+        elif "kag_chunks" in sql:
+
+            class _Result:
+                def first(self):
+                    return SimpleNamespace(id=100 + len(params["pat"]))
+
+            return _Result()
+        return None
+
+
+def _make_figures_dir(tmp_path, names):
+    """Crea images/<docname>/ con archivos de imagen (contenido dummy)."""
+    images_dir = tmp_path / "images" / "doc"
+    images_dir.mkdir(parents=True)
+    for name in names:
+        (images_dir / name).write_bytes(b"\x89PNG\r\n")
+    return images_dir
+
+
+def test_index_figures_parallel_deterministic_order(monkeypatch, tmp_path):
+    """describe_figure se llama por cada figura (en paralelo) y el INSERT
+    mantiene el orden determinista (sorted por nombre de archivo)."""
+    import src.kag_ingest as ki
+
+    _make_figures_dir(tmp_path, ["b.png", "a.png", "c.png"])
+    md_path = tmp_path / "doc.md"
+    md_path.write_text("![fig a](images/doc/a.png)\n![fig b](images/doc/b.png)")
+
+    calls = []
+
+    def fake_describe(session, image_path, caption):
+        calls.append((image_path, caption))
+        return f"descripción de {image_path}"
+
+    monkeypatch.setattr(ki, "describe_figure", fake_describe)
+    monkeypatch.setattr(ki, "IMAGES_DIR", tmp_path / "images")
+
+    session = _FiguresSession()
+    count = ki._index_figures(
+        session, doc_id=1, md_path=md_path, md_text=md_path.read_text()
+    )
+
+    assert count == 3
+    # describe_figure se llamó para las 3 figuras.
+    assert len(calls) == 3
+    # INSERT en orden determinista (sorted por nombre: a, b, c).
+    assert [i["image_path"] for i in session.inserts] == [
+        "images/doc/a.png",
+        "images/doc/b.png",
+        "images/doc/c.png",
+    ]
+    # Captions correctos.
+    assert session.inserts[0]["caption"] == "fig a"
+    assert session.inserts[1]["caption"] == "fig b"
+    assert session.inserts[2]["caption"] == ""
+    # Descripciones sanitizadas.
+    assert session.inserts[0]["description"] == "descripción de " + str(
+        tmp_path / "images" / "doc" / "a.png"
+    )
+
+
+def test_index_figures_pool_failure_degrades_to_sequential(monkeypatch, tmp_path):
+    """Si el pool falla (p. ej. ThreadPoolExecutor roto), se degrada a
+    secuencial — nunca romper, mismo resultado."""
+    import src.kag_ingest as ki
+
+    _make_figures_dir(tmp_path, ["a.png", "b.png"])
+    md_path = tmp_path / "doc.md"
+    md_path.write_text("![fig a](images/doc/a.png)")
+
+    calls = []
+
+    def fake_describe(session, image_path, caption):
+        calls.append(image_path)
+        return f"desc {image_path}"
+
+    monkeypatch.setattr(ki, "describe_figure", fake_describe)
+    monkeypatch.setattr(ki, "IMAGES_DIR", tmp_path / "images")
+
+    class _BrokenPool:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("pool no disponible")
+
+    monkeypatch.setattr(ki, "ThreadPoolExecutor", _BrokenPool)
+
+    session = _FiguresSession()
+    count = ki._index_figures(
+        session, doc_id=1, md_path=md_path, md_text=md_path.read_text()
+    )
+
+    assert count == 2
+    assert len(calls) == 2  # secuencial: ambas figuras procesadas
+    assert [i["image_path"] for i in session.inserts] == [
+        "images/doc/a.png",
+        "images/doc/b.png",
+    ]
+
+
+def test_index_figures_no_images_dir_returns_zero(monkeypatch, tmp_path):
+    import src.kag_ingest as ki
+
+    md_path = tmp_path / "doc.md"
+    md_path.write_text("sin figuras")
+    monkeypatch.setattr(ki, "IMAGES_DIR", tmp_path / "images")
+
+    session = _FiguresSession()
+    assert ki._index_figures(session, doc_id=1, md_path=md_path, md_text="") == 0
+    assert session.inserts == []
+
+
+# ---------------------------------------------------------------------
+# summarize_document — fase map paralela (KAG_SUMMARY_PARALLEL)
+# ---------------------------------------------------------------------
+
+
+class _SummarySession:
+    """Sesión falsa: load_settings y _get_prompt_pair devuelven constantes."""
+
+    def execute(self, stmt, params=None):
+        class _R:
+            def scalars(self):
+                return self
+
+            def first(self):
+                return None
+
+        return _R()
+
+
+def _patch_summary_deps(monkeypatch, fake_complete):
+    """Parchea load_settings/_get_prompt_pair/complete_local de kag_ingest."""
+    import src.kag_ingest as ki
+
+    monkeypatch.setattr(
+        ki,
+        "load_settings",
+        lambda session: SimpleNamespace(small_model="qwen2.5-3b"),
+    )
+    monkeypatch.setattr(
+        ki,
+        "_get_prompt_pair",
+        lambda *a, **k: ("SYS", "<text>\n{text}\n</text>\n\nSummary:"),
+    )
+    monkeypatch.setattr(ki, "complete_local", fake_complete)
+    return ki
+
+
+LONG_MD = (
+    "# Cap 1\n\nContenido del capítulo uno.\n\n"
+    "## Sección 1.1\n\nDetalle de la sección 1.1.\n\n"
+    "# Cap 2\n\nContenido del capítulo dos.\n\n"
+    "## Sección 2.1\n\nDetalle de la sección 2.1."
+)
+
+
+def test_summarize_long_map_parallel_preserves_order(monkeypatch):
+    """La fase map se ejecuta en paralelo y el combined respeta el orden
+    original de las secciones (el reduce recibe el combined en orden)."""
+    import src.kag_ingest as ki
+
+    calls = []
+
+    def fake_complete(session, prompt, system=None, max_tokens=None, **kw):
+        calls.append((prompt, max_tokens))
+        # Extrae el texto de la sección del prompt y lo usa como resumen.
+        inner = prompt.split("<text>\n", 1)[1].split("\n</text>", 1)[0]
+        return f"resumen:{inner[:20]}"
+
+    ki = _patch_summary_deps(monkeypatch, fake_complete)
+    monkeypatch.setattr(
+        ki, "resolve_config", lambda session: {"KAG_SUMMARY_PARALLEL": 3}
+    )
+
+    result = ki.summarize_document(_SummarySession(), LONG_MD, "long")
+
+    # 4 secciones H1/H2 + 1 reduce = 5 llamadas.
+    assert len(calls) == 5
+    # Las 4 llamadas map usan max_tokens=60; el reduce usa 200.
+    map_calls = [c for c in calls if c[1] == 60]
+    reduce_calls = [c for c in calls if c[1] == 200]
+    assert len(map_calls) == 4
+    assert len(reduce_calls) == 1
+    # El combined del reduce contiene los resúmenes en el orden del documento.
+    combined = reduce_calls[0][0]
+    assert combined.index("resumen:# Cap 1") < combined.index("resumen:## Sección 1.1")
+    assert combined.index("resumen:## Sección 1.1") < combined.index("resumen:# Cap 2")
+    assert combined.index("resumen:# Cap 2") < combined.index("resumen:## Sección 2.1")
+    # El reduce recibe el combined y devuelve su propio resumen.
+    assert result.startswith("resumen:- resumen:# Cap 1")
+
+
+def test_summarize_long_map_parallel_actually_concurrent(monkeypatch):
+    """Con KAG_SUMMARY_PARALLEL>1 las llamadas map se solapan en el tiempo
+    (concurrencia real, no secuencial)."""
+    import threading
+
+    import src.kag_ingest as ki
+
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def fake_complete(session, prompt, system=None, max_tokens=None, **kw):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        import time
+
+        time.sleep(0.02)
+        with lock:
+            active -= 1
+        return "s"
+
+    ki = _patch_summary_deps(monkeypatch, fake_complete)
+    monkeypatch.setattr(
+        ki, "resolve_config", lambda session: {"KAG_SUMMARY_PARALLEL": 3}
+    )
+
+    ki.summarize_document(_SummarySession(), LONG_MD, "long")
+    assert max_active >= 2  # al menos 2 llamadas map solapadas
+
+
+def test_summarize_long_reduce_called_once_with_combined(monkeypatch):
+    """El reduce se llama UNA vez con el combined de todos los map."""
+    import src.kag_ingest as ki
+
+    reduce_prompts = []
+
+    def fake_complete(session, prompt, system=None, max_tokens=None, **kw):
+        if max_tokens == 200:
+            reduce_prompts.append(prompt)
+            return "RESUMEN FINAL"
+        inner = prompt.split("<text>\n", 1)[1].split("\n</text>", 1)[0]
+        return f"map:{inner[:30]}"
+
+    ki = _patch_summary_deps(monkeypatch, fake_complete)
+    monkeypatch.setattr(
+        ki, "resolve_config", lambda session: {"KAG_SUMMARY_PARALLEL": 3}
+    )
+
+    result = ki.summarize_document(_SummarySession(), LONG_MD, "long")
+
+    assert result == "RESUMEN FINAL"
+    assert len(reduce_prompts) == 1
+    combined = reduce_prompts[0].split("<text>\n", 1)[1].split("\n</text>", 1)[0]
+    assert combined.startswith("- map:# Cap 1")
+    assert "- map:## Sección 1.1" in combined
+    assert "- map:# Cap 2" in combined
+    assert "- map:## Sección 2.1" in combined
+
+
+def test_summarize_long_map_skips_failed_sections(monkeypatch):
+    """Degradación: una sección que falla ('' o excepción) se omite; las
+    demás se resumen y el reduce se llama con las que sobreviven."""
+    import src.kag_ingest as ki
+
+    def fake_complete(session, prompt, system=None, max_tokens=None, **kw):
+        if max_tokens == 200:
+            return "RESUMEN FINAL"
+        if "Cap 2" in prompt:
+            return ""  # sección fallida → se omite
+        return f"map:{prompt[:10]}"
+
+    ki = _patch_summary_deps(monkeypatch, fake_complete)
+    monkeypatch.setattr(
+        ki, "resolve_config", lambda session: {"KAG_SUMMARY_PARALLEL": 3}
+    )
+
+    result = ki.summarize_document(_SummarySession(), LONG_MD, "long")
+    assert result == "RESUMEN FINAL"
+
+
+def test_summarize_long_all_map_fail_returns_empty(monkeypatch):
+    """Degradación: si todas las secciones fallan → '' (nunca romper)."""
+    import src.kag_ingest as ki
+
+    def fake_complete(session, prompt, system=None, max_tokens=None, **kw):
+        return ""  # todas las secciones fallan
+
+    ki = _patch_summary_deps(monkeypatch, fake_complete)
+    monkeypatch.setattr(
+        ki, "resolve_config", lambda session: {"KAG_SUMMARY_PARALLEL": 3}
+    )
+
+    assert ki.summarize_document(_SummarySession(), LONG_MD, "long") == ""
+
+
+def test_summarize_long_parallel_1_is_sequential(monkeypatch):
+    """KAG_SUMMARY_PARALLEL=1 → comportamiento clásico secuencial (mismo
+    resultado, sin pool)."""
+    import src.kag_ingest as ki
+
+    calls = []
+
+    def fake_complete(session, prompt, system=None, max_tokens=None, **kw):
+        calls.append(max_tokens)
+        inner = prompt.split("<text>\n", 1)[1].split("\n</text>", 1)[0]
+        return f"s:{inner[:10]}"
+
+    ki = _patch_summary_deps(monkeypatch, fake_complete)
+    monkeypatch.setattr(
+        ki, "resolve_config", lambda session: {"KAG_SUMMARY_PARALLEL": 1}
+    )
+
+    result = ki.summarize_document(_SummarySession(), LONG_MD, "long")
+    assert result.startswith("s:- s:# Cap")
+    assert calls == [60, 60, 60, 60, 200]  # 4 map + 1 reduce, en orden
+
+
+def test_summarize_long_pool_failure_degrades_to_sequential(monkeypatch):
+    """Si el pool falla (ThreadPoolExecutor roto) → fallback secuencial con
+    el mismo resultado (nunca romper)."""
+    import src.kag_ingest as ki
+
+    calls = []
+
+    def fake_complete(session, prompt, system=None, max_tokens=None, **kw):
+        calls.append(max_tokens)
+        inner = prompt.split("<text>\n", 1)[1].split("\n</text>", 1)[0]
+        return f"s:{inner[:10]}"
+
+    ki = _patch_summary_deps(monkeypatch, fake_complete)
+    monkeypatch.setattr(
+        ki, "resolve_config", lambda session: {"KAG_SUMMARY_PARALLEL": 3}
+    )
+
+    class _BrokenPool:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("pool no disponible")
+
+    monkeypatch.setattr(ki, "ThreadPoolExecutor", _BrokenPool)
+
+    result = ki.summarize_document(_SummarySession(), LONG_MD, "long")
+    assert result.startswith("s:- s:# Cap")
+    assert calls == [60, 60, 60, 60, 200]  # fallback secuencial completo
+
+
+def test_summarize_short_unchanged(monkeypatch):
+    """doc_type='short' sigue siendo una sola llamada (sin map-reduce)."""
+    import src.kag_ingest as ki
+
+    calls = []
+
+    def fake_complete(session, prompt, system=None, max_tokens=None, **kw):
+        calls.append(max_tokens)
+        return "RESUMEN CORTO"
+
+    ki = _patch_summary_deps(monkeypatch, fake_complete)
+    monkeypatch.setattr(
+        ki, "resolve_config", lambda session: {"KAG_SUMMARY_PARALLEL": 3}
+    )
+
+    result = ki.summarize_document(_SummarySession(), "texto corto", "short")
+    assert result == "RESUMEN CORTO"
+    assert calls == [200]
+
+
+def test_summarize_long_reads_parallel_from_config(monkeypatch):
+    """KAG_SUMMARY_PARALLEL se lee de config (env var KAG_SUMMARY_PARALLEL)."""
+    import src.kag_ingest as ki
+
+    seen = {}
+
+    def fake_resolve(session):
+        seen["called"] = True
+        return {"KAG_SUMMARY_PARALLEL": 2}
+
+    def fake_complete(session, prompt, system=None, max_tokens=None, **kw):
+        return "s"
+
+    ki = _patch_summary_deps(monkeypatch, fake_complete)
+    monkeypatch.setattr(ki, "resolve_config", fake_resolve)
+
+    ki.summarize_document(_SummarySession(), LONG_MD, "long")
+    assert seen.get("called") is True

@@ -228,27 +228,21 @@ def _canonicalize(
     return result
 
 
-def extract_entities_deterministic(
-    nlp,
-    text: str,
+def _entities_from_doc(
+    doc,
     embed_fn=None,
     sim_threshold: float = DEFAULT_SIM_THRESHOLD,
     min_freq: int = 2,
     lang: str = "es",
     gap_margin: float | None = None,
 ) -> dict:
-    """Extrae entidades (sustantivos vía depparse) y relaciones (co-ocurrencia).
+    """Entidades/relaciones de un doc spaCy YA parseado (sin nlp(text)).
 
-    Sin LLM. `nlp` es un pipeline spaCy ya cargado (p. ej. el del
-    segmentador). `embed_fn` (opcional) embebe una lista de strings → lista
-    de vectores (p. ej. src.embeddings.embed_texts) para canonicalizar
-    variantes superficiales.
-
-    Devuelve {"entities": [{"name", "type", "description"}],
-              "relations": [{"source", "target", "type", "description"}]}
-    — el mismo shape que espera _store_entities_relations.
+    Cuerpo compartido de extract_entities_deterministic (una doc) y
+    extract_entities_deterministic_batch (nlp.pipe multi-core): candidatos,
+    filtro de frecuencia, canonicalización por embeddings y relaciones de
+    co-ocurrencia. Devuelve {"entities": [...], "relations": [...]}.
     """
-    doc = nlp(text)
     if doc is None:
         return {"entities": [], "relations": []}
 
@@ -316,3 +310,69 @@ def extract_entities_deterministic(
                     }
                 )
     return {"entities": entities, "relations": relations}
+
+
+def extract_entities_deterministic(
+    nlp,
+    text: str,
+    embed_fn=None,
+    sim_threshold: float = DEFAULT_SIM_THRESHOLD,
+    min_freq: int = 2,
+    lang: str = "es",
+    gap_margin: float | None = None,
+) -> dict:
+    """Extrae entidades (sustantivos vía depparse) y relaciones (co-ocurrencia).
+
+    Sin LLM. `nlp` es un pipeline spaCy ya cargado (p. ej. el del
+    segmentador). `embed_fn` (opcional) embebe una lista de strings → lista
+    de vectores (p. ej. src.embeddings.embed_texts) para canonicalizar
+    variantes superficiales.
+
+    Devuelve {"entities": [{"name", "type", "description"}],
+              "relations": [{"source", "target", "type", "description"}]}
+    — el mismo shape que espera _store_entities_relations.
+    """
+    return _entities_from_doc(
+        nlp(text), embed_fn, sim_threshold, min_freq, lang, gap_margin
+    )
+
+
+def extract_entities_deterministic_batch(
+    nlp,
+    texts: list[str],
+    embed_fn=None,
+    sim_threshold: float = DEFAULT_SIM_THRESHOLD,
+    min_freq: int = 2,
+    lang: str = "es",
+    gap_margin: float | None = None,
+    n_process: int = 1,
+    batch_size: int = 64,
+) -> list[dict]:
+    """Versión batch de extract_entities_deterministic con nlp.pipe multi-core.
+
+    Procesa todos los textos con UNA llamada a nlp.pipe(texts, n_process=N,
+    batch_size=B) — spaCy reparte los docs entre N procesos (fuera del GIL
+    para noun chunks, lematización y filtrado sintáctico). Devuelve una
+    lista ALINEADA con `texts` (mismo orden), cada elemento con el shape
+    {"entities": [...], "relations": [...]}.
+
+    `n_process>1` usa multiprocessing: en Windows/macOS (spawn) requiere el
+    guard `if __name__ == "__main__"` en el entrypoint. Si nlp.pipe falla
+    con n_process>1, se degrada a secuencial (n_process=1) — nunca romper.
+    """
+    if not texts:
+        return []
+    try:
+        docs = nlp.pipe(texts, n_process=n_process, batch_size=batch_size)
+        results = [
+            _entities_from_doc(doc, embed_fn, sim_threshold, min_freq, lang, gap_margin)
+            for doc in docs
+        ]
+    except Exception:  # noqa: BLE001 — degradación: multiprocessing no disponible
+        results = [
+            _entities_from_doc(
+                nlp(text), embed_fn, sim_threshold, min_freq, lang, gap_margin
+            )
+            for text in texts
+        ]
+    return results

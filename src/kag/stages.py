@@ -116,7 +116,8 @@ CLEANUP_SQL: dict[str, dict[str, list[str]]] = {
             # El índice de frecuencia de palabras se reescribe por doc en esta
             # etapa (migración 0023): limpiarlo junto con los chunks.
             "DELETE FROM kag_word_freq WHERE doc_id = :doc_id",
-            # Las proposiciones se re-extraen junto con el chunking (0024).
+            # Las proposiciones se borran con los chunks (CASCADE); el DELETE
+            # explícito es redundante pero inofensivo.
             "DELETE FROM kag_propositions WHERE doc_id = :doc_id",
         ],
         "chunked": [
@@ -124,8 +125,9 @@ CLEANUP_SQL: dict[str, dict[str, list[str]]] = {
             # están; se re-insertan con embedding).
             "DELETE FROM kag_relations WHERE doc_id = :doc_id",
             "DELETE FROM kag_entities WHERE doc_id = :doc_id",
-            # Las proposiciones se re-extraen junto con el chunking (0024).
-            "DELETE FROM kag_propositions WHERE doc_id = :doc_id",
+            # Las proposiciones NO se borran: la extracción es un paso aparte
+            # con cache por content_hash (0026) — los chunks ya extraídos con
+            # hash idéntico se saltan al reanudar.
         ],
         "figures": [
             "DELETE FROM kag_figures WHERE doc_id = :doc_id",

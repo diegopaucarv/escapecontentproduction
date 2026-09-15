@@ -15,6 +15,7 @@ from src.kag.entities import (
     _norm,
     _strip_leading_determiners,
     extract_entities_deterministic,
+    extract_entities_deterministic_batch,
 )
 
 # ---------------------------------------------------------------------
@@ -397,3 +398,143 @@ def test_extract_entities_deterministic_frequency_filter():
     data = extract_entities_deterministic(nlp, "texto", embed_fn=None, lang="es")
     # "gato" aparece 1 vez, no es PROPN → filtrado por frecuencia.
     assert data["entities"] == []
+
+
+# ---------------------------------------------------------------------
+# extract_entities_deterministic_batch — nlp.pipe multi-core
+# ---------------------------------------------------------------------
+
+
+class _FakeNlpPipe:
+    """Fake de spaCy con pipe(): devuelve un doc por texto (mismo orden).
+
+    Registra los kwargs de la última llamada a pipe (n_process, batch_size)
+    para verificar el despacho multi-core sin importar spaCy real.
+    """
+
+    def __init__(self, docs_by_text):
+        self._docs = docs_by_text
+        self.pipe_calls = []
+
+    def __call__(self, text):
+        return self._docs[text]
+
+    def pipe(self, texts, n_process=1, batch_size=64):
+        self.pipe_calls.append((list(texts), n_process, batch_size))
+        return [self._docs[t] for t in texts]
+
+
+def _doc_for(tokens, chunks=None, sents=None):
+    return _FakeDoc(tokens, chunks=chunks, sents=sents or [_FakeSent(tokens)])
+
+
+def test_batch_returns_aligned_list():
+    # Dos textos independientes → lista de 2 dicts en el MISMO orden.
+    toks_a = [_tok("El", "DET"), _tok("capital", "NOUN"), _tok("cultural", "ADJ")]
+    toks_b = [_tok("La", "DET"), _tok("red", "NOUN"), _tok("neuronal", "ADJ")]
+    docs = {
+        "texto a": _doc_for(toks_a, chunks=[_FakeChunk(toks_a, root_idx=1)]),
+        "texto b": _doc_for(toks_b, chunks=[_FakeChunk(toks_b, root_idx=1)]),
+    }
+    nlp = _FakeNlpPipe(docs)
+
+    results = extract_entities_deterministic_batch(
+        nlp, ["texto a", "texto b"], embed_fn=None, lang="es"
+    )
+
+    assert len(results) == 2
+    assert {e["name"] for e in results[0]["entities"]} == {"capital cultural"}
+    assert {e["name"] for e in results[1]["entities"]} == {"red neuronal"}
+    # n_process=1 por default: pipe se llamó con n_process=1.
+    assert nlp.pipe_calls[0][1] == 1
+
+
+def test_batch_matches_single_per_text():
+    # El batch produce el MISMO resultado que la versión single por texto.
+    toks_a = [_tok("El", "DET"), _tok("capital", "NOUN"), _tok("cultural", "ADJ")]
+    toks_b = [_tok("La", "DET"), _tok("red", "NOUN"), _tok("neuronal", "ADJ")]
+    docs = {
+        "texto a": _doc_for(toks_a, chunks=[_FakeChunk(toks_a, root_idx=1)]),
+        "texto b": _doc_for(toks_b, chunks=[_FakeChunk(toks_b, root_idx=1)]),
+    }
+    nlp = _FakeNlpPipe(docs)
+
+    batch = extract_entities_deterministic_batch(
+        nlp, ["texto a", "texto b"], embed_fn=None, lang="es"
+    )
+    single = [
+        extract_entities_deterministic(nlp, t, embed_fn=None, lang="es")
+        for t in ("texto a", "texto b")
+    ]
+
+    assert batch == single
+
+
+def test_batch_n_process_forwarded():
+    # n_process>1 se reenvía a nlp.pipe (el fake lo registra).
+    toks = [_tok("El", "DET"), _tok("capital", "NOUN"), _tok("cultural", "ADJ")]
+    docs = {"texto": _doc_for(toks, chunks=[_FakeChunk(toks, root_idx=1)])}
+    nlp = _FakeNlpPipe(docs)
+
+    extract_entities_deterministic_batch(
+        nlp, ["texto"], embed_fn=None, lang="es", n_process=2, batch_size=16
+    )
+
+    assert nlp.pipe_calls[0][1] == 2
+    assert nlp.pipe_calls[0][2] == 16
+
+
+def test_batch_pipe_failure_degrades_to_sequential():
+    # nlp.pipe con n_process>1 falla (p. ej. Windows sin guard) → degrada a
+    # secuencial (nlp(text) por texto) — nunca romper.
+    class _BrokenPipe:
+        def __init__(self, docs_by_text):
+            self._docs = docs_by_text
+            self.calls = 0
+
+        def __call__(self, text):
+            return self._docs[text]
+
+        def pipe(self, texts, n_process=1, batch_size=64):
+            self.calls += 1
+            raise RuntimeError("multiprocessing no disponible")
+
+    toks_a = [_tok("El", "DET"), _tok("capital", "NOUN"), _tok("cultural", "ADJ")]
+    toks_b = [_tok("La", "DET"), _tok("red", "NOUN"), _tok("neuronal", "ADJ")]
+    docs = {
+        "texto a": _doc_for(toks_a, chunks=[_FakeChunk(toks_a, root_idx=1)]),
+        "texto b": _doc_for(toks_b, chunks=[_FakeChunk(toks_b, root_idx=1)]),
+    }
+    nlp = _BrokenPipe(docs)
+
+    results = extract_entities_deterministic_batch(
+        nlp, ["texto a", "texto b"], embed_fn=None, lang="es", n_process=2
+    )
+
+    # Degradado: mismo resultado que la versión single, sin excepción.
+    assert len(results) == 2
+    assert {e["name"] for e in results[0]["entities"]} == {"capital cultural"}
+    assert {e["name"] for e in results[1]["entities"]} == {"red neuronal"}
+    assert nlp.calls == 1  # pipe se intentó UNA vez
+
+
+def test_batch_empty_texts():
+    assert extract_entities_deterministic_batch(_FakeNlpPipe({}), []) == []
+
+
+def test_batch_none_doc_degrades():
+    # Un doc None dentro del batch → entidades vacías para ese texto.
+    class _NlpNonePipe:
+        def __call__(self, text):
+            return None
+
+        def pipe(self, texts, n_process=1, batch_size=64):
+            return [None for _ in texts]
+
+    results = extract_entities_deterministic_batch(
+        _NlpNonePipe(), ["a", "b"], embed_fn=None, lang="es"
+    )
+    assert results == [
+        {"entities": [], "relations": []},
+        {"entities": [], "relations": []},
+    ]

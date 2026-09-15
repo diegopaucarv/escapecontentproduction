@@ -98,7 +98,7 @@ def test_cleanup_stage_executes_sql():
             pass
 
     cleanup_stage(_FakeSession(), "kag_documents", 42, "chunked")
-    assert len(executed) == 3
+    assert len(executed) == 2
     sql, params = executed[0]
     assert "DELETE FROM kag_relations" in sql
     assert params == {"doc_id": 42}

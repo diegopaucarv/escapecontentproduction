@@ -506,7 +506,7 @@ Summary:""",
         "task_key": "kag_proposition_chunking",
         "user_template": """Archivo: {source_file}
 Documento: {document_id}
-Chunk: {chunk_index} - {chunk_title}
+Capítulo/Sección: {section_path}
 Rango: Línea {line_start} a Línea {line_end}
 
 Texto a procesar:
@@ -514,12 +514,14 @@ Texto a procesar:
 {chapter_text_content}
 ---
 
-Genera el JSON: {"propositions": [{"core_idea_id": str, "argument_id": str, "statement": str, "text_span": str, "char_start": int, "char_end": int, "line_start": int, "line_end": int, "citations_references": [str]}]}""",
-        "version": "1.0",
+Genera el JSON con las proposiciones organizadas por divisiones (capítulos/secciones del texto):
+{"divisions": [{"section_path": str, "propositions": [{"core_idea_id": str, "argument_id": str, "statement": str, "text_span": str, "char_start": int, "char_end": int, "line_start": int, "line_end": int, "citations_references": [str]}]}]}""",
+        "version": "2.0",
         "intent": (
             "Eres un analista de epistemologia y analisis del discurso. Tu "
-            "objetivo es descomponer el texto del chunk en proposiciones "
-            "atomicas gramaticalmente independientes y autocontenidas."
+            "objetivo es descomponer el texto en proposiciones atomicas "
+            "gramaticalmente independientes y autocontenidas, organizadas por "
+            "capitulos/secciones (divisiones)."
         ),
         "rules": [
             (
@@ -530,7 +532,12 @@ Genera el JSON: {"propositions": [{"core_idea_id": str, "argument_id": str, "sta
             "text_span debe contener el fragmento de texto exacto del original",
             (
                 "char_start/char_end y line_start/line_end: offsets absolutos "
-                "del text_span dentro del chunk"
+                "del text_span dentro del texto procesado"
+            ),
+            (
+                "Organizar el output por divisiones: cada division declara su "
+                "section_path (el capitulo/seccion del texto al que pertenecen "
+                "sus proposiciones) y su lista de proposiciones"
             ),
             (
                 "REGLA DE REFERENCIAS DUPLICADAS: si una frase contiene una "
@@ -544,14 +551,13 @@ Genera el JSON: {"propositions": [{"core_idea_id": str, "argument_id": str, "sta
         "input_schema": {
             "source_file": "string",
             "document_id": "string",
-            "chunk_index": "integer",
-            "chunk_title": "string",
+            "section_path": "string",
             "line_start": "integer",
             "line_end": "integer",
             "chapter_text_content": "string",
         },
         "output_schema": {
-            "propositions": "array",
+            "divisions": "array",
         },
         "few_shot": [],
     },
