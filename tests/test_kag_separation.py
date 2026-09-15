@@ -8,7 +8,11 @@ y `call_with_retries` monkeypatcheado. NO se importa src.kag.segmentador
 
 import json
 
-from src.kag_ingest import _build_skeleton, _index_document_separation
+from src.kag_ingest import (
+    _build_skeleton,
+    _index_document_separation,
+    _sanitize_document_id,
+)
 
 
 class _FakeSession:
@@ -153,6 +157,63 @@ def test_separation_llm_sin_document_id_usa_vacio(tmp_path, monkeypatch):
     assert docs[0]["document_id"] == ""
     assert docs[0]["line_start"] == 1
     assert docs[0]["line_end"] == 16
+
+
+def test_sanitize_document_id_trunca_con_hash():
+    """document_id del LLM que excede la columna se trunca con hash corto.
+
+    El LLM de separación a veces usa el nombre completo del archivo como
+    prefijo (p. ej. '100-The Handbook ... Pre_doc_001', >100 chars) y rompía
+    el INSERT con StringDataRightTruncation. El truncado es determinista:
+    mismo input → mismo id (idempotencia intacta).
+    """
+    largo = (
+        "100-The Handbook of Culture and Psychology -- David Matsumoto; "
+        "Hyisung C_ Hwang -- Oxford University Pre_doc_001"
+    )
+    assert len(largo) > 200
+    corto = _sanitize_document_id(largo)
+    assert len(corto) <= 200
+    assert corto.endswith("_" + corto.split("_")[-1])  # sufijo hash presente
+    # Determinista: mismo input → mismo output.
+    assert _sanitize_document_id(largo) == corto
+    # Ids cortos pasan intactos; vacío → vacío.
+    assert _sanitize_document_id("doc_1") == "doc_1"
+    assert _sanitize_document_id("") == ""
+    assert _sanitize_document_id(None) == ""
+
+
+def test_separation_document_id_largo_se_trunca(tmp_path, monkeypatch):
+    """El id largo del LLM se trunca ANTES del dedup y de la persistencia."""
+    md = tmp_path / "stack.md"
+    md.write_text(_md_text(), encoding="utf-8")
+    id_largo = "x" * 300
+
+    def fake_call_with_retries(session, **kwargs):
+        return (
+            json.dumps(
+                {
+                    "documents": [
+                        {
+                            "document_id": id_largo,
+                            "title": "Libro Uno",
+                            "line_start": 1,
+                            "line_end": 8,
+                            "language": "es",
+                        }
+                    ]
+                }
+            ),
+            "fake-large",
+            False,
+        )
+
+    monkeypatch.setattr("src.kag_ingest.call_with_retries", fake_call_with_retries)
+    docs = _index_document_separation(_FakeSession(), md, _md_text(), verbose=False)
+
+    assert len(docs) == 1
+    assert len(docs[0]["document_id"]) <= 200
+    assert docs[0]["document_id"] == _sanitize_document_id(id_largo)
 
 
 # ---------------------------------------------------------------------

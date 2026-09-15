@@ -2703,6 +2703,23 @@ def _title_from_md(text: str, doc_path: str) -> str:
     return sanitize_text(Path(doc_path).stem)[:300]
 
 
+def _sanitize_document_id(did: str, max_len: int = 200) -> str:
+    """Normaliza un document_id del LLM para que quepa en la columna.
+
+    El LLM de separación a veces genera ids larguísimos (nombre completo del
+    archivo + sufijo) que exceden VARCHAR(255). Se trunca a `max_len` y, si
+    hubo truncado, se añade un hash corto del id original para mantener la
+    unicidad y la estabilidad (mismo input → mismo id, idempotencia intacta).
+    """
+    did = str(did or "").strip()
+    if not did:
+        return ""
+    if len(did) <= max_len:
+        return did
+    suffix = hashlib.sha256(did.encode("utf-8")).hexdigest()[:8]
+    return f"{did[: max_len - 9]}_{suffix}"
+
+
 def _build_skeleton(md_text: str, max_chars: int = 2000) -> str:
     """Esqueleto del archivo: primeras ~2000 chars + encabezados H1/H2/H3.
 
@@ -2812,6 +2829,10 @@ def _index_document_separation(session, md_path, md_text, verbose=True) -> list[
     seen_ids = set()
 
     def _append_doc(did, title, ls, le, language):
+        # Normalizar el id del LLM (puede exceder la columna VARCHAR): truncar
+        # con hash corto ANTES del dedup para que la unicidad se evalúe sobre
+        # el id final que se persiste.
+        did = _sanitize_document_id(did)
         if did in seen_ids:
             # Evitar violación del UNIQUE (doc_path, document_id) si el LLM
             # repite ids: sufijo numérico determinista.
@@ -2885,7 +2906,7 @@ def _index_document_separation(session, md_path, md_text, verbose=True) -> list[
                 ls, le = le, ls
             out.append(
                 {
-                    "document_id": str(h.get("document_id") or ""),
+                    "document_id": _sanitize_document_id(h.get("document_id")),
                     "title": (
                         sanitize_text(str(h.get("title") or ""))[:300]
                         or _title_from_md(md_text, source_file)
@@ -3042,7 +3063,7 @@ def _index_document_slice(
     Idempotente por (doc_path, document_id) + content_hash del slice;
     --force re-indexa. Devuelve dict resumen del documento.
     """
-    document_id = str(spec.get("document_id") or "")
+    document_id = _sanitize_document_id(spec.get("document_id"))
     total_lines = len(md_text.splitlines())
     try:
         line_start = int(spec.get("line_start") or 1)
