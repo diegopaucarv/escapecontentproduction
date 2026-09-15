@@ -468,11 +468,14 @@ def grounded_entity_linking(session, query: str) -> list:
     return candidates
 
 
-def match_entities_candidates(session, names: list) -> list:
+def match_entities_candidates(session, names: list, embed_fn=None) -> list:
     """Candidatos por mención: lista de listas de ids.
 
-    Exacto por name_norm primero; si no hay, LIKE (hasta 5). Cada mención
-    puede tener 0..N candidatos — la desambiguación por copresencia decide.
+    Exacto por name_norm primero; si no hay, LIKE (hasta 5); si aún no hay,
+    similitud coseno sobre name_embedding (embed_fn, p. ej. embed_texts) —
+    permite cruzar idiomas (query en español vs entidades en inglés). Cada
+    mención puede tener 0..N candidatos — la desambiguación por copresencia
+    decide.
     """
     groups = []
     for name in names:
@@ -497,6 +500,22 @@ def match_entities_candidates(session, names: list) -> list:
                 {"pat": f"%{nn}%"},
             ).fetchall()
             group.extend(r.id for r in rows)
+        if not group and embed_fn is not None:
+            try:
+                emb = embed_fn([name])[0]
+                rows = session.execute(
+                    text(
+                        "SELECT e.id FROM kag_entities e "
+                        "JOIN kag_documents d ON d.id = e.doc_id "
+                        "WHERE d.status = 'ready' AND e.name_embedding IS NOT NULL "
+                        "ORDER BY e.name_embedding <=> CAST(:emb AS vector) "
+                        "LIMIT 3"
+                    ),
+                    {"emb": embedding_to_sql(emb)},
+                ).fetchall()
+                group.extend(r.id for r in rows)
+            except Exception:  # noqa: BLE001 — sin embedding: sin candidatos
+                pass
         # Dedup dentro del grupo (el LIKE puede solaparse con el exacto).
         group = list(dict.fromkeys(group))
         if group:
@@ -1339,11 +1358,17 @@ def critic_and_linking(session, query, top_k=10, verbose=False):
         raw_names = [
             str(e).strip() for e in (data.get("entities") or []) if str(e).strip()
         ]
-        # Anclaje real: solo nombres que están en el pool (normalizados).
-        pool_norm = {normalize_entity_name(c) for c in candidates}
-        anchored = [n for n in raw_names if normalize_entity_name(n) in pool_norm]
-        if anchored:
-            names = anchored
+        # Anclaje: si el pool determinista está vacío (p. ej. query en otro
+        # idioma que no matchea por léxico), confiamos en los nombres del LLM
+        # multilingüe tal cual — el embedding fallback los resolverá. Si hay
+        # pool, solo nombres anclados (normalizados).
+        if not candidates:
+            names = raw_names
+        else:
+            pool_norm = {normalize_entity_name(c) for c in candidates}
+            anchored = [n for n in raw_names if normalize_entity_name(n) in pool_norm]
+            if anchored:
+                names = anchored
     except Exception:  # noqa: BLE001 — LLM no disponible: degradación
         pass
     if not terms:
@@ -1558,8 +1583,16 @@ def ask(session, query, top_k=8, global_top_k=20, verbose=True, history=None):
 
     # 3. Entity linking: candidatos del grafo + desambiguación por
     #    copresencia. `names` ya viene del LLM fusionado (o del pool
-    #    determinista si falló).
-    groups = match_entities_candidates(session, names)
+    #    determinista si falló). embed_fn (carga perezosa) permite el
+    #    fallback por similitud coseno sobre name_embedding (cross-lingual).
+    embed_fn = None
+    try:
+        from src.embeddings import embed_texts as _embed_texts
+
+        embed_fn = _embed_texts
+    except Exception:  # noqa: BLE001 — sin modelo de embeddings: solo léxico
+        pass
+    groups = match_entities_candidates(session, names, embed_fn=embed_fn)
     adj = build_adjacency(session) if groups else {}
     entity_ids = disambiguate_by_cooccurrence(
         session,

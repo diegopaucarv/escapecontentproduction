@@ -1,10 +1,26 @@
+# El host 'db' es la red Docker y no resuelve desde el host; las credenciales
+# son las mismas. Reemplaza '@db:' por '@localhost:' ANTES de leer settings.
+import os
 from logging.config import fileConfig
+from pathlib import Path
 
-from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+from alembic import context
 from src.config import get_settings
 from src.db.models import Base
+
+_env_path = Path(__file__).resolve().parent.parent / ".env"
+for _var in ("DATABASE_URL", "DATABASE_URL_ASYNC"):
+    _val = os.environ.get(_var, "")
+    if not _val and _env_path.exists():
+        for _line in _env_path.read_text(encoding="utf-8").splitlines():
+            _line = _line.strip()
+            if _line.startswith(f"{_var}="):
+                _val = _line.split("=", 1)[1].strip().strip('"').strip("'")
+                break
+    if "@db:" in _val:
+        os.environ[_var] = _val.replace("@db:", "@localhost:")
 
 config = context.config
 

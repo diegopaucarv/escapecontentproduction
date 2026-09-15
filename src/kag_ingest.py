@@ -433,7 +433,6 @@ def complete_local(
                 f"{base_url}/chat/completions",
                 headers={
                     "Content-Type": "application/json",
-                    "Authorization": "Bearer ",
                 },
                 json=body,
                 timeout=timeout,
@@ -509,7 +508,7 @@ def extract_entities_relations(session, chunk_text):
         return {}
 
 
-def _store_entities_relations(session, doc_id, chunk_id, data):
+def _store_entities_relations(session, doc_id, chunk_id, data, embed_fn=None):
     """Guarda entidades y relaciones de un chunk con dedup por name_norm (por doc).
 
     Batch: una sola consulta de existentes por doc + un solo INSERT multi-VALUES
@@ -517,6 +516,10 @@ def _store_entities_relations(session, doc_id, chunk_id, data):
     SELECT/INSERT por entidad). El grafo es incremental a nivel de documento:
     solo se tocan las filas de este doc_id (el trigger de versión 0016
     invalida la caché de adyacencia una vez por statement).
+
+    `embed_fn` (opcional, p. ej. src.embeddings.embed_texts) embebe los nombres
+    de las entidades nuevas para el entity linking por similitud (columna
+    name_embedding, migración 0022). Sin embed_fn, name_embedding queda NULL.
     """
     entities = data.get("entities") or []
     relations = data.get("relations") or []
@@ -559,11 +562,20 @@ def _store_entities_relations(session, doc_id, chunk_id, data):
             )
         )
     if new_entities:
+        # Embeddings de los nombres nuevos (entity linking por similitud).
+        name_embs: list = []
+        if embed_fn is not None:
+            try:
+                name_embs = embed_fn([n for _, _, n, _, _, _ in new_entities])
+            except Exception:  # noqa: BLE001 — sin embedding: name_embedding NULL
+                name_embs = [None] * len(new_entities)
+        else:
+            name_embs = [None] * len(new_entities)
         # Un solo INSERT multi-VALUES con UN set de parámetros. Pasar una
         # lista de dicts haría executemany, y psycopg2 no devuelve filas con
         # executemany + RETURNING (ResourceClosedError "does not return rows").
         placeholders = ", ".join(
-            f"(:d{i}, :c{i}, :n{i}, :nn{i}, :e{i}, :de{i})"
+            f"(:d{i}, :c{i}, :n{i}, :nn{i}, :e{i}, :de{i}, CAST(:emb{i} AS vector))"
             for i in range(len(new_entities))
         )
         params: dict = {}
@@ -576,12 +588,14 @@ def _store_entities_relations(session, doc_id, chunk_id, data):
                     f"nn{i}": nn,
                     f"e{i}": et,
                     f"de{i}": de,
+                    f"emb{i}": embedding_to_sql(name_embs[i]),
                 }
             )
         rows = session.execute(
             text(
                 "INSERT INTO kag_entities "
-                "(doc_id, chunk_id, name, name_norm, entity_type, description) "
+                "(doc_id, chunk_id, name, name_norm, entity_type, description, "
+                "name_embedding) "
                 f"VALUES {placeholders} "
                 "RETURNING id, name_norm"
             ),
@@ -1044,6 +1058,11 @@ def index_document(
                         ),
                         {"emb": embedding_to_sql(embs[i]), "id": row.id},
                     )
+                    if verbose:
+                        print(
+                            f"[KAG] ⚙ chunked: chunk {start + i + 1}/{len(chunk_rows)} "
+                            "— entidades..."
+                        )
                     if llm_entities:
                         data = extract_entities_relations(session, row.content)
                     else:
@@ -1058,7 +1077,9 @@ def index_document(
                             embed_fn=embed_texts,
                             lang=lang,
                         )
-                    _store_entities_relations(session, doc_id, row.id, data)
+                    _store_entities_relations(
+                        session, doc_id, row.id, data, embed_fn=embed_texts
+                    )
             set_stage(session, "kag_documents", doc_id, "chunked")
 
         entity_count = session.execute(
@@ -1074,6 +1095,8 @@ def index_document(
         if resume in ("pending", "segmented", "chunked", "figures"):
             if resume == "figures":
                 cleanup_stage(session, "kag_documents", doc_id, "figures")
+            if verbose:
+                print(f"[KAG] 🖼 figures: indexando figuras de {md_path.name}...")
             figure_count = _index_figures(session, doc_id, md_path, md_text, verbose)
             set_stage(session, "kag_documents", doc_id, "figures")
 
@@ -1093,7 +1116,13 @@ def index_document(
                 ).scalar()
             summary = ""
             if not no_summary:
+                if verbose:
+                    print(
+                        "[KAG] 📝 ready: generando resumen jerárquico (Qwen local)..."
+                    )
                 summary = summarize_document(session, md_text, doc_type)
+                if verbose:
+                    print("[KAG] 📝 ready: resumen listo.")
 
             session.execute(
                 text(
@@ -1187,6 +1216,51 @@ def index_all(session, force=False, no_summary=False, verbose=True, llm_entities
     return results
 
 
+def backfill_entity_embeddings(session, batch_size=64, verbose=True):
+    """Rellena name_embedding de entidades que aún lo tienen NULL (migración 0022).
+
+    Idempotente: solo toca filas con name_embedding IS NULL. Embebe los nombres
+    en lotes con embed_texts y hace un UPDATE por lote (commit por lote).
+    Devuelve el número de entidades actualizadas.
+    """
+    total = 0
+    while True:
+        rows = session.execute(
+            text(
+                "SELECT id, name FROM kag_entities "
+                "WHERE name_embedding IS NULL LIMIT :limit"
+            ),
+            {"limit": batch_size},
+        ).fetchall()
+        if not rows:
+            break
+        # Import perezoso: src.embeddings importa src.db.session (que lee
+        # .env al importar) — debe ocurrir DESPUÉS de _fix_db_host().
+        from src.embeddings import embed_texts
+
+        try:
+            embs = embed_texts([r.name for r in rows])
+        except Exception as exc:  # noqa: BLE001 — sin embedding: se salta el lote
+            if verbose:
+                print(f"[KAG] ⚠ Backfill embeddings falló (lote): {exc}")
+            break
+        for r, emb in zip(rows, embs):
+            session.execute(
+                text(
+                    "UPDATE kag_entities SET name_embedding = CAST(:emb AS vector) "
+                    "WHERE id = :id"
+                ),
+                {"emb": embedding_to_sql(emb), "id": r.id},
+            )
+        session.commit()
+        total += len(rows)
+        if verbose:
+            print(f"[KAG] ⚙ Backfill embeddings: {total} entidades...")
+    if verbose:
+        print(f"[KAG] ✅ Backfill embeddings completo: {total} entidades.")
+    return total
+
+
 # ---------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------
@@ -1218,6 +1292,11 @@ def main() -> None:
     parser.add_argument(
         "--verbose", action="store_true", default=True, help="Prints descriptivos."
     )
+    parser.add_argument(
+        "--backfill-embeddings",
+        action="store_true",
+        help="Rellena name_embedding de entidades sin embedding (migración 0022).",
+    )
     args = parser.parse_args()
 
     _fix_db_host()
@@ -1225,7 +1304,9 @@ def main() -> None:
 
     session = SessionLocal()
     try:
-        if args.doc:
+        if args.backfill_embeddings:
+            backfill_entity_embeddings(session, verbose=args.verbose)
+        elif args.doc:
             index_document(
                 session,
                 DOCS_DIR / args.doc,
