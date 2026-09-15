@@ -1019,8 +1019,15 @@ def index_document(
                 ),
                 {"id": doc_id},
             ).fetchall()
+            total_batches = (len(chunk_rows) + EMBED_BATCH_SIZE - 1) // EMBED_BATCH_SIZE
             for start in range(0, len(chunk_rows), EMBED_BATCH_SIZE):
                 batch = chunk_rows[start : start + EMBED_BATCH_SIZE]
+                batch_no = start // EMBED_BATCH_SIZE + 1
+                if verbose:
+                    print(
+                        f"[KAG] ⚙ chunked: lote {batch_no}/{total_batches} "
+                        f"(chunks {start + 1}-{start + len(batch)} de {len(chunk_rows)})..."
+                    )
                 try:
                     embs = embed_texts(
                         [r.content for r in batch], input_type="document"
