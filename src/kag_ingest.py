@@ -501,12 +501,7 @@ def _store_entities_relations(session, doc_id, chunk_id, data):
                 "SELECT name_norm, id FROM kag_entities "
                 "WHERE doc_id = :doc_id AND name_norm = ANY(:norms)"
             ),
-            {
-                "doc_id": doc_id,
-                "norms": bindparam(
-                    "norms", expanding=True, value=list(dict.fromkeys(norms))
-                ),
-            },
+            {"doc_id": doc_id, "norms": list(dict.fromkeys(norms))},
         ).fetchall()
         existing = {r.name_norm: r.id for r in rows}
 
