@@ -171,7 +171,11 @@ def test_sanitize_document_id_trunca_con_hash():
         "100-The Handbook of Culture and Psychology -- David Matsumoto; "
         "Hyisung C_ Hwang -- Oxford University Pre_doc_001"
     )
-    assert len(largo) > 200
+    # Caso real del bug: 112 chars (excedía VARCHAR(100), cabe en VARCHAR(255)).
+    assert len(largo) > 100
+    assert _sanitize_document_id(largo) == largo  # < 200 → intacto
+    # Caso extremo: > 200 chars → truncado con hash corto determinista.
+    largo = "x" * 300
     corto = _sanitize_document_id(largo)
     assert len(corto) <= 200
     assert corto.endswith("_" + corto.split("_")[-1])  # sufijo hash presente
