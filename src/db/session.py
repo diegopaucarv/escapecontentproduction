@@ -40,3 +40,20 @@ def session_scope() -> Generator[Session, None, None]:
         raise
     finally:
         session.close()
+
+
+def run_in_own_session(fn, *args, **kwargs):
+    """Ejecuta fn con una sesión propia (Session no es thread-safe).
+
+    SQLAlchemy Session NO es thread-safe: compartir la sesión del caller
+    entre hilos lanza InvalidSessionError ("session is provisioning a new
+    connection") cuando dos hilos pisan la adquisición de conexión. Cada
+    tarea paralela abre su propia sesión (SessionLocal) y la cierra al
+    terminar. Las tareas son lecturas read-only: no hay transacción que
+    propagar de vuelta al caller.
+    """
+    session = SessionLocal()
+    try:
+        return fn(session, *args, **kwargs)
+    finally:
+        session.close()

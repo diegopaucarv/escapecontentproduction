@@ -137,6 +137,24 @@ def _row(id_, chunk_index, content, chapter_id):
     )
 
 
+def _patch_paraphrase_deps(monkeypatch, fake_call):
+    """Parchea las dependencias de _paraphrase_group para tests herméticos.
+
+    Los workers ahora reciben una sesión real (run_in_own_session): sin estos
+    parches, load_settings/_get_prompt_pair intentarían conectar a la DB real
+    (en la máquina del usuario hay Postgres). Se parchean para degradar igual
+    que lo harían sin DB.
+    """
+    monkeypatch.setattr("src.kag_ingest.call_with_retries", fake_call)
+    monkeypatch.setattr("src.kag_ingest.load_settings", lambda session: None)
+    monkeypatch.setattr(
+        "src.kag_ingest._get_prompt_pair",
+        # Template con {chapter_id}: _fill_prompt lo rellena con el capítulo
+        # real (o "(sin capítulo)") igual que el template de producción.
+        lambda *a, **k: ("SYS", "USER {chapter_id}"),
+    )
+
+
 def test_paraphrase_chunks_updates_by_chunk(monkeypatch):
     rows = [
         _row(1, 0, "Contenido A.", "uuid-1"),
@@ -161,7 +179,7 @@ def test_paraphrase_chunks_updates_by_chunk(monkeypatch):
             False,
         )
 
-    monkeypatch.setattr("src.kag_ingest.call_with_retries", fake_call)
+    _patch_paraphrase_deps(monkeypatch, fake_call)
     _paraphrase_chunks(session, 42, "docs/archivo.md", verbose=False)
 
     assert session.updates == [
@@ -196,7 +214,7 @@ def test_paraphrase_chunks_group_without_chapter(monkeypatch):
             False,
         )
 
-    monkeypatch.setattr("src.kag_ingest.call_with_retries", fake_call)
+    _patch_paraphrase_deps(monkeypatch, fake_call)
     _paraphrase_chunks(session, 42, "docs/archivo.md", verbose=False)
 
     assert session.updates == [(1, "Paráfrasis A."), (2, "Paráfrasis B.")]
@@ -214,7 +232,7 @@ def test_paraphrase_chunks_llm_failure_degrades(monkeypatch):
     def fake_call(session, prompt, system=None, model_size=None, **kwargs):
         raise RuntimeError("LLM no disponible")
 
-    monkeypatch.setattr("src.kag_ingest.call_with_retries", fake_call)
+    _patch_paraphrase_deps(monkeypatch, fake_call)
     _paraphrase_chunks(session, 42, "docs/archivo.md", verbose=False)
 
     # Degradación: sin UPDATE, sin excepción, commit igual.
@@ -229,7 +247,7 @@ def test_paraphrase_chunks_invalid_json_degrades(monkeypatch):
     def fake_call(session, prompt, system=None, model_size=None, **kwargs):
         return "no es json", "model", False
 
-    monkeypatch.setattr("src.kag_ingest.call_with_retries", fake_call)
+    _patch_paraphrase_deps(monkeypatch, fake_call)
     _paraphrase_chunks(session, 42, "docs/archivo.md", verbose=False)
 
     assert session.updates == []

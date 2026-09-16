@@ -86,6 +86,17 @@ def _fake_prompt_pair(session, model_name, task_key, system_fallback, user_fallb
     return system_fallback, user_fallback
 
 
+def _patch_own_session(monkeypatch, session):
+    """Los workers de _run_proposition_batches_parallel abren su propia sesión
+    real (run_in_own_session, src/db/session.py) — sin DB real en tests, se
+    parchea para que usen la sesión fake del test directamente."""
+    monkeypatch.setattr(
+        ki,
+        "_with_own_session",
+        lambda fn, *a, **k: fn(session, *a, **k),
+    )
+
+
 def _llm_ok(props, entities=None, relations=None):
     """Fake de call_with_retries que devuelve el JSON del schema Fase 5."""
 
@@ -124,6 +135,7 @@ def test_extract_document_propositions_assigns_by_chunk_index_and_stores_entitie
     session = _DocPropsSession(rows, cached_chunk_ids=[])
     stored_props = []
     stored_entities = []
+    _patch_own_session(monkeypatch, session)
 
     fake_call = _llm_ok(
         props=[
@@ -195,6 +207,7 @@ def test_extract_document_propositions_fallback_to_content_when_paraphrase_null(
     session = _DocPropsSession(rows, cached_chunk_ids=[])
     seen_prompts = []
     stored = []
+    _patch_own_session(monkeypatch, session)
 
     def fake_call(session, prompt, system=None, model_size=None, **kwargs):
         seen_prompts.append(prompt)
@@ -246,6 +259,7 @@ def test_extract_document_propositions_cache_skips_extracted(monkeypatch):
     session = _DocPropsSession(rows, cached_chunk_ids=[1])
     called = []
     stored = []
+    _patch_own_session(monkeypatch, session)
 
     def fake_call(session, prompt, system=None, model_size=None, **kwargs):
         called.append(prompt)
@@ -310,6 +324,7 @@ def test_extract_document_propositions_llm_failure_degrades(monkeypatch):
     rows = [_chunk_row(1, "aaa", "Paráfrasis A.", h1)]
     session = _DocPropsSession(rows, cached_chunk_ids=[])
     stored = []
+    _patch_own_session(monkeypatch, session)
 
     def boom(session, prompt, system=None, model_size=None, **kwargs):
         raise RuntimeError("LLM no disponible")
@@ -335,6 +350,7 @@ def test_extract_document_propositions_invalid_json_degrades(monkeypatch):
     rows = [_chunk_row(1, "aaa", "Paráfrasis A.", h1)]
     session = _DocPropsSession(rows, cached_chunk_ids=[])
     stored = []
+    _patch_own_session(monkeypatch, session)
 
     def fake_call(session, prompt, system=None, model_size=None, **kwargs):
         return "no es json", "model", False
@@ -359,6 +375,7 @@ def test_extract_document_propositions_empty_entities_only_propositions(monkeypa
     rows = [_chunk_row(1, "aaa", "Paráfrasis A.", h1)]
     session = _DocPropsSession(rows, cached_chunk_ids=[])
     stored = []
+    _patch_own_session(monkeypatch, session)
 
     fake_call = _llm_ok(
         props=[

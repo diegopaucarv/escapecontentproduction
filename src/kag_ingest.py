@@ -45,6 +45,22 @@ from src.kag.stages import (
 from src.llm.base import call_with_retries, load_settings, parse_llm_output
 from src.llm.together import complete_vision
 
+
+def _with_own_session(fn, *args, **kwargs):
+    """Ejecuta fn con una sesión propia del hilo (ver src.db.session).
+
+    SQLAlchemy Session NO es thread-safe: compartir la sesión del caller
+    entre hilos lanza InvalidSessionError ("session is provisioning a new
+    connection") cuando dos hilos pisan la adquisición de conexión. Cada
+    tarea paralela abre su propia sesión (SessionLocal) y la cierra al
+    terminar. Las tareas son lecturas read-only: no hay transacción que
+    propagar de vuelta al caller.
+    """
+    from src.db.session import run_in_own_session
+
+    return run_in_own_session(fn, *args, **kwargs)
+
+
 # ---------------------------------------------------------------------
 # Prompt-as-code: task keys (specs en src/db/seed_kag_prompts.py)
 # ---------------------------------------------------------------------
@@ -1254,8 +1270,8 @@ def _run_proposition_batches_parallel(
 
     def work(i, chapter_id, batch):
         with sem:
-            return i, batch_fn(
-                session,
+            return i, _with_own_session(
+                batch_fn,
                 doc_id,
                 batch,
                 doc_path,
@@ -1864,8 +1880,13 @@ def _paraphrase_chunks(session, doc_id, doc_path, verbose=True):
 
     def work(i, chapter_id, group_chunks):
         with sem:
-            return i, _paraphrase_group(
-                session, doc_id, doc_path, chapter_id, group_chunks, verbose
+            return i, _with_own_session(
+                _paraphrase_group,
+                doc_id,
+                doc_path,
+                chapter_id,
+                group_chunks,
+                verbose,
             )
 
     pool_size = min(len(groups), max_parallel * 2)
@@ -1998,11 +2019,92 @@ def _split_h1_h2(text: str) -> list:
     return [s.strip() for s in sections if s.strip()]
 
 
-def summarize_document(session, text, doc_type):
+def _persist_summary_index(session, doc_id, section_summaries, final_summary):
+    """Persiste el índice de resúmenes jerárquicos (nivel 'document' + 'section').
+
+    Solo persiste si `doc_id` no es None y `final_summary` no es '' (el árbol
+    section→document requiere la fila documento). Idempotente para re-ingesta
+    con --force: DELETE previo por doc_id. Un solo embedding batch para
+    [final] + secciones (degradación: embedding NULL si falla — el FTS sigue
+    funcionando). Nunca rompe el flujo del resumen: cualquier excepción se
+    loguea y el resumen se devuelve igual.
+    """
+    if doc_id is None:
+        return
+    if not final_summary:
+        print("[KAG] ⚠ summary_index no persistido: resumen final vacío (degradación)")
+        return
+    try:
+        # Import perezoso: src.embeddings importa src.db.session (que lee .env
+        # al importar) — debe ocurrir DESPUÉS de _fix_db_host().
+        from src.embeddings import embed_texts
+
+        sections = [s for s in section_summaries if s]
+        texts = [final_summary] + sections
+        try:
+            embs = embed_texts(texts, input_type="document")
+        except Exception:  # noqa: BLE001 — sin embedding: embedding NULL
+            embs = [None] * len(texts)
+        session.execute(
+            text("DELETE FROM summary_index WHERE doc_id = :doc_id"),
+            {"doc_id": doc_id},
+        )
+        doc_row_id = session.execute(
+            text(
+                "INSERT INTO summary_index "
+                "(doc_id, level, chapter_id, parent_id, text, embedding) "
+                "VALUES (:doc_id, 'document', NULL, NULL, :text, "
+                "CAST(:emb AS vector)) RETURNING id"
+            ),
+            {
+                "doc_id": doc_id,
+                "text": final_summary,
+                "emb": embedding_to_sql(embs[0]),
+            },
+        ).scalar()
+        if not doc_row_id:
+            return
+        if sections:
+            # Multi-VALUES en UN solo statement (patrón _store_propositions):
+            # una lista de dicts haría executemany, y psycopg2 no devuelve
+            # filas con executemany + RETURNING (ResourceClosedError).
+            placeholders = ", ".join(
+                f"(:d{i}, 'section', NULL, :p{i}, :t{i}, CAST(:emb{i} AS vector))"
+                for i in range(len(sections))
+            )
+            params: dict = {}
+            for i, s in enumerate(sections):
+                params.update(
+                    {
+                        f"d{i}": doc_id,
+                        f"p{i}": doc_row_id,
+                        f"t{i}": s,
+                        f"emb{i}": embedding_to_sql(embs[i + 1]),
+                    }
+                )
+            session.execute(
+                text(
+                    "INSERT INTO summary_index "
+                    "(doc_id, level, chapter_id, parent_id, text, embedding) "
+                    f"VALUES {placeholders}"
+                ),
+                params,
+            )
+    except Exception as exc:  # noqa: BLE001 — degradación no bloqueante
+        print(f"[KAG] ⚠ summary_index no persistido: {exc}")
+
+
+def summarize_document(session, text, doc_type, doc_id=None):
     """Resumen jerárquico con Qwen 2.5 local. Devuelve '' si falla (degradación).
 
     short: una llamada con el texto truncado a ~16k tokens.
     long:  map-reduce por secciones H1/H2 + llamada reduce.
+
+    Si `doc_id` no es None, persiste el índice de resúmenes jerárquicos
+    (fila 'document' + filas 'section' con parent_id) en summary_index
+    (migración 0032) — cero llamadas LLM nuevas, solo lo que ya se calcula
+    + un embedding por fila. Con doc_id=None el comportamiento es exactamente
+    el de antes (no persiste nada).
     """
     try:
         settings = load_settings(session)
@@ -2016,12 +2118,14 @@ def summarize_document(session, text, doc_type):
         )
         if doc_type == "short":
             truncated = text[:SUMMARY_MAX_CHARS]
-            return complete_local(
+            final = complete_local(
                 session,
                 summary_user.format(text=truncated),
                 system=summary_system,
                 max_tokens=200,
             ).strip()
+            _persist_summary_index(session, doc_id, [], final)
+            return final
         section_summaries = []
         sections = _split_h1_h2(text)
         if not sections:
@@ -2036,8 +2140,8 @@ def summarize_document(session, text, doc_type):
             # el orden del documento). El reduce final sigue siendo secuencial.
             def _map_section(i, sec):
                 truncated = sec[:SUMMARY_MAX_CHARS]
-                s = complete_local(
-                    session,
+                s = _with_own_session(
+                    complete_local,
                     summary_user.format(text=truncated),
                     system=summary_system,
                     max_tokens=60,
@@ -2077,12 +2181,14 @@ def summarize_document(session, text, doc_type):
         if not section_summaries:
             return ""
         combined = "\n".join(f"- {s}" for s in section_summaries)
-        return complete_local(
+        final = complete_local(
             session,
             summary_user.format(text=combined),
             system=summary_system,
             max_tokens=200,
         ).strip()
+        _persist_summary_index(session, doc_id, section_summaries, final)
+        return final
     except Exception as exc:  # noqa: BLE001 — degradación no bloqueante
         print(f"[KAG] ⚠ Resumen local no disponible: {exc}")
         return ""
@@ -2556,8 +2662,8 @@ def _index_figures(
         with ThreadPoolExecutor(max_workers=min(max_workers, len(figures))) as ex:
             futures = [
                 ex.submit(
+                    _with_own_session,
                     _describe_figure_vision,
-                    session,
                     f,
                     slice_text,
                     doc_line_start,
@@ -3461,7 +3567,7 @@ def _index_document_slice(
                         "[KAG] 📝 ready: generando resumen jerárquico (Qwen local)..."
                     )
                 summary = sanitize_text(
-                    summarize_document(session, slice_text, doc_type)
+                    summarize_document(session, slice_text, doc_type, doc_id=doc_id)
                 )
                 if verbose:
                     print("[KAG] 📝 ready: resumen listo.")

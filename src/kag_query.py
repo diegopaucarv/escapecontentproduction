@@ -12,6 +12,7 @@ de la query usa src.embeddings (carga perezosa del modelo Jina).
 Uso:
     python -m src.kag_query "¿Qué fórmula usa la propagación hacia atrás?"
     python -m src.kag_query --top-k 12 "pregunta"
+    python -m src.kag_query --mode audited --rerank "pregunta"
 """
 
 from __future__ import annotations
@@ -38,6 +39,22 @@ from src.kag_ingest import (
     normalize_entity_name,
 )
 from src.llm.base import call_with_retries, load_settings, parse_llm_output
+
+
+def _with_own_session(fn, *args, **kwargs):
+    """Ejecuta fn con una sesión propia del hilo (ver src.db.session).
+
+    SQLAlchemy Session NO es thread-safe: compartir la sesión del caller
+    entre hilos lanza InvalidSessionError ("session is provisioning a new
+    connection") cuando dos hilos pisan la adquisición de conexión. Cada
+    tarea paralela abre su propia sesión (SessionLocal) y la cierra al
+    terminar. Las tareas son lecturas read-only: no hay transacción que
+    propagar de vuelta al caller.
+    """
+    from src.db.session import run_in_own_session
+
+    return run_in_own_session(fn, *args, **kwargs)
+
 
 # ---------------------------------------------------------------------
 # Prompt-as-code: task keys (specs en src/db/seed_kag_prompts.py)
@@ -80,7 +97,8 @@ AUDIT_FUSED_SYSTEM_SHORT = (
     "respuesta JSON."
 )
 AUDITED_ANSWER_SYSTEM_SHORT = (
-    "Eres un asistente de conocimiento con estándares epistémicos estrictos."
+    "Eres un asistente de conocimiento con estándares epistémicos estrictos. "
+    "Responde en el idioma de la consulta."
 )
 
 
@@ -1040,8 +1058,9 @@ def hybrid_search(session, query_text, query_embedding, top_k, rrf_k=60, verbose
     """Búsqueda híbrida: densa (pgvector) + léxica (FTS) + RRF.
 
     La búsqueda densa y la FTS son lecturas read-only independientes y
-    corren en paralelo (ThreadPoolExecutor). El resultado es idéntico al
-    secuencial: mismo RRF, mismo orden, mismo score.
+    corren en paralelo (ThreadPoolExecutor), cada una con su propia sesión
+    (_with_own_session: Session no es thread-safe). El resultado es idéntico
+    al secuencial: mismo RRF, mismo orden, mismo score.
 
     Si query_embedding es None (embeddings no disponibles), degrada a solo
     FTS. Si la migración 0014 no está aplicada (columna content_tsv ausente,
@@ -1054,8 +1073,10 @@ def hybrid_search(session, query_text, query_embedding, top_k, rrf_k=60, verbose
     with ThreadPoolExecutor(max_workers=2) as pool:
         dense_future = None
         if query_embedding is not None:
-            dense_future = pool.submit(vector_search, session, query_embedding, top_k)
-        sparse_future = pool.submit(fts_search, session, query_text, top_k)
+            dense_future = pool.submit(
+                _with_own_session, vector_search, query_embedding, top_k
+            )
+        sparse_future = pool.submit(_with_own_session, fts_search, query_text, top_k)
         if dense_future is not None:
             # Esperar primero la densa: si falla, su error se propaga (misma
             # precedencia que el flujo secuencial, donde la densa corre antes).
@@ -1072,6 +1093,131 @@ def hybrid_search(session, query_text, query_embedding, top_k, rrf_k=60, verbose
     if not dense_hits:
         return sparse_hits
     return rrf_merge(dense_hits, sparse_hits, k=rrf_k, top_k=top_k)
+
+
+# ---------------------------------------------------------------------
+# Recuperación de resúmenes (summary_index, migración 0032) y
+# proposiciones por embedding (kag_propositions, migración 0024)
+# ---------------------------------------------------------------------
+
+
+def search_summaries(
+    session, query_text, query_embedding, top_k, level=None, rrf_k=60, verbose=False
+):
+    """Búsqueda híbrida sobre summary_index: densa + FTS + RRF (§3.1).
+
+    Devuelve lista de DICTS con el texto del resumen (el caller necesita el
+    texto, no solo ids): [{"id", "doc_id", "level", "chapter_id", "text",
+    "score"}]. La densa usa pgvector sobre summary_index.embedding; la FTS
+    usa la columna generada tsv (config 'simple', corpus multilingüe). Si una
+    de las dos capas no produce hits, se devuelve la otra; si ambas vacías,
+    []. Degradación: si la tabla no existe (migración 0032 no aplicada),
+    ProgrammingError → [] sin romper.
+    """
+    dense_hits = []
+    sparse_hits = []
+    try:
+        if query_embedding is not None:
+            q = embedding_to_sql(query_embedding)
+            rows = session.execute(
+                text(
+                    "SELECT id, doc_id, level, chapter_id, text, "
+                    "1 - (embedding <=> CAST(:q AS vector)) AS score "
+                    "FROM summary_index "
+                    "WHERE embedding IS NOT NULL "
+                    "AND (:level IS NULL OR level = :level) "
+                    "ORDER BY embedding <=> CAST(:q AS vector) LIMIT :top_k"
+                ),
+                {"q": q, "top_k": top_k, "level": level},
+            ).fetchall()
+            dense_hits = [(r.id, float(r.score)) for r in rows]
+        if query_text and query_text.strip():
+            rows = session.execute(
+                text(
+                    "SELECT id, doc_id, level, chapter_id, text, "
+                    "ts_rank_cd(tsv, plainto_tsquery('simple', :q)) AS score "
+                    "FROM summary_index "
+                    "WHERE tsv @@ plainto_tsquery('simple', :q) "
+                    "AND (:level IS NULL OR level = :level) "
+                    "ORDER BY score DESC LIMIT :top_k"
+                ),
+                {"q": query_text, "top_k": top_k, "level": level},
+            ).fetchall()
+            sparse_hits = [(r.id, float(r.score)) for r in rows]
+    except ProgrammingError:  # migración 0032 no aplicada
+        session.rollback()
+        return []
+    if not dense_hits:
+        merged = sparse_hits
+    elif not sparse_hits:
+        merged = dense_hits
+    else:
+        merged = rrf_merge(dense_hits, sparse_hits, k=rrf_k, top_k=top_k)
+    if not merged:
+        return []
+    # Segundo SELECT por los ids fusionados. id es UUID: se castea a text
+    # para ANY(:ids) con strings; el orden del RRF se preserva en Python
+    # (tabla chica — evita array_position con UUIDs).
+    ids = [str(i) for i, _score in merged]
+    try:
+        rows = session.execute(
+            text(
+                "SELECT id, doc_id, level, chapter_id, text "
+                "FROM summary_index WHERE id::text = ANY(:ids)"
+            ),
+            {"ids": ids},
+        ).fetchall()
+    except ProgrammingError:  # migración 0032 no aplicada
+        session.rollback()
+        return []
+    by_id = {str(r.id): r for r in rows}
+    out = []
+    for i, score in merged:
+        r = by_id.get(str(i))
+        if r is None:
+            continue
+        out.append(
+            {
+                "id": r.id,
+                "doc_id": r.doc_id,
+                "level": r.level,
+                "chapter_id": r.chapter_id,
+                "text": r.text,
+                "score": score,
+            }
+        )
+    if verbose:
+        print(f"[KAG] Resúmenes (índice): {len(out)} hits")
+    return out
+
+
+def proposition_vector_search(session, query_embedding, top_k):
+    """Búsqueda semántica directa sobre kag_propositions.embedding (§3.2).
+
+    El embedding de proposiciones ya existe (migración 0024) pero nunca se
+    usa para búsqueda directa: esta función lo explota como capa micro.
+    Devuelve lista de dicts con id, chunk_id, doc_id, statement y score.
+    Degradación: query_embedding None o tabla ausente (migración no
+    aplicada) → [] sin romper.
+    """
+    if query_embedding is None:
+        return []
+    q = embedding_to_sql(query_embedding)
+    try:
+        rows = session.execute(
+            text(
+                "SELECT id, chunk_id, doc_id, statement, "
+                "1 - (embedding <=> CAST(:q AS vector)) AS score "
+                "FROM kag_propositions "
+                "WHERE embedding IS NOT NULL "
+                "ORDER BY embedding <=> CAST(:q AS vector) LIMIT :top_k"
+            ),
+            {"q": q, "top_k": top_k},
+        ).fetchall()
+    except ProgrammingError:  # migración 0024 no aplicada
+        session.rollback()
+        return []
+    return [dict(r._mapping) for r in rows]
 
 
 def chunks_for_entities(session, entity_ids, top_n):
@@ -1389,16 +1535,19 @@ def _get_reranker():
         return _reranker
 
 
-def rerank_chunks(query, chunks, top_n=RERANK_TOP_N):
+def rerank_chunks(query, chunks, top_n=RERANK_TOP_N, enabled=None):
     """Reordena los chunks ancla por relevancia semántica (cross-encoder).
 
-    Solo actúa si RERANK_ENABLED = True. Reordena el top-N por la afinidad
-    exacta (query, chunk) y actualiza el score del ancla con la puntuación
-    del reranker — así `_group_chunks_with_window` ordena los grupos por la
-    nueva relevancia. Devuelve la misma lista (mismo orden) si el modelo no
-    está disponible o falla — degradación natural.
+    Solo actúa si `enabled` es True (default: RERANK_ENABLED). Reordena el
+    top-N por la afinidad exacta (query, chunk) y actualiza el score del
+    ancla con la puntuación del reranker — así `_group_chunks_with_window`
+    ordena los grupos por la nueva relevancia. Devuelve la misma lista
+    (mismo orden) si el modelo no está disponible o falla — degradación
+    natural.
     """
-    if not RERANK_ENABLED or not chunks:
+    if enabled is None:
+        enabled = RERANK_ENABLED
+    if not enabled or not chunks:
         return chunks
     try:
         model = _get_reranker()
@@ -1759,7 +1908,14 @@ def critic_and_linking(session, query, top_k=10, verbose=False):
 
 
 def assemble_context(
-    chunks, triples, figures, summaries, query, history=None, propositions=None
+    chunks,
+    triples,
+    figures,
+    summaries,
+    query,
+    history=None,
+    propositions=None,
+    summary_hits=None,
 ):
     """Ensambla el bloque de contexto para la respuesta final.
 
@@ -1771,7 +1927,11 @@ def assemble_context(
     informativa (preparado, aún sin probar con Docker). `propositions`
     (opcional) es la capa micro: proposiciones atómicas de los chunks
     ganadores (kag_propositions) — se muestran DESPUÉS de los fragmentos
-    y ANTES de las figuras.
+    y ANTES de las figuras. `summary_hits` (opcional) son los resúmenes
+    recuperados del índice temático (search_summaries, §3.3): dan el
+    MARCO de la consulta global, separados de los resúmenes de documento
+    (referencia secundaria) — se muestran entre esos resúmenes y los
+    fragmentos.
 
     ORDEN PARA PROMPT CACHING: el subgrafo y los resúmenes (bloques
     semi-estáticos, ordenados de forma determinista por doc) van ANTES de
@@ -1807,6 +1967,25 @@ def assemble_context(
     else:
         parts.append("(sin resúmenes)")
     parts.append("")
+    if summary_hits is not None:
+        parts.append("--- RESUMENES RECUPERADOS (marco temático) ---")
+        if summary_hits:
+            for s in summary_hits:
+                doc_id = s.get("doc_id", "?")
+                level = s.get("level", "document")
+                chapter = s.get("chapter_id")
+                if level == "section" and chapter:
+                    parts.append(
+                        f"[doc_id: {doc_id} | nivel: section | capítulo: {chapter}] "
+                        f"{s.get('text', '')}"
+                    )
+                else:
+                    parts.append(
+                        f"[doc_id: {doc_id} | nivel: {level}] {s.get('text', '')}"
+                    )
+        else:
+            parts.append("(sin resúmenes recuperados)")
+        parts.append("")
     parts.append("--- FRAGMENTOS RECUPERADOS (orden de importancia) ---")
     if chunks:
         for i, c in enumerate(chunks, start=1):
@@ -2180,7 +2359,7 @@ def _evaluate_sufficiency(
 
 
 def _audit_epistemic_fused(
-    session, query, propositions, corpus_metadata, verbose=False
+    session, query, propositions, corpus_metadata, verbose=False, summary_hits=None
 ) -> tuple:
     """Auditoría epistémica en UNA llamada al LLM pequeño (fusión de
     síntesis + contradicciones + suficiencia).
@@ -2188,7 +2367,9 @@ def _audit_epistemic_fused(
     Devuelve (facts, contradiction_report, evaluation) con los MISMOS shapes
     que _synthesize_facts / _resolve_contradictions / _evaluate_sufficiency.
     Si el JSON del LLM falla o viene malformado, degrada a las llamadas
-    separadas actuales — nunca romper.
+    separadas actuales — nunca romper. `summary_hits` (opcional) son los
+    resúmenes recuperados del índice temático (§3.3): se anexan al prompt
+    como marco de la consulta global.
     """
     if not propositions:
         return (
@@ -2213,6 +2394,10 @@ def _audit_epistemic_fused(
         .replace("{active_corpus_metadata}", _json_dumps(corpus_metadata))
         .replace("{candidate_chunks_json}", _json_dumps(propositions))
     )
+    if summary_hits:
+        prompt += "\n\nResúmenes recuperados (marco temático):\n" + _json_dumps(
+            summary_hits
+        )
     try:
         text_out, _model, _used_fallback = call_with_retries(
             session,
@@ -2369,8 +2554,9 @@ def _verify_grounding(session, facts, verbose=False) -> list:
 
     Con KAG_GROUNDING_PARALLEL=True (default) y varios hechos, los cálculos
     por fact (lectura read-only + partial_ratio) corren en ThreadPoolExecutor
-    (max_workers 2-4, CPU-bound en Python). El resultado es idéntico al
-    secuencial: mismo orden en `verified`, misma poda.
+    (max_workers 2-4, CPU-bound en Python), cada uno con su propia sesión
+    (_with_own_session: Session no es thread-safe). El resultado es idéntico
+    al secuencial: mismo orden en `verified`, misma poda.
     """
     if not facts:
         return []
@@ -2381,7 +2567,7 @@ def _verify_grounding(session, facts, verbose=False) -> list:
     threshold = float(_kag_config_value(session, "KAG_GROUNDING_THRESHOLD", 95.0))
     parallel = bool(_kag_config_value(session, "KAG_GROUNDING_PARALLEL", True))
 
-    def _check_fact(f):
+    def _check_fact(session, f):
         if f.get("relevance_level") not in ("direct_answer", "supporting_evidence"):
             return None
         chunk_id = f.get("chunk_id")
@@ -2443,10 +2629,10 @@ def _verify_grounding(session, facts, verbose=False) -> list:
 
     if parallel and len(facts) > 1:
         with ThreadPoolExecutor(max_workers=min(4, len(facts))) as pool:
-            futures = [pool.submit(_check_fact, f) for f in facts]
+            futures = [pool.submit(_with_own_session, _check_fact, f) for f in facts]
             results = [future.result() for future in futures]
     else:
-        results = [_check_fact(f) for f in facts]
+        results = [_check_fact(session, f) for f in facts]
     return [r for r in results if r is not None]
 
 
@@ -2491,9 +2677,10 @@ def _branch_b_expand(
     # (c) FTS sobre kag_propositions con los términos. Las subconsultas por
     #      término son lecturas read-only independientes: con
     #      KAG_QUERY_PARALLEL=True corren en ThreadPoolExecutor (max_workers
-    #      2-4). El resultado es idéntico al secuencial: los futures se
-    #      recogen en orden de envío y el dedup/append corre en el hilo
-    #      principal en ese mismo orden.
+    #      2-4), cada una con su propia sesión (_with_own_session: Session no
+    #      es thread-safe). El resultado es idéntico al secuencial: los
+    #      futures se recogen en orden de envío y el dedup/append corre en el
+    #      hilo principal en ese mismo orden.
     valid_terms = []
     for term in terms:
         if not term or not str(term).strip():
@@ -2503,7 +2690,7 @@ def _branch_b_expand(
             continue
         valid_terms.append((term, tokens))
 
-    def _fts_term(term, tokens):
+    def _fts_term(session, term, tokens):
         tsq = _fts_tsquery(tokens)
         try:
             return session.execute(
@@ -2536,11 +2723,12 @@ def _branch_b_expand(
     ):
         with ThreadPoolExecutor(max_workers=min(4, len(valid_terms))) as pool:
             futures = [
-                pool.submit(_fts_term, term, tokens) for term, tokens in valid_terms
+                pool.submit(_with_own_session, _fts_term, term, tokens)
+                for term, tokens in valid_terms
             ]
             rowsets = [future.result() for future in futures]
     else:
-        rowsets = [_fts_term(term, tokens) for term, tokens in valid_terms]
+        rowsets = [_fts_term(session, term, tokens) for term, tokens in valid_terms]
 
     for rows in rowsets:
         for r in rows:
@@ -2563,7 +2751,9 @@ def _branch_b_expand(
     return new_props
 
 
-def _ask_audited(session, query, top_k=8, global_top_k=20, verbose=False) -> dict:
+def _ask_audited(
+    session, query, top_k=8, global_top_k=20, verbose=False, rerank=False
+) -> dict:
     """Flujo audited completo: recuperación clásica → proposiciones → síntesis
     → contradicciones → suficiencia → Branch B → grounding → respuesta.
 
@@ -2585,17 +2775,43 @@ def _ask_audited(session, query, top_k=8, global_top_k=20, verbose=False) -> dic
         _safe_rollback(session)
         if verbose:
             print(f"[KAG] ⚠ Embeddings no disponibles ({exc}); solo FTS.")
+    # 1.1. Canales nuevos (§3.2/§3.3): proposiciones (capa micro) y
+    #      resúmenes temáticos (marco global). Ambos degradan a [] sin
+    #      romper; KAG_PROPOSITION_CHANNEL / KAG_SUMMARY_CHANNEL los apagan.
+    prop_channel = []
+    if _kag_config_value(session, "KAG_PROPOSITION_CHANNEL", True):
+        try:
+            prop_hits = proposition_vector_search(session, q_emb, k)
+            prop_channel = [
+                (p["chunk_id"], p["score"]) for p in prop_hits if p.get("chunk_id")
+            ]
+        except Exception as exc:  # noqa: BLE001 — degradación natural
+            _safe_rollback(session)
+            if verbose:
+                print(f"[KAG] ⚠ Canal de proposiciones falló: {exc}")
+    summary_hits = []
+    if qtype == "global" and _kag_config_value(session, "KAG_SUMMARY_CHANNEL", True):
+        try:
+            summary_hits = search_summaries(
+                session, query, q_emb, top_k=global_top_k, verbose=verbose
+            )
+        except Exception as exc:  # noqa: BLE001 — degradación natural
+            _safe_rollback(session)
+            if verbose:
+                print(f"[KAG] ⚠ Índice de resúmenes falló: {exc}")
     # Búsqueda híbrida ∥ CRIT+EL (spaCy + LLM) en paralelo: mismo resultado
     # que el secuencial; KAG_QUERY_PARALLEL=False restaura el orden viejo.
+    # Cada tarea usa su propia sesión (_with_own_session: Session no es
+    # thread-safe).
     vec_hits = []
     regex_hits, regex_terms, names = [], [], []
     if _kag_config_value(session, "KAG_QUERY_PARALLEL", True):
         with ThreadPoolExecutor(max_workers=2) as pool:
             hybrid_future = pool.submit(
-                hybrid_search, session, query, q_emb, k, verbose=verbose
+                _with_own_session, hybrid_search, query, q_emb, k, verbose=verbose
             )
             crit_future = pool.submit(
-                critic_and_linking, session, query, top_k=k, verbose=verbose
+                _with_own_session, critic_and_linking, query, top_k=k, verbose=verbose
             )
             try:
                 vec_hits = hybrid_future.result()
@@ -2655,8 +2871,9 @@ def _ask_audited(session, query, top_k=8, global_top_k=20, verbose=False) -> dic
         vec_hits,
         regex_hits,
         [(pc["chunk_id"], 0.0) for pc in ppr_chunks],
+        prop_channel,
         k=60,
-        top_k=len(vec_hits) + len(regex_hits) + len(ppr_chunks),
+        top_k=len(vec_hits) + len(regex_hits) + len(ppr_chunks) + len(prop_channel),
     )
     merged_ids = [cid for cid, _score in merged_hits]
     fetched = chunks_by_ids(session, merged_ids)
@@ -2665,6 +2882,14 @@ def _ask_audited(session, query, top_k=8, global_top_k=20, verbose=False) -> dic
     for c in fetched:
         c["score"] = score_by_id.get(c["chunk_id"], 0.0)
         chunks.append(c)
+    # Reranker opcional (cross-encoder): reordena los anclas por afinidad
+    # semántica exacta antes de expandir la ventana. Se activa con la flag
+    # --rerank o con RERANK_ENABLED; si el modelo no carga, degrada sin
+    # rerank (mismo orden).
+    if rerank or RERANK_ENABLED:
+        chunks = rerank_chunks(query, chunks, enabled=rerank or RERANK_ENABLED)
+        if verbose:
+            print(f"[KAG] Reranker: {len(chunks)} anclas reordenadas (cross-encoder)")
     chunks = _group_chunks_with_window(session, chunks)
     chunk_ids = [c["chunk_id"] for c in chunks]
 
@@ -2697,7 +2922,12 @@ def _ask_audited(session, query, top_k=8, global_top_k=20, verbose=False) -> dic
         if verbose:
             print(f"[KAG] ⚠ Metadatos de corpus fallaron ({exc}).")
     facts, contradiction_report, evaluation = _audit_epistemic_fused(
-        session, query, propositions, corpus_metadata, verbose=verbose
+        session,
+        query,
+        propositions,
+        corpus_metadata,
+        verbose=verbose,
+        summary_hits=summary_hits,
     )
     verdict = evaluation.get("verdict", "SUFFICIENT_FOR_SYNTHESIS")
 
@@ -2849,7 +3079,14 @@ def _ask_audited(session, query, top_k=8, global_top_k=20, verbose=False) -> dic
 
 
 def ask(
-    session, query, top_k=8, global_top_k=20, verbose=True, history=None, mode="fast"
+    session,
+    query,
+    top_k=8,
+    global_top_k=20,
+    verbose=True,
+    history=None,
+    mode="fast",
+    rerank=False,
 ):
     """Flujo completo de consulta KAG (§3.1 del diseño).
 
@@ -2862,10 +3099,18 @@ def ask(
     el contexto clásico + proposiciones atómicas de los chunks ganadores;
     "audited" devuelve un dict con la auditoría epistémica completa
     (síntesis, contradicciones, suficiencia, Branch B, grounding).
+
+    `rerank` (opcional): True activa el reranker cross-encoder para esta
+    consulta (independiente de RERANK_ENABLED).
     """
     if mode == "audited":
         return _ask_audited(
-            session, query, top_k=top_k, global_top_k=global_top_k, verbose=verbose
+            session,
+            query,
+            top_k=top_k,
+            global_top_k=global_top_k,
+            verbose=verbose,
+            rerank=rerank,
         )
     if verbose:
         print(f"\n🔎 Pregunta: {query}")
@@ -2888,19 +3133,45 @@ def ask(
         session.rollback()  # la transacción queda abortada tras el error
         if verbose:
             print(f"[KAG] ⚠ Embeddings no disponibles ({exc}); solo FTS.")
+    # 2.1. Canales nuevos (§3.2/§3.3): proposiciones (capa micro) y
+    #      resúmenes temáticos (marco global). Ambos degradan a [] sin
+    #      romper; KAG_PROPOSITION_CHANNEL / KAG_SUMMARY_CHANNEL los apagan.
+    prop_channel = []
+    if _kag_config_value(session, "KAG_PROPOSITION_CHANNEL", True):
+        try:
+            prop_hits = proposition_vector_search(session, q_emb, k)
+            prop_channel = [
+                (p["chunk_id"], p["score"]) for p in prop_hits if p.get("chunk_id")
+            ]
+        except Exception as exc:  # noqa: BLE001 — degradación natural
+            session.rollback()  # la transacción queda abortada tras el error
+            if verbose:
+                print(f"[KAG] ⚠ Canal de proposiciones falló: {exc}")
+    summary_hits = []
+    if qtype == "global" and _kag_config_value(session, "KAG_SUMMARY_CHANNEL", True):
+        try:
+            summary_hits = search_summaries(
+                session, query, q_emb, top_k=global_top_k, verbose=verbose
+            )
+        except Exception as exc:  # noqa: BLE001 — degradación natural
+            session.rollback()  # la transacción queda abortada tras el error
+            if verbose:
+                print(f"[KAG] ⚠ Índice de resúmenes falló: {exc}")
     # 2 + 2.5+3. Búsqueda híbrida ∥ CRIT+EL (spaCy + LLM) en paralelo: la
     #      extracción de candidatos y la llamada al LLM pequeño corren
     #      mientras la DB responde la búsqueda híbrida. Resultado idéntico
     #      al secuencial; KAG_QUERY_PARALLEL=False restaura el orden viejo.
+    #      Cada tarea usa su propia sesión (_with_own_session: Session no es
+    #      thread-safe).
     vec_hits = []
     regex_hits, regex_terms, names = [], [], []
     if _kag_config_value(session, "KAG_QUERY_PARALLEL", True):
         with ThreadPoolExecutor(max_workers=2) as pool:
             hybrid_future = pool.submit(
-                hybrid_search, session, query, q_emb, k, verbose=verbose
+                _with_own_session, hybrid_search, query, q_emb, k, verbose=verbose
             )
             crit_future = pool.submit(
-                critic_and_linking, session, query, top_k=k, verbose=verbose
+                _with_own_session, critic_and_linking, query, top_k=k, verbose=verbose
             )
             try:
                 vec_hits = hybrid_future.result()
@@ -2991,10 +3262,10 @@ def ask(
     if verbose:
         print(f"[KAG] PPR cercanas: {len(ppr_entities)} entidades (umbral relativo)")
 
-    # 5. Merge + dedup: RRF sobre las tres capas (vector, regex, PPR) →
-    #    una sola lista de chunks, sin duplicación. Cada capa aporta su
-    #    rank; el RRF es escala-agnóstico (ts_rank, coseno y menciones no
-    #    comparten escala).
+    # 5. Merge + dedup: RRF sobre las cuatro capas (vector, regex, PPR,
+    #    proposiciones) → una sola lista de chunks, sin duplicación. Cada
+    #    capa aporta su rank; el RRF es escala-agnóstico (ts_rank, coseno y
+    #    menciones no comparten escala).
     ppr_chunks = (
         chunks_for_entities(session, ppr_entities, top_n=10) if ppr_entities else []
     )
@@ -3002,8 +3273,9 @@ def ask(
         vec_hits,
         regex_hits,
         [(pc["chunk_id"], 0.0) for pc in ppr_chunks],
+        prop_channel,
         k=60,
-        top_k=len(vec_hits) + len(regex_hits) + len(ppr_chunks),
+        top_k=len(vec_hits) + len(regex_hits) + len(ppr_chunks) + len(prop_channel),
     )
     # Una sola consulta por todos los ids (en vez del loop N+1 por hit),
     # preservando el orden de importancia del RRF (array_position). El
@@ -3013,9 +3285,9 @@ def ask(
     score_by_id = dict(merged_hits)
     if _kag_config_value(session, "KAG_QUERY_PARALLEL", True):
         with ThreadPoolExecutor(max_workers=2) as pool:
-            chunks_future = pool.submit(chunks_by_ids, session, merged_ids)
+            chunks_future = pool.submit(_with_own_session, chunks_by_ids, merged_ids)
             triples_future = pool.submit(
-                subgraph_triples, session, ppr_entities or entity_ids, 25
+                _with_own_session, subgraph_triples, ppr_entities or entity_ids, 25
             )
             fetched = chunks_future.result()
             triples = triples_future.result()
@@ -3031,10 +3303,10 @@ def ask(
 
     # 5.5. Reranker opcional (cross-encoder): reordena los anclas por
     #      afinidad semántica exacta (query, chunk) antes de expandir la
-    #      ventana. Default OFF (RERANK_ENABLED); si el modelo no carga,
-    #      degrada sin rerank (mismo orden).
-    if RERANK_ENABLED:
-        chunks = rerank_chunks(query, chunks)
+    #      ventana. Se activa con la flag --rerank o con RERANK_ENABLED;
+    #      si el modelo no carga, degrada sin rerank (mismo orden).
+    if rerank or RERANK_ENABLED:
+        chunks = rerank_chunks(query, chunks, enabled=rerank or RERANK_ENABLED)
         if verbose:
             print(f"[KAG] Reranker: {len(chunks)} anclas reordenadas (cross-encoder)")
 
@@ -3060,10 +3332,12 @@ def ask(
     doc_ids = list({c["doc_id"] for c in chunks})
     if _kag_config_value(session, "KAG_QUERY_PARALLEL", True):
         with ThreadPoolExecutor(max_workers=3) as pool:
-            figures_future = pool.submit(figures_for_chunks, session, chunk_ids)
-            summaries_future = pool.submit(doc_summaries, session, doc_ids)
+            figures_future = pool.submit(
+                _with_own_session, figures_for_chunks, chunk_ids
+            )
+            summaries_future = pool.submit(_with_own_session, doc_summaries, doc_ids)
             propositions_future = pool.submit(
-                propositions_for_chunks, session, chunk_ids
+                _with_own_session, propositions_for_chunks, chunk_ids
             )
             figures = figures_future.result()
             summaries = summaries_future.result()
@@ -3086,6 +3360,7 @@ def ask(
         query,
         history=history,
         propositions=propositions,
+        summary_hits=summary_hits,
     )
     if verbose:
         print("\n[KAG] Contexto ensamblado:")
@@ -3129,6 +3404,16 @@ def main() -> None:
         default="fast",
         help="Modo de consulta: fast (respuesta directa) o audited (auditoría epistémica).",
     )
+    parser.add_argument(
+        "--rerank",
+        action="store_true",
+        default=False,
+        help=(
+            "Activa el reranker cross-encoder (jina-reranker-v2, ~1GB) para "
+            "reordenar los chunks por afinidad semántica exacta antes de armar "
+            "el contexto."
+        ),
+    )
     args = parser.parse_args()
 
     _fix_db_host()
@@ -3143,6 +3428,7 @@ def main() -> None:
             global_top_k=args.global_top_k,
             verbose=args.verbose,
             mode=args.mode,
+            rerank=args.rerank,
         )
         print(answer)
     finally:
