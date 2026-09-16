@@ -31,6 +31,33 @@ from pathlib import Path
 from sqlalchemy import bindparam, text
 from sqlalchemy.exc import ProgrammingError
 
+from src.kag.prompts import (
+    ANSWER_SYSTEM_SHORT,
+    AUDIT_FUSED_SYSTEM_SHORT,
+    AUDITED_ANSWER_SYSTEM_SHORT,
+    COMBINED_SYSTEM_SHORT,
+    CONTRADICTION_SYSTEM_SHORT,
+    CRITIC_SYSTEM_SHORT,
+    GROUNDED_ENTITIES_SYSTEM_SHORT,
+    QUERY_METADATA_SYSTEM_SHORT,
+    QUERY_STRATEGY_SYSTEM_SHORT,
+    QUERY_SUBQUERIES_SYSTEM_SHORT,
+    SUFFICIENCY_SYSTEM_SHORT,
+    SYNTHESIS_SYSTEM_SHORT,
+    TASK_ANSWER,
+    TASK_AUDIT_FUSED,
+    TASK_CONTRADICTIONS,
+    TASK_CRITIC_LINKING,
+    TASK_CRITIC_REGEX,
+    TASK_GROUNDED_ENTITIES,
+    TASK_QUERY_ANSWER,
+    TASK_QUERY_METADATA,
+    TASK_QUERY_STRATEGY,
+    TASK_QUERY_SUBQUERIES,
+    TASK_SUFFICIENCY,
+    TASK_SYNTHESIS,
+    _get_prompt_pair,
+)
 from src.kag.thresholds import auto_cutoff
 from src.kag.thresholds import auto_margin as _auto_margin
 from src.kag_ingest import (
@@ -54,55 +81,6 @@ def _with_own_session(fn, *args, **kwargs):
     from src.db.session import run_in_own_session
 
     return run_in_own_session(fn, *args, **kwargs)
-
-
-# ---------------------------------------------------------------------
-# Prompt-as-code: task keys (specs en src/db/seed_kag_prompts.py)
-# ---------------------------------------------------------------------
-
-TASK_GROUNDED_ENTITIES = "kag_grounded_entities"
-TASK_CRITIC_REGEX = "kag_critic_regex"
-TASK_CRITIC_LINKING = "kag_critic_linking"
-TASK_QUERY_STRATEGY = "kag_query_strategy"
-TASK_QUERY_METADATA = "kag_query_metadata"
-TASK_QUERY_SUBQUERIES = "kag_query_subqueries"
-TASK_QUERY_ANSWER = "kag_query_answer"
-# Auditoría epistémica (modo audited) — specs en src/db/seed_kag_prompts.py.
-TASK_SYNTHESIS = "kag_synthesis"
-TASK_CONTRADICTIONS = "kag_contradictions"
-TASK_SUFFICIENCY = "kag_sufficiency"
-TASK_AUDIT_FUSED = "kag_audit_fused"
-TASK_ANSWER = "kag_answer"
-
-# System prompts cortos actuales — fallback EXACTO de hoy cuando no hay
-# artefacto compilado (tests sin DB: get_active_prompt devuelve None).
-GROUNDED_ENTITIES_SYSTEM_SHORT = "Eres un selector de entidades. Devuelve JSON válido."
-CRITIC_SYSTEM_SHORT = "Eres un crítico de búsqueda. Devuelve JSON válido."
-COMBINED_SYSTEM_SHORT = (
-    "Eres un crítico de búsqueda y selector de entidades. Devuelve JSON válido."
-)
-ANSWER_SYSTEM_SHORT = (
-    "Eres un asistente de conocimiento. Responde la pregunta del usuario "
-    "usando SOLO el contexto proporcionado. Si el contexto no contiene la "
-    "respuesta, dilo claramente. Cita los documentos cuando sea posible. "
-    "Responde en el idioma de la pregunta."
-)
-# Fallbacks del modo audited (mismos textos que src/kag_agents.py — el
-# artefacto compilado los reemplaza si existe).
-SYNTHESIS_SYSTEM_SHORT = "Eres un agente de consolidación fáctica de alta precisión."
-CONTRADICTION_SYSTEM_SHORT = "Eres un analista epistemológico."
-SUFFICIENCY_SYSTEM_SHORT = (
-    "Eres el Agente Auditor Epistemológico de un sistema de recuperación avanzada."
-)
-AUDIT_FUSED_SYSTEM_SHORT = (
-    "Eres el Agente Auditor Epistemológico de un sistema de recuperación avanzada. "
-    "Consolida hechos, tipifica contradicciones y dictamina suficiencia en UNA "
-    "respuesta JSON."
-)
-AUDITED_ANSWER_SYSTEM_SHORT = (
-    "Eres un asistente de conocimiento con estándares epistémicos estrictos. "
-    "Responde en el idioma de la consulta."
-)
 
 
 # ---------------------------------------------------------------------
@@ -200,44 +178,6 @@ def _fix_db_host() -> None:
                     break
         if "@db:" in val:
             os.environ[var] = val.replace("@db:", "@localhost:")
-
-
-def _get_system_prompt(session, model_name: str, task_key: str, fallback: str) -> str:
-    """System prompt desde el artefacto compilado, con fallback a la constante.
-
-    Import lazy dentro de try/except: si no hay DB, no hay artefacto o el
-    compilador no existe, se devuelve la constante actual (comportamiento
-    exacto de hoy — los tests usan sesiones falsas sin DB).
-    """
-    try:
-        from src.llm.compiler import get_active_prompt
-
-        artifact = get_active_prompt(session, model_name, task_key)
-        if artifact is not None and artifact.prompt_text:
-            return artifact.prompt_text
-    except Exception:  # noqa: BLE001 — degradación natural
-        pass
-    return fallback
-
-
-def _get_prompt_pair(
-    session, model_name: str, task_key: str, system_fallback: str, user_fallback: str
-) -> tuple[str, str]:
-    """(system, user) desde el artefacto compilado, o los fallbacks actuales.
-
-    El artefacto (0021) congela el SYSTEM renderizado en `prompt_text` y el
-    USER template parametrizable en `user_template`. Sin artefacto (tests sin
-    DB) devuelve las constantes actuales — comportamiento EXACTO de hoy.
-    """
-    try:
-        from src.llm.compiler import get_active_prompt
-
-        artifact = get_active_prompt(session, model_name, task_key)
-        if artifact is not None and artifact.prompt_text and artifact.user_template:
-            return artifact.prompt_text, artifact.user_template
-    except Exception:  # noqa: BLE001 — degradación natural
-        pass
-    return system_fallback, user_fallback
 
 
 # ---------------------------------------------------------------------
@@ -347,7 +287,6 @@ def classify_query_strategy(session, query) -> tuple[str, list[str], str, str, b
         small_model,
         TASK_QUERY_STRATEGY,
         QUERY_STRATEGY_SYSTEM_SHORT,
-        QUERY_STRATEGY_PROMPT,
     )
     try:
         text_out, _model, _used_fallback = call_with_retries(
@@ -446,7 +385,6 @@ def extract_metadata_filters(session, query) -> dict:
         large_model,
         TASK_QUERY_METADATA,
         QUERY_METADATA_SYSTEM_SHORT,
-        QUERY_METADATA_PROMPT,
     )
     try:
         text_out, _model, _used_fallback = call_with_retries(
@@ -492,7 +430,6 @@ def generate_subqueries(session, query) -> list:
         large_model,
         TASK_QUERY_SUBQUERIES,
         QUERY_SUBQUERIES_SYSTEM_SHORT,
-        QUERY_SUBQUERIES_PROMPT,
     )
     try:
         text_out, _model, _used_fallback = call_with_retries(
@@ -821,18 +758,6 @@ def _noun_chunk_fallback(session, query: str) -> list:
 # Entity linking anclado (opt 1)
 # ---------------------------------------------------------------------
 
-GROUNDED_ENTITIES_PROMPT = """Entidades candidatas del grafo de conocimiento:
-{candidates}
-
-Pregunta: {query}
-
-Devuelve SOLO JSON:
-{{"entities": ["Entidad 1", "Entidad 2"]}}
-
-Elige SOLO de la lista de candidatas. Si ninguna se menciona en la
-pregunta, devuelve {{"entities": []}}.
-"""
-
 
 def grounded_entity_linking(session, query: str) -> list:
     """Entity linking anclado: el LLM selecciona entidades canónicas SOLO
@@ -855,7 +780,6 @@ def grounded_entity_linking(session, query: str) -> list:
         small_model,
         TASK_GROUNDED_ENTITIES,
         GROUNDED_ENTITIES_SYSTEM_SHORT,
-        GROUNDED_ENTITIES_PROMPT,
     )
     try:
         text_out, _model, _used_fallback = call_with_retries(
@@ -2159,30 +2083,6 @@ def rerank_chunks(query, chunks, top_n=RERANK_TOP_N, enabled=None):
 # Búsqueda textual dirigida por el LLM crítico (regex / términos exactos)
 # ---------------------------------------------------------------------
 
-CRITIC_PROMPT = """Eres un crítico de búsqueda. Dada una pregunta, decide si
-contiene términos EXACTOS que requieren búsqueda textual (regex/FTS) en vez
-de búsqueda semántica: nombres propios, países, ciudades, organizaciones,
-códigos alfanuméricos (CVE-2024-3094, SKU-123), acrónimos, fechas, cifras,
-identificadores o términos técnicos raros.
-
-El corpus es MULTILINGÜE. Para cada término exacto, incluye su traducción a
-TODOS los idiomas soportados: {languages}. Los códigos y nombres propios no
-se traducen (se repiten igual en todos los idiomas).
-
-Palabras muy frecuentes en el corpus (NO las propongas: matchearían
-demasiados chunks y no aportan precisión): {common_words}
-
-Devuelve SOLO JSON:
-{{"needs_regex": true/false, "terms": ["término y sus traducciones..."]}}
-
-- needs_regex: true si hay al menos un término exacto que buscar.
-- terms: máx 3 términos, cada uno con su traducción a todos los idiomas
-  (ej. ["discriminación negativa", "negative discrimination", ...]).
-- Si no hay términos exactos, devuelve {{"needs_regex": false, "terms": []}}.
-
-Pregunta: {query}
-"""
-
 # Heurística determinista de respaldo: tokens con mayúscula inicial o
 # códigos alfanuméricos (el LLM crítico puede fallar o no estar disponible).
 _REGEX_TERM_RE = re.compile(
@@ -2304,7 +2204,6 @@ def critic_regex_search(session, query, top_k=10, verbose=False):
         small_model,
         TASK_CRITIC_REGEX,
         CRITIC_SYSTEM_SHORT,
-        CRITIC_PROMPT,
     )
     try:
         common = _corpus_common_words(session)
@@ -2365,104 +2264,6 @@ def critic_regex_search(session, query, top_k=10, verbose=False):
 # CRIT + EL fusionados (una sola llamada LLM)
 # ---------------------------------------------------------------------
 
-COMBINED_PROMPT = """Eres un crítico de búsqueda y selector de entidades.
-Dada una pregunta:
-
-1. Decide si contiene términos EXACTOS que requieren búsqueda textual
-   (regex/FTS): nombres propios, países, ciudades, organizaciones, códigos
-   alfanuméricos (CVE-2024-3094, SKU-123), acrónimos, fechas, cifras,
-   identificadores o términos técnicos raros.
-2. Selecciona las entidades canónicas que se mencionan en la pregunta. Elige
-   de la lista de candidatos cuando sea posible; si la lista es insuficiente
-   o está vacía, propón entidades adicionales tú mismo (nombres canónicos,
-   posiblemente en inglés — el sistema las resolverá por similitud).
-
-El corpus es MULTILINGÜE. Para cada término exacto, incluye su traducción a
-TODOS los idiomas soportados: {languages}. Los códigos y nombres propios no
-se traducen (se repiten igual en todos los idiomas).
-
-Palabras muy frecuentes en el corpus (NO las propongas: matchearían
-demasiados chunks y no aportan precisión): {common_words}
-
-Candidatos del grafo:
-{candidates}
-
-Devuelve SOLO JSON:
-{{"needs_regex": true/false, "terms": ["término y sus traducciones..."], "entities": ["Entidad 1"]}}
-
-- needs_regex: true si hay al menos un término exacto que buscar.
-- terms: máx 3 términos, cada uno con su traducción a todos los idiomas
-  (ej. ["discriminación negativa", "negative discrimination", ...]).
-- entities: 3-5 entidades relevantes. Prefiere las de la lista de candidatos;
-  si la lista es insuficiente o está vacía, propón entidades adicionales tú
-  mismo (nombres canónicos, posiblemente en inglés). Si ninguna, [].
-- Si no hay términos exactos, devuelve {{"needs_regex": false, "terms": []}}.
-
-Pregunta: {query}
-"""
-
-QUERY_STRATEGY_SYSTEM_SHORT = (
-    "Eres un clasificador de estrategias de consulta. Devuelve JSON válido."
-)
-QUERY_STRATEGY_PROMPT = """Consulta del usuario: "{query}"
-
-Clasifica la consulta en UNA de las cinco estrategias de recuperación y
-justifica brevemente tu elección.
-
-Devuelve SOLO JSON:
-{{"strategy": "subqueries|metadata|hierarchical|graph|multidoc", "reason": "string"}}
-
-- strategy: una de las cinco claves exactas.
-- reason: frase breve (1-2 líneas) en el idioma de la consulta explicando
-  por qué esa estrategia sirve a la intención del usuario.
-"""
-
-QUERY_METADATA_SYSTEM_SHORT = (
-    "Eres un extractor de filtros de metadatos. Devuelve JSON válido."
-)
-QUERY_METADATA_PROMPT = """Consulta del usuario: "{query}"
-
-Metadatos del corpus disponible:
-{corpus_metadata}
-
-Extrae los filtros de metadatos que la consulta menciona EXPLÍCITAMENTE o
-implica inequívocamente. Devuelve SOLO JSON:
-{{"filters": {{"authors": ["string"], "years": ["string"], "fields": ["string"], "works": ["string"], "languages": ["string"]}}, "reason": "string"}}
-
-- authors: nombres de personas (autores, editores, pensadores citados).
-- years: años o rangos ("1975", "década de 1990", "2005-2010").
-- fields: campos de conocimiento (matchear contra LCSH/temáticas del corpus).
-- works: títulos de obras específicas.
-- languages: idiomas de los documentos.
-- Si la consulta no menciona ningún filtro, devuelve arrays VACÍOS.
-- reason: frase breve (1-2 líneas) en el idioma de la consulta explicando
-  qué filtros extrajiste y por qué.
-"""
-
-QUERY_SUBQUERIES_SYSTEM_SHORT = (
-    "Eres un planificador de recuperación. Devuelve JSON válido."
-)
-QUERY_SUBQUERIES_PROMPT = """Consulta del usuario: "{query}"
-
-Metadatos del corpus disponible:
-{corpus_metadata}
-
-Descompón la consulta en subconsultas ATÓMICAS, cada una orientada a UNA
-faceta distinta del corpus y recuperable de forma INDEPENDIENTE. Devuelve
-SOLO JSON:
-{{"subqueries": [{{"query": "string", "intent": "string"}}], "reason": "string"}}
-
-- 2-4 subconsultas si la consulta es ambigua o multifacética; UNA subconsulta
-  (= la original) si ya es atómica.
-- Cada subconsulta debe ser AUTOCONTENIDA: sin pronombres ni referencias que
-  dependan de la consulta original.
-- Cada subconsulta se orienta a UNA faceta (autor, obra, concepto, periodo,
-  comparación, etc.) para que la recuperación apunte a partes distintas del
-  corpus.
-- reason: frase breve (1-2 líneas) en el idioma de la consulta explicando la
-  descomposición.
-"""
-
 
 def critic_and_linking(session, query, top_k=10, verbose=False):
     """Fusiona el LLM crítico y el entity linking anclado en UNA llamada.
@@ -2488,7 +2289,6 @@ def critic_and_linking(session, query, top_k=10, verbose=False):
         small_model,
         TASK_CRITIC_LINKING,
         COMBINED_SYSTEM_SHORT,
-        COMBINED_PROMPT,
     )
     try:
         common = _corpus_common_words(session)
@@ -2685,78 +2485,6 @@ def assemble_context(
     return "\n".join(parts)
 
 
-ANSWER_SYSTEM = (
-    "Eres un asistente de conocimiento. Responde la pregunta del usuario "
-    "usando SOLO el contexto proporcionado. Si el contexto no contiene la "
-    "respuesta, dilo claramente. Cita los documentos cuando sea posible. "
-    "Responde en el idioma de la pregunta."
-)
-
-ANSWER_PROMPT = """Contexto:
-{context}
-
-Pregunta: {query}
-
-Responde con precisión basándote en el contexto."""
-
-# ---------------------------------------------------------------------
-# Prompts del modo audited (fallback EXACTO de src/kag_agents.py — el
-# artefacto compilado los reemplaza si existe).
-# ---------------------------------------------------------------------
-
-SYNTHESIS_PROMPT = """Consulta del usuario: "{query}"
-
-Fragmentos recuperados para análisis:
-{candidate_chunks_json}
-
-Devuelve el JSON: {{"query": str, "total_chunks_processed": int, "synthesized_facts": [{{"chunk_id": str, "document_id": str, "source_file": str, "relevance_level": "direct_answer|supporting_evidence|contextual_background|irrelevant", "atomic_summary": str, "verbatim_evidence": str, "academic_citations": [str]}}]}}"""
-
-CONTRADICTION_PROMPT = """Consulta: "{query}"
-
-Hechos sintetizados:
-{synthesized_facts_json}
-
-Devuelve el JSON: {{"contradictions_detected": bool, "analysis_cases": [{{"conflict_type": "paradigmatic_theoretical_divergence|empirical_contextual_boundary|temporal_diachronic_shift|terminological_homonymy", "divergence_summary": str, "thesis_a": {{"proposition_id": str, "document_id": str, "claim": str, "author_or_framework": str, "empirical_context": str}}, "thesis_b": {{"proposition_id": str, "document_id": str, "claim": str, "author_or_framework": str, "empirical_context": str}}, "epistemic_reconciliation": str}}]}}"""
-
-SUFFICIENCY_PROMPT = """Consulta: "{query}"
-
-Metadatos del Corpus Disponible (Descriptores ISO 25964 y LCC presentes en DB):
-{active_corpus_metadata}
-
-Proposiciones recuperadas (Nivel 1):
-{synthesized_propositions_json}
-
-Contextos escalados (Nivel 2, si aplicó):
-{parent_contexts_json}
-
-Emite tu evaluación formal: {{"verdict": "SUFFICIENT_FOR_SYNTHESIS|INSUFFICIENT_TRIGGER_BRANCH_B|NEGATIVE_REJECTION", "confidence_score": float, "negative_rejection_details": {{"reason": "out_of_thematic_scope_iso25964|classification_mismatch_lcc|total_absence_in_knowledge_graph|unsupported_technical_granularity", "closest_available_topics": [str], "formal_abstention_statement": str}}, "branch_b_instructions": {{"unresolved_subqueries": [str], "target_thesaurus_concepts": [str]}}}}"""
-
-AUDIT_FUSED_PROMPT = """Consulta del usuario: "{query}"
-
-Metadatos del Corpus Disponible (Descriptores ISO 25964 y LCC presentes en DB):
-{active_corpus_metadata}
-
-Proposiciones recuperadas para análisis:
-{candidate_chunks_json}
-
-Realiza la auditoría epistémica completa en UNA sola respuesta JSON con esta forma EXACTA:
-{{"facts": [{{"statement": str, "verbatim_evidence": str, "relevance": "direct_answer|supporting_evidence|contextual_background|irrelevant"}}], "contradictions": [{{"type": "paradigmatic_theoretical_divergence|empirical_contextual_boundary|temporal_diachronic_shift|terminological_homonymy", "resolution": str}}], "sufficiency": {{"verdict": "SUFFICIENT|INSUFFICIENT|NEGATIVE_REJECTION", "confidence": float}}}}
-
-Reglas:
-- `facts`: un objeto por proposición relevante. `statement` es el resumen atómico; `verbatim_evidence` es la cita textual EXACTA tal como aparece en la proposición (se verificará carácter por carácter contra la DB); `relevance` clasifica el hecho.
-- `contradictions`: solo si hay tensiones epistémicas reales entre hechos; si no, lista vacía.
-- `sufficiency.verdict`: SUFFICIENT si los hechos bastan para responder; INSUFFICIENT si falta material y se requiere expansión iterativa; NEGATIVE_REJECTION si el corpus no cubre el dominio.
-- `sufficiency.confidence`: float 0.0–1.0."""
-
-AUDITED_ANSWER_PROMPT = """Consulta del usuario: "{query}"
-
-Evidencia verificada (grounded_evidence):
-{grounded_evidence_json}
-
-Tensiones epistémicas (epistemic_tensions):
-{epistemic_tensions_json}"""
-
-
 def generate_answer(session, context, query):
     """Respuesta final con el LLM grande. Si falla, devuelve el contexto crudo."""
     settings = load_settings(session)
@@ -2764,7 +2492,7 @@ def generate_answer(session, context, query):
     fallback = getattr(settings, "fallback_model", None) if settings else None
     large_model = getattr(settings, "large_model", None) if settings else None
     system, user_template = _get_prompt_pair(
-        session, large_model, TASK_QUERY_ANSWER, ANSWER_SYSTEM_SHORT, ANSWER_PROMPT
+        session, large_model, TASK_QUERY_ANSWER, ANSWER_SYSTEM_SHORT
     )
     try:
         text_out, _model, _used_fallback = call_with_retries(
@@ -2858,7 +2586,7 @@ def _synthesize_facts(session, query, propositions, verbose=False) -> list:
     retries, fallback = _settings_retries(session)
     small_model, _large_model = _settings_models(session)
     system, user_template = _get_prompt_pair(
-        session, small_model, TASK_SYNTHESIS, SYNTHESIS_SYSTEM_SHORT, SYNTHESIS_PROMPT
+        session, small_model, TASK_SYNTHESIS, SYNTHESIS_SYSTEM_SHORT
     )
     prompt = user_template.format(
         query=query, candidate_chunks_json=_json_dumps(propositions)
@@ -2919,7 +2647,6 @@ def _resolve_contradictions(session, query, facts, verbose=False) -> dict:
         small_model,
         TASK_CONTRADICTIONS,
         CONTRADICTION_SYSTEM_SHORT,
-        CONTRADICTION_PROMPT,
     )
     prompt = user_template.format(
         query=query, synthesized_facts_json=_json_dumps(facts)
@@ -2968,7 +2695,6 @@ def _evaluate_sufficiency(
         small_model,
         TASK_SUFFICIENCY,
         SUFFICIENCY_SYSTEM_SHORT,
-        SUFFICIENCY_PROMPT,
     )
     prompt = user_template.format(
         query=query,
@@ -3054,7 +2780,6 @@ def _audit_epistemic_fused(
         small_model,
         TASK_AUDIT_FUSED,
         AUDIT_FUSED_SYSTEM_SHORT,
-        AUDIT_FUSED_PROMPT,
     )
     prompt = (
         user_template.replace("{query}", query)
@@ -3860,7 +3585,6 @@ def _ask_audited(
         large_model,
         TASK_ANSWER,
         AUDITED_ANSWER_SYSTEM_SHORT,
-        AUDITED_ANSWER_PROMPT,
     )
     prompt = user_template.format(
         query=query,

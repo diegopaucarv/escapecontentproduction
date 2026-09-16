@@ -6,6 +6,7 @@ constante en código) además del SYSTEM (intent + rules).
 """
 
 from src.db.seed_kag_prompts import KAG_TEMPLATES
+from src.kag.prompts import get_user_template
 
 EXPECTED_TASK_KEYS = {
     # A. Modo audited (src/kag_query.py)
@@ -13,6 +14,7 @@ EXPECTED_TASK_KEYS = {
     "kag_contradictions",
     "kag_sufficiency",
     "kag_answer",
+    "kag_audit_fused",
     # B. src/kag_query.py (clásico)
     "kag_grounded_entities",
     "kag_critic_regex",
@@ -40,7 +42,7 @@ EXPECTED_TASK_KEYS = {
 
 
 def test_kag_templates_has_11_specs():
-    assert len(KAG_TEMPLATES) == 19
+    assert len(KAG_TEMPLATES) == 20
 
 
 def test_kag_templates_task_keys_match_expected():
@@ -67,65 +69,59 @@ def test_all_kag_templates_have_intent_and_rules():
 
 
 def test_kag_ingest_fallbacks_iguales_a_spec_v11():
-    """Los fallbacks de src/kag_ingest.py deben ser EXACTOS a las specs v1.1.
-
-    FIX H1: las constantes DOCUMENT_*_USER_SHORT copian el user_template de la
-    spec (mismos placeholders: {deterministic_documents}, {document_context}).
+    """El runtime (get_user_template) resuelve el user_template EXACTO de la
+    spec (fuente única): los fallbacks de src/kag_ingest.py ya no viven en
+    código, se resuelven desde src/kag/prompts/specs.py.
     """
-    from src.kag_ingest import (
-        DOCUMENT_ANALYSIS_USER_SHORT,
-        DOCUMENT_SEPARATION_USER_SHORT,
-    )
-
     by_key = {t["task_key"]: t for t in KAG_TEMPLATES}
     assert (
-        DOCUMENT_SEPARATION_USER_SHORT
+        get_user_template("kag_document_separation")
         == by_key["kag_document_separation"]["user_template"]
     )
     assert (
-        DOCUMENT_ANALYSIS_USER_SHORT == by_key["kag_document_analysis"]["user_template"]
+        get_user_template("kag_document_analysis")
+        == by_key["kag_document_analysis"]["user_template"]
     )
 
 
 def test_kag_query_strategy_fallback_igual_a_spec():
-    """El fallback QUERY_STRATEGY_PROMPT de src/kag_query.py debe ser EXACTO
-    al user_template de la spec kag_query_strategy (mismo placeholder
-    {query}); los tests comparan fallbacks con specs."""
-    from src.kag_query import QUERY_STRATEGY_PROMPT
-
+    """get_user_template('kag_query_strategy') debe ser EXACTO al user_template
+    de la spec (mismo placeholder {query})."""
     by_key = {t["task_key"]: t for t in KAG_TEMPLATES}
-    assert QUERY_STRATEGY_PROMPT == by_key["kag_query_strategy"]["user_template"]
+    assert (
+        get_user_template("kag_query_strategy")
+        == by_key["kag_query_strategy"]["user_template"]
+    )
 
 
 def test_kag_query_metadata_fallback_igual_a_spec():
-    """El fallback QUERY_METADATA_PROMPT de src/kag_query.py debe ser EXACTO
-    al user_template de la spec kag_query_metadata (mismos placeholders
-    {query} y {corpus_metadata}); los tests comparan fallbacks con specs."""
-    from src.kag_query import QUERY_METADATA_PROMPT
-
+    """get_user_template('kag_query_metadata') debe ser EXACTO al user_template
+    de la spec (mismos placeholders {query} y {corpus_metadata})."""
     by_key = {t["task_key"]: t for t in KAG_TEMPLATES}
-    assert QUERY_METADATA_PROMPT == by_key["kag_query_metadata"]["user_template"]
+    assert (
+        get_user_template("kag_query_metadata")
+        == by_key["kag_query_metadata"]["user_template"]
+    )
 
 
 def test_kag_query_subqueries_fallback_igual_a_spec():
-    """El fallback QUERY_SUBQUERIES_PROMPT de src/kag_query.py debe ser EXACTO
-    al user_template de la spec kag_query_subqueries (mismos placeholders
-    {query} y {corpus_metadata}); los tests comparan fallbacks con specs."""
-    from src.kag_query import QUERY_SUBQUERIES_PROMPT
-
+    """get_user_template('kag_query_subqueries') debe ser EXACTO al
+    user_template de la spec (mismos placeholders {query} y {corpus_metadata})."""
     by_key = {t["task_key"]: t for t in KAG_TEMPLATES}
-    assert QUERY_SUBQUERIES_PROMPT == by_key["kag_query_subqueries"]["user_template"]
+    assert (
+        get_user_template("kag_query_subqueries")
+        == by_key["kag_query_subqueries"]["user_template"]
+    )
 
 
 def test_kag_document_extract_fallback_igual_a_spec():
-    """El fallback DOCUMENT_EXTRACT_USER_SHORT de src/kag_ingest.py debe ser
-    EXACTO al user_template de la spec kag_document_extract (mismos
-    placeholders {source_file}, {document_id}, {chapters_json}, {chunks_json})."""
-    from src.kag_ingest import DOCUMENT_EXTRACT_USER_SHORT
-
+    """get_user_template('kag_document_extract') debe ser EXACTO al
+    user_template de la spec (mismos placeholders {source_file}, {document_id},
+    {chapters_json}, {chunks_json})."""
     by_key = {t["task_key"]: t for t in KAG_TEMPLATES}
     assert (
-        DOCUMENT_EXTRACT_USER_SHORT == by_key["kag_document_extract"]["user_template"]
+        get_user_template("kag_document_extract")
+        == by_key["kag_document_extract"]["user_template"]
     )
 
 

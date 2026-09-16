@@ -35,6 +35,25 @@ import httpx
 from sqlalchemy import bindparam, text
 
 from src.kag.config import get_config_value, resolve_config
+from src.kag.prompts import (
+    CHAPTER_PROPOSITIONS_SYSTEM_SHORT,
+    DOCUMENT_ANALYSIS_SYSTEM_SHORT,
+    DOCUMENT_EXTRACT_SYSTEM_SHORT,
+    DOCUMENT_SEPARATION_SYSTEM_SHORT,
+    EXTRACT_SYSTEM_SHORT,
+    PARAPHRASE_SYSTEM_SHORT,
+    PROPOSITIONAL_SYSTEM_SHORT,
+    QWEN_SUMMARY_SYSTEM,
+    TASK_CHAPTER_PROPOSITIONS,
+    TASK_CHUNK_PARAPHRASE,
+    TASK_DOCUMENT_ANALYSIS,
+    TASK_DOCUMENT_EXTRACT,
+    TASK_DOCUMENT_SEPARATION,
+    TASK_EXTRACT_ENTITIES,
+    TASK_PROPOSITION_CHUNKING,
+    TASK_QWEN_SUMMARY,
+    _get_prompt_pair,
+)
 from src.kag.stages import (
     KAG_INGEST_STAGES,
     cleanup_stage,
@@ -59,120 +78,6 @@ def _with_own_session(fn, *args, **kwargs):
     from src.db.session import run_in_own_session
 
     return run_in_own_session(fn, *args, **kwargs)
-
-
-# ---------------------------------------------------------------------
-# Prompt-as-code: task keys (specs en src/db/seed_kag_prompts.py)
-# ---------------------------------------------------------------------
-
-TASK_EXTRACT_ENTITIES = "kag_extract_entities"
-TASK_QWEN_SUMMARY = "kag_qwen_summary"
-TASK_PROPOSITION_CHUNKING = "kag_proposition_chunking"
-TASK_DOCUMENT_SEPARATION = "kag_document_separation"
-TASK_DOCUMENT_ANALYSIS = "kag_document_analysis"
-TASK_CHUNK_PARAPHRASE = "kag_chunk_paraphrase"
-TASK_CHAPTER_PROPOSITIONS = "kag_chapter_propositions"
-TASK_DOCUMENT_EXTRACT = "kag_document_extract"
-
-# System prompts cortos actuales — fallback EXACTO de hoy cuando no hay
-# artefacto compilado (tests sin DB: get_active_prompt devuelve None).
-EXTRACT_SYSTEM_SHORT = "Eres un extractor de conocimiento. Devuelve JSON válido."
-
-# Fase 1 — separación de documentos apilados (spec kag_document_separation).
-# El user fallback es el template EXACTO de la spec (src/db/seed_kag_prompts.py):
-# se rellena con _fill_prompt (replace por clave, NUNCA .format() — el template
-# contiene llaves JSON literales).
-DOCUMENT_SEPARATION_SYSTEM_SHORT = (
-    "Eres un bibliotecario digital. Identifica los documentos (libros, papers, "
-    "artículos) apilados en un archivo Markdown y devuelve sus límites físicos "
-    "de línea."
-)
-DOCUMENT_SEPARATION_USER_SHORT = """Archivo: {source_file}
-
-Esqueleto del archivo (líneas del texto plano):
----
-{skeleton}
----
-
-Documentos detectados determinísticamente (MultibookFinderTool, límites físicos por ISBN/separadores):
----
-{deterministic_documents}
----
-
-Identifica los documentos contenidos en el archivo y devuelve el JSON:
-{{"documents": [{{"document_id": str, "title": str, "line_start": int, "line_end": int, "language": str}}]}}
-
-REGLAS:
-- La lista determinista es la BASE: confirma cada documento detectado (puedes ajustar títulos/idioma).
-- AÑADE divisiones adicionales SOLO si encuentras libros/papers/artículos SEPARADOS que la detección física no capturó (p. ej. un libro que empieza sin ISBN ni separador).
-- NO dividas un libro en capítulos/secciones: los capítulos se detectan en la Fase 2 (análisis documental), no aquí.
-- Cada documento debe tener un document_id unico y estable; line_start/line_end delimitan su rango en el archivo fuente."""
-
-# Fase 2 — análisis documental (spec kag_document_analysis). El user fallback
-# es el template EXACTO de la spec (src/db/seed_kag_prompts.py): se rellena con
-# _fill_prompt (replace por clave, NUNCA .format() — el template contiene llaves
-# JSON literales).
-TASK_DOCUMENT_ANALYSIS = "kag_document_analysis"
-DOCUMENT_ANALYSIS_SYSTEM_SHORT = (
-    "Eres un analista documental y bibliotecario. Produce la ficha documental "
-    "(tesauro ISO 25964, clasificación LCC/LCSH, cita BibTeX) y detecta los "
-    "capítulos del documento con su rango de líneas."
-)
-DOCUMENT_ANALYSIS_USER_SHORT = """Archivo: {source_file}
-Documento: {document_id}
-
-Contexto del documento COMPLETO (texto plano, líneas 1..N):
----
-{document_context}
----
-
-Analiza el documento y devuelve el JSON:
-{{"ficha": {{"title": str, "technical_level": str, "thematic_areas_iso25964": [{{"preferred_term": str, "non_preferred_terms": [str], "scope_note_disambiguation": str, "broader_term": str, "narrower_terms": [str], "related_terms": [str]}}], "library_of_congress": {{"lcsh_terms": [str], "lcc_classification": {{"label": str, "call_number": str}}}}, "bibtex": str, "key_entities": [{{"name": str, "type": str}}]}}, "index": [{{"division": str, "chapters": [{{"chapter_id": str, "title": str, "line_start": int, "line_end": int, "has_images": bool}}]}}]}}
-
-REGLAS:
-- El contexto es el documento COMPLETO: úsalo para detectar TODOS los capítulos reales (no solo los que tengan headers de markdown).
-- Los divisores estructurales (p. ej. "PART I", "Parte 1", portadas, páginas de título, entradas del TOC) NO son capítulos por sí mismos: solo son capítulos los títulos (numerados o no) que van SEGUIDOS de texto real.
-- Si una división "PART X" no tiene contenido propio, úsala solo como `division` del índice, nunca como capítulo. Un capítulo debe tener un rango de líneas con contenido sustancial (no 1-2 líneas de solo título).
-- Reagrupa los capítulos en un índice JERÁRQUICO: cada división (p. ej. "PART I Foundations") agrupa sus capítulos. Si el documento no tiene divisiones, usa UNA división con el título del documento.
-- line_start/line_end son RELATIVOS al documento (línea 1 = primera línea del contexto).
-- has_images: true si el capítulo contiene imágenes o figuras."""
-
-
-def _get_system_prompt(session, model_name, task_key, fallback: str) -> str:
-    """System prompt desde el artefacto compilado, o el fallback actual.
-
-    Import perezoso + try/except: si no hay DB/artefacto (tests con sesiones
-    falsas), degrada a la constante de hoy sin romper nada.
-    """
-    try:
-        from src.llm.compiler import get_active_prompt
-
-        artifact = get_active_prompt(session, model_name, task_key)
-        if artifact is not None and artifact.prompt_text:
-            return artifact.prompt_text
-    except Exception:  # noqa: BLE001 — degradación natural
-        pass
-    return fallback
-
-
-def _get_prompt_pair(
-    session, model_name, task_key, system_fallback: str, user_fallback: str
-) -> tuple[str, str]:
-    """(system, user) desde el artefacto compilado, o los fallbacks actuales.
-
-    El artefacto (0021) congela el SYSTEM renderizado en `prompt_text` y el
-    USER template parametrizable en `user_template`. Sin artefacto (tests sin
-    DB) devuelve las constantes actuales — comportamiento EXACTO de hoy.
-    """
-    try:
-        from src.llm.compiler import get_active_prompt
-
-        artifact = get_active_prompt(session, model_name, task_key)
-        if artifact is not None and artifact.prompt_text and artifact.user_template:
-            return artifact.prompt_text, artifact.user_template
-    except Exception:  # noqa: BLE001 — degradación natural
-        pass
-    return system_fallback, user_fallback
 
 
 # Raíces del repositorio de conocimiento (relativas a la raíz del proyecto).
@@ -619,29 +524,6 @@ def complete_local(
 # Extracción LLM de entidades y relaciones
 # ---------------------------------------------------------------------
 
-EXTRACT_PROMPT = """Extrae las entidades y relaciones del siguiente fragmento de texto.
-
-Devuelve SOLO JSON con esta forma exacta:
-{
-  "entities": [
-    {"name": "Nombre de la entidad", "type": "concept|method|law|person|org|figure", "description": "breve descripción"}
-  ],
-  "relations": [
-    {"source": "Entidad origen", "target": "Entidad destino", "type": "RELACIÓN_EN_MAYÚSCULAS", "description": "breve descripción"}
-  ]
-}
-
-Reglas:
-- Entidades: conceptos, métodos, leyes, personas, organizaciones o figuras relevantes.
-- Relaciones: solo entre entidades presentes en el fragmento.
-- Si no hay entidades, devuelve {"entities": [], "relations": []}.
-
-Texto:
-<text>
-{chunk}
-</text>
-"""
-
 
 def extract_entities_relations(session, chunk_text):
     """Extrae entidades y relaciones de un chunk con el modelo pequeño (Together).
@@ -658,7 +540,6 @@ def extract_entities_relations(session, chunk_text):
         small_model,
         TASK_EXTRACT_ENTITIES,
         EXTRACT_SYSTEM_SHORT,
-        EXTRACT_PROMPT,
     )
     # str.replace en vez de .format(): el prompt contiene llaves JSON literales
     # que .format() interpretaría como placeholders (KeyError).
@@ -901,129 +782,6 @@ def _store_proposition_links(
 # Extracción LLM de proposiciones atómicas (capa micro, migración 0024)
 # ---------------------------------------------------------------------
 
-# Intent del analista epistemológico (corto) — fallback EXACTO cuando no hay
-# artefacto compilado (tests sin DB: get_active_prompt devuelve None).
-PROPOSITIONAL_SYSTEM_SHORT = (
-    "Eres un analista de epistemología y análisis del discurso. Tu objetivo "
-    "es descomponer el texto en proposiciones atómicas autocontenidas: cada "
-    "proposición debe ser gramaticalmente independiente (reemplaza anáforas "
-    "como 'éste', 'lo anterior', 'dicho autor' por el sujeto explícito). "
-    "'text_span' debe contener el fragmento de texto EXACTO del original. "
-    "REGLA DE REFERENCIAS DUPLICADAS: si una frase contiene una referencia "
-    "académica (ej. 'Bourdieu, 1984, p. 52'), dicha referencia DEBE "
-    "preservarse y duplicarse en 'citations_references' de TODAS las "
-    "proposiciones que deriven de ella. Devuelve JSON válido."
-)
-
-PROPOSITIONAL_USER_SHORT = """Archivo: {source_file}
-Documento: {document_id}
-Capítulo: {chapter_id}
-Rango: Línea {line_start} a Línea {line_end}
-
-Texto a procesar:
----
-{chapter_text_content}
----
-
-Genera el JSON con las proposiciones organizadas por divisiones (capítulos del texto):
-{{"divisions": [{{"chapter_id": str, "propositions": [{{"core_idea_id": str, "argument_id": str, "statement": str, "text_span": str, "char_start": int, "char_end": int, "line_start": int, "line_end": int, "citations_references": [str]}}]}}]}}"""
-
-# Paráfrasis de chunks (Fase 4, etapa 'paraphrased') — fallback EXACTO cuando
-# no hay artefacto compilado (tests sin DB: get_active_prompt devuelve None).
-# El template USER es el de la spec kag_chunk_paraphrase (seed_kag_prompts.py)
-# con el schema de salida ajustado a {"paraphrases": [{"chunk_index": int,
-# "paraphrase": str}]} (por chunk_index, no por chunk_id).
-PARAPHRASE_SYSTEM_SHORT = (
-    "Eres un parafraseador académico. Parafrasea cada chunk preservando el "
-    "significado exacto, sin añadir ni omitir información."
-)
-
-PARAPHRASE_USER_SHORT = """Archivo: {source_file}
-Documento: {document_id}
-Capítulo: {chapter_id}
-
-Chunks del capítulo:
----
-{chunks_json}
----
-
-Parafrasea cada chunk y devuelve el JSON:
-{{"paraphrases": [{{"chunk_index": int, "paraphrase": str}}]}}"""
-
-# Proposiciones + entidades + relaciones por documento (Fase 5, etapa
-# 'chunked') — fallback EXACTO cuando no hay artefacto compilado (tests sin
-# DB: get_active_prompt devuelve None). El template USER es el de la spec
-# kag_chapter_propositions (seed_kag_prompts.py) con el schema de salida
-# {"propositions": [{"chunk_index": int, ...}], "entities": [...],
-# "relations": [...]} (asignación primaria por chunk_index).
-CHAPTER_PROPOSITIONS_SYSTEM_SHORT = (
-    "Eres un analista de epistemología y análisis del discurso. Tu objetivo "
-    "es descomponer las paráfrasis del capítulo en proposiciones atómicas "
-    "autocontenidas y extraer las entidades y relaciones del capítulo. "
-    "'text_span' debe contener el fragmento de texto EXACTO de la paráfrasis. "
-    "REGLA DE REFERENCIAS DUPLICADAS: si una frase contiene una referencia "
-    "académica (ej. 'Bourdieu, 1984, p. 52'), dicha referencia DEBE "
-    "preservarse y duplicarse en 'citations_references' de TODAS las "
-    "proposiciones que deriven de ella. Devuelve JSON válido."
-)
-
-CHAPTER_PROPOSITIONS_USER_SHORT = """Archivo: {source_file}
-Documento: {document_id}
-Capítulo: {chapter_id}
-
-Paráfrasis del capítulo:
----
-{paraphrases_json}
----
-
-Extrae las proposiciones atomicas y devuelve el JSON:
-{{"propositions": [{{"chunk_index": int, "core_idea_id": str, "argument_id": str, "statement": str, "text_span": str, "citations_references": [str]}}], "entities": [{{"name": str, "type": str, "description": str}}], "relations": [{{"source": str, "target": str, "type": str, "description": str}}]}}"""
-
-# Extracción FUSIONADA por documento (Fases 4+5 en UNA llamada, spec
-# kag_document_extract) — fallback EXACTO cuando no hay artefacto compilado
-# (tests sin DB: get_active_prompt devuelve None). El SYSTEM define las TRES
-# capas lingüísticas DISTINTAS que el modelo debe producir en el mismo JSON:
-# paráfrasis (chunk, para info específica), proposición (hecho atómico) y
-# resumen (capítulo/documento, solo para indexing).
-DOCUMENT_EXTRACT_SYSTEM_SHORT = (
-    "Eres un analista de epistemología y análisis del discurso. Procesas los "
-    "chunks de un documento y produces TRES capas lingüísticas DISTINTAS en "
-    "UNA sola respuesta JSON:\n"
-    "1. PARÁFRASIS (por chunk): reescritura del chunk preservando TODOS los "
-    "detalles, la estructura argumentativa y las referencias, sin añadir ni "
-    "omitir información. Se usa para recuperar información ESPECÍFICA "
-    "(búsqueda textual sobre la paráfrasis). NO es un resumen: debe ser tan "
-    "detallada como el original.\n"
-    "2. PROPOSICIÓN (por chunk): hecho atómico autocontenido y "
-    "gramaticalmente independiente (reemplaza anáforas por el sujeto "
-    "explícito). 'text_span' debe contener el fragmento de texto EXACTO del "
-    "chunk del que deriva. REGLA DE REFERENCIAS DUPLICADAS: si una frase "
-    "contiene una referencia académica, debe preservarse y duplicarse en "
-    "'citations_references' de TODAS las proposiciones que deriven de ella.\n"
-    "3. RESUMEN (por capítulo y documento): condensación jerárquica de "
-    "abajo-arriba. Cada 'section_summaries' resume UN capítulo (chapter_id); "
-    "'document_summary' sintetiza el documento completo a partir de los "
-    "resúmenes de capítulo. Los resúmenes se usan SOLO para indexación y "
-    "marco temático (NUNCA para responder detalles específicos).\n"
-    "Devuelve JSON válido."
-)
-
-DOCUMENT_EXTRACT_USER_SHORT = """Archivo: {source_file}
-Documento: {document_id}
-
-Capítulos del documento (para los resúmenes de sección):
----
-{chapters_json}
----
-
-Chunks del documento (texto a procesar):
----
-{chunks_json}
----
-
-Procesa los chunks y devuelve el JSON:
-{{"paraphrases": [{{"chunk_index": int, "paraphrase": str}}], "propositions": [{{"chunk_index": int, "core_idea_id": str, "argument_id": str, "statement": str, "text_span": str, "citations_references": [str]}}], "entities": [{{"name": str, "type": str, "description": str}}], "relations": [{{"source": str, "target": str, "type": str, "description": str}}], "section_summaries": [{{"chapter_id": str, "summary": str}}], "document_summary": str}}"""
-
 
 def _span_offsets(content: str, char_start: int, char_end: int):
     """(char_start, char_end, line_start, line_end) 1-based del chunk."""
@@ -1124,7 +882,6 @@ def _extract_propositions(
         small_model,
         TASK_PROPOSITION_CHUNKING,
         PROPOSITIONAL_SYSTEM_SHORT,
-        PROPOSITIONAL_USER_SHORT,
     )
     # Truncado del contexto (~12000 chars) si el chunk es muy grande.
     chunk_text = content[:MAX_CONTEXT_CHARS]
@@ -1451,7 +1208,6 @@ def _extract_propositions_batch(
         model_name,
         TASK_PROPOSITION_CHUNKING,
         PROPOSITIONAL_SYSTEM_SHORT,
-        PROPOSITIONAL_USER_SHORT,
     )
     sep = "\n\n---\n\n"
     batch_text = sep.join(ch["content"] for ch in chunks)
@@ -1569,7 +1325,6 @@ def _extract_document_batch(
         model_name,
         TASK_CHAPTER_PROPOSITIONS,
         CHAPTER_PROPOSITIONS_SYSTEM_SHORT,
-        CHAPTER_PROPOSITIONS_USER_SHORT,
     )
     sep = "\n\n---\n\n"
     batch_text = sep.join(ch["content"] for ch in chunks)
@@ -1982,7 +1737,6 @@ def _extract_document_fused_batch(
         model_name,
         TASK_DOCUMENT_EXTRACT,
         DOCUMENT_EXTRACT_SYSTEM_SHORT,
-        DOCUMENT_EXTRACT_USER_SHORT,
     )
     # Capítulos del documento (para los resúmenes de sección): solo los que
     # cubre el lote (chapter_id de los chunks).
@@ -2451,7 +2205,6 @@ def _paraphrase_group(session, doc_id, doc_path, chapter_id, chunks, verbose=Tru
         model_name,
         TASK_CHUNK_PARAPHRASE,
         PARAPHRASE_SYSTEM_SHORT,
-        PARAPHRASE_USER_SHORT,
     )
     chunks_json = json.dumps(
         [{"chunk_index": ch["chunk_index"], "content": ch["content"]} for ch in chunks],
@@ -2503,25 +2256,6 @@ def _paraphrase_group(session, doc_id, doc_path, chapter_id, chunks, verbose=Tru
 # ---------------------------------------------------------------------
 # Resumen jerárquico con Qwen 2.5 local
 # ---------------------------------------------------------------------
-
-QWEN_SUMMARY_SYSTEM = """You are a summarization assistant. Given a document divided into sections, produce a JSON object with one summary per section and a final document summary. Follow these rules strictly:
-- Output a JSON object: {"section_summaries": [{"section": str, "summary": str}], "document_summary": str}
-- Each section summary: exactly ONE sentence, maximum 30 words.
-- document_summary: 2-3 sentences synthesizing the whole document.
-- No preamble, no explanations, no markdown outside the JSON.
-- Only facts present in the text. Do not invent.
-- Do not start with phrases like "This text..." or "The text describes...".
-- Respond in the same language as the text.
-
-Example:
-Text: <text># Cap 1\nEl backpropagation ajusta los pesos de una red neuronal calculando el gradiente de la función de pérdida.\n# Cap 2\nLa función de pérdida mide el error entre la salida predicha y la esperada.</text>
-JSON: {"section_summaries": [{"section": "# Cap 1", "summary": "El backpropagation ajusta los pesos de una red neuronal mediante el gradiente de la función de pérdida."}, {"section": "# Cap 2", "summary": "La función de pérdida mide el error entre la salida predicha y la esperada."}], "document_summary": "El texto explica el backpropagation y la función de pérdida en el entrenamiento de redes neuronales."}"""
-
-QWEN_SUMMARY_USER = """<text>
-{text}
-</text>
-
-JSON:"""
 
 
 def _split_h1_h2(text: str) -> list:
@@ -2754,7 +2488,6 @@ def summarize_document(session, text, doc_type, doc_id=None):
             small_model,
             TASK_QWEN_SUMMARY,
             QWEN_SUMMARY_SYSTEM,
-            QWEN_SUMMARY_USER,
         )
         sections = _split_h1_h2(text)
         if not sections:
@@ -3034,7 +2767,6 @@ def _index_document_analysis(
             large_model,
             TASK_DOCUMENT_ANALYSIS,
             DOCUMENT_ANALYSIS_SYSTEM_SHORT,
-            DOCUMENT_ANALYSIS_USER_SHORT,
         )
         prompt = _fill_prompt(
             user_template,
@@ -3603,7 +3335,6 @@ def _index_document_separation(session, md_path, md_text, verbose=True) -> list[
             large_model,
             TASK_DOCUMENT_SEPARATION,
             DOCUMENT_SEPARATION_SYSTEM_SHORT,
-            DOCUMENT_SEPARATION_USER_SHORT,
         )
         prompt = _fill_prompt(
             user_template,
