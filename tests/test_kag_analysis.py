@@ -33,6 +33,10 @@ class _FakeSession:
     def execute(self, stmt, params=None):
         sql = str(stmt)
         self.calls.append((sql, params or {}))
+        if "INSERT INTO kag_thesaurus_terms" in sql:
+            # Tesauro (0035): RETURNING id de términos — no consume el
+            # contador de UUIDs de capítulos.
+            return SimpleNamespace(scalar=lambda: 1)
         if "RETURNING id" in sql:
             self._next_id += 1
             return SimpleNamespace(scalar=lambda: f"chap-uuid-{self._next_id}")

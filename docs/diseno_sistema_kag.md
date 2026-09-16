@@ -1030,17 +1030,17 @@ sequenceDiagram
     Q->>L: _audit_epistemic_fused (UNA llamada: síntesis + contradicciones + suficiencia)
     L-->>Q: facts + contradictions + sufficiency (verdict)
     alt NEGATIVE_REJECTION
-        Q-->>U: abstención formal (verdict incluido)
+        Q-->>U: abstención formal (verdi<ct incluido)
     else INSUFFICIENT_TRIGGER_BRANCH_B
         loop hasta max_iterations=2 (early exit si Δ < 0.05 o sin novedades)
             Q->>DB: _branch_b_expand (FTS kag_propositions + vecinos del grafo)
             Q->>L: re-auditar (fused)
         end
     end
-    Q->>L: _verify_grounding (rapidfuzz partial_ratio >= 95)
+<<<>>>    Q->>L: _verify_grounding (rapidfuzz partial_ratio >= 95)
     Q->>L: respuesta final (LLM grande, prompt kag_answer)
     L-->>Q: answer
-    Q-->>U: "dict {answer, verdict, grounded_evidence, epistemic_tensions, used_fallback}"
+    Q-->>U: "dict {answer, verdict, grounded_evidence, epistemic_tensions, used_fallback}"<<>>
 ```
 
 ### 9.4 API — `POST /kag/ask` y `POST /kag/ingest`

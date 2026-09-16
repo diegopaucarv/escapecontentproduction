@@ -2376,6 +2376,101 @@ def _enrich_library_of_congress(ficha: dict, verbose: bool = True) -> dict:
     return ficha
 
 
+def _store_document_thesaurus(session, doc_id, ficha):
+    """Puebla el tesauro (0035) desde la ficha documental (Fase 2).
+
+    Extrae términos de la ficha:
+      - thematic_areas_iso25964 → source='iso25964' (preferred_term con
+        broader/narrower/related de la ficha).
+      - library_of_congress.lcsh_terms → source='lcsh' (sin relaciones).
+      - library_of_congress.lcc_classification.label → source='lcc' (sin
+        relaciones).
+
+    Upsert por (term_norm, source) con RETURNING id (un statement por
+    término, sin executemany) y enlaza el documento vía kag_document_thesaurus
+    (un solo INSERT multi-VALUES con ON CONFLICT DO NOTHING).
+    """
+    terms = []  # (term, term_norm, source, broader, narrower, related)
+    areas = ficha.get("thematic_areas_iso25964") or []
+    if isinstance(areas, list):
+        for area in areas:
+            if not isinstance(area, dict):
+                continue
+            preferred = str(area.get("preferred_term") or "").strip()
+            if not preferred:
+                continue
+            broader = str(area.get("broader_term") or "").strip()
+            narrower = area.get("narrower_terms") or []
+            related = area.get("related_terms") or []
+            terms.append(
+                (
+                    preferred,
+                    normalize_entity_name(preferred),
+                    "iso25964",
+                    [broader] if broader else [],
+                    [str(t).strip() for t in narrower if str(t).strip()],
+                    [str(t).strip() for t in related if str(t).strip()],
+                )
+            )
+    loc = ficha.get("library_of_congress") or {}
+    if isinstance(loc, dict):
+        lcsh_terms = loc.get("lcsh_terms") or []
+        if isinstance(lcsh_terms, list):
+            for term in lcsh_terms:
+                term_str = (
+                    str(term)
+                    if not isinstance(term, dict)
+                    else str(term.get("term") or "")
+                ).strip()
+                if not term_str:
+                    continue
+                terms.append(
+                    (term_str, normalize_entity_name(term_str), "lcsh", [], [], [])
+                )
+        lcc = loc.get("lcc_classification") or {}
+        if isinstance(lcc, dict):
+            label = str(lcc.get("label") or "").strip()
+            if label:
+                terms.append((label, normalize_entity_name(label), "lcc", [], [], []))
+    if not terms:
+        return
+    term_ids = []
+    for term, term_norm, source, broader, narrower, related in terms:
+        row = session.execute(
+            text(
+                "INSERT INTO kag_thesaurus_terms "
+                "(term, term_norm, source, broader, narrower, related) "
+                "VALUES (:term, :term_norm, :source, :broader, :narrower, :related) "
+                "ON CONFLICT (term_norm, source) DO UPDATE SET "
+                "broader = EXCLUDED.broader, narrower = EXCLUDED.narrower, "
+                "related = EXCLUDED.related "
+                "RETURNING id"
+            ),
+            {
+                "term": term,
+                "term_norm": term_norm,
+                "source": source,
+                "broader": json.dumps(broader, ensure_ascii=False),
+                "narrower": json.dumps(narrower, ensure_ascii=False),
+                "related": json.dumps(related, ensure_ascii=False),
+            },
+        ).scalar()
+        term_ids.append(row)
+    # Un solo INSERT multi-VALUES con ON CONFLICT DO NOTHING (dedup por PK).
+    placeholders = ", ".join(f"(:d{i}, :t{i})" for i in range(len(term_ids)))
+    params = {}
+    for i, tid in enumerate(term_ids):
+        params[f"d{i}"] = doc_id
+        params[f"t{i}"] = tid
+    session.execute(
+        text(
+            "INSERT INTO kag_document_thesaurus (doc_id, term_id) "
+            f"VALUES {placeholders} ON CONFLICT DO NOTHING"
+        ),
+        params,
+    )
+
+
 def _index_document_analysis(
     session, doc_id, doc_path, slice_text, verbose=True
 ) -> dict:
@@ -2607,6 +2702,19 @@ def _index_document_analysis(
             "doc_id": doc_id,
         },
     )
+    # ── Tesauro (0035): términos LCSH/LCC/ISO 25964 + links del documento ──
+    # Best-effort: si la migración no está aplicada o el tesauro falla, se
+    # hace rollback (la transacción queda aborted tras un error en Postgres)
+    # y la ingesta sigue con las etapas restantes.
+    try:
+        _store_document_thesaurus(session, doc_id, ficha)
+    except Exception as exc:  # noqa: BLE001 — degradación natural
+        try:
+            session.rollback()
+        except Exception:  # noqa: BLE001 — sesión falsa de tests
+            pass
+        if verbose:
+            print(f"[KAG] ⚠ Tesauro no poblado para {doc_path}: {exc}")
     chapter_map: dict[str, str] = {}
     for ch in clean_chapters:
         row = session.execute(

@@ -434,12 +434,14 @@ def test_build_adjacency_cached_by_version():
     session = _FakeSession(version=1, rows=rows)
 
     adj1 = build_adjacency(session)
-    assert session.relation_queries == 2  # kag_relations + kag_proposition_links
+    assert (
+        session.relation_queries == 5
+    )  # kag_relations + kag_proposition_links + 3 capa tesauro
     assert adj1[1][2] == 1
     assert adj1[2][3] == 1
 
     adj2 = build_adjacency(session)
-    assert session.relation_queries == 2  # no relee
+    assert session.relation_queries == 5  # no relee
     assert adj2 is adj1  # mismo objeto
 
 
@@ -479,7 +481,9 @@ def test_build_adjacency_rebuilds_on_version_change():
     session = _FakeSession(version=1, rows=rows_v1)
 
     adj1 = build_adjacency(session)
-    assert session.relation_queries == 2  # kag_relations + kag_proposition_links
+    assert (
+        session.relation_queries == 5
+    )  # kag_relations + kag_proposition_links + 3 capa tesauro
     assert 3 in adj1[2]
 
     # Ingesta: versión sube y las relaciones cambian.
@@ -490,7 +494,7 @@ def test_build_adjacency_rebuilds_on_version_change():
     ]
 
     adj2 = build_adjacency(session)
-    assert session.relation_queries == 4  # 2 consultas × 2 llamadas
+    assert session.relation_queries == 10  # 5 consultas × 2 llamadas
     assert 2 not in adj2  # entidad 2 ya no está en el grafo
     assert adj2[1][4] == 1
     assert adj2[4][5] == 1
@@ -527,9 +531,11 @@ def test_build_adjacency_degrades_without_version_table():
     session = _FakeSession(rows=rows)
 
     adj1 = build_adjacency(session)
-    assert session.relation_queries == 2  # kag_relations + kag_proposition_links
+    assert (
+        session.relation_queries == 5
+    )  # kag_relations + kag_proposition_links + 3 capa tesauro
     adj2 = build_adjacency(session)
-    assert session.relation_queries == 4  # relee cada vez (2 consultas × 2)
+    assert session.relation_queries == 10  # relee cada vez (5 consultas × 2)
     assert adj2 is not adj1  # no cachea
     assert adj2[1][2] == 1
 

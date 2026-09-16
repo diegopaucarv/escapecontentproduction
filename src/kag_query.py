@@ -1045,6 +1045,24 @@ def _read_graph_version(session):
         return None
 
 
+def _fetch_adjacency_rows(session, sql):
+    """SELECT de una capa del grafo con degradación: tabla ausente → [].
+
+    Si la tabla no existe (migración sin aplicar) o la sesión no soporta la
+    consulta, hace rollback (la transacción queda aborted tras un error en
+    Postgres) y devuelve [] para que build_adjacency continúe con las capas
+    disponibles.
+    """
+    try:
+        return session.execute(text(sql)).fetchall()
+    except Exception:  # noqa: BLE001 — degradación natural
+        try:
+            session.rollback()
+        except Exception:  # noqa: BLE001 — sesión falsa de tests sin rollback
+            pass
+        return []
+
+
 def build_adjacency(session):
     """Grafo desde kag_relations: {entity_id: {neighbor_id: weight}}.
 
@@ -1061,6 +1079,14 @@ def build_adjacency(session):
     (arista bidireccional, weight 1). El dict mezcla keys INT (entidades) y
     STRING "p:..." (proposiciones). Si la tabla no existe, degrada al grafo
     de entidades sin romper.
+
+    Capa tesauro (0035, flag KAG_GRAPH_THESAURUS_LAYER): además, lee
+    kag_entities (doc→entidad), kag_document_thesaurus (doc→término) y
+    kag_thesaurus_terms (término→término por broader/narrower/related,
+    resueltos por term_norm dentro del mismo source; si el término
+    relacionado no existe como fila, se omite) y agrega nodos de documento
+    "d:{doc_id}" y de tesauro "t:{term_id}". Si alguna tabla no existe,
+    degrada a las capas disponibles sin romper.
     """
     global _adjacency_cache, _adjacency_version
 
@@ -1103,6 +1129,80 @@ def build_adjacency(session):
             adj.setdefault(eid, {})
             adj[pnode][eid] = 1
             adj[eid][pnode] = 1
+
+    if _kag_config_value(session, "KAG_GRAPH_THESAURUS_LAYER", True):
+        # Capa documento: doc → entidades (kag_entities) y doc → términos
+        # (kag_document_thesaurus). Cada consulta degrada por separado.
+        doc_ent_rows = _fetch_adjacency_rows(
+            session, "SELECT DISTINCT doc_id, id AS entity_id FROM kag_entities"
+        )
+        doc_term_rows = _fetch_adjacency_rows(
+            session, "SELECT doc_id, term_id FROM kag_document_thesaurus"
+        )
+        for r in doc_ent_rows:
+            did = getattr(r, "doc_id", None)
+            eid = getattr(r, "entity_id", None)
+            if did is None or eid is None:
+                continue
+            dnode = f"d:{did}"
+            adj.setdefault(dnode, {})
+            adj.setdefault(eid, {})
+            adj[dnode][eid] = 1
+            adj[eid][dnode] = 1
+        for r in doc_term_rows:
+            did = getattr(r, "doc_id", None)
+            tid = getattr(r, "term_id", None)
+            if did is None or tid is None:
+                continue
+            dnode = f"d:{did}"
+            tnode = f"t:{tid}"
+            adj.setdefault(dnode, {})
+            adj.setdefault(tnode, {})
+            adj[dnode][tnode] = 1
+            adj[tnode][dnode] = 1
+        # Capa tesauro: término → término por broader/narrower/related,
+        # resueltos por term_norm dentro del mismo source.
+        term_rows = _fetch_adjacency_rows(
+            session,
+            "SELECT id, term_norm, source, broader, narrower, related "
+            "FROM kag_thesaurus_terms",
+        )
+        terms_by_key = {}
+        for r in term_rows:
+            tid = getattr(r, "id", None)
+            norm = getattr(r, "term_norm", None)
+            src = getattr(r, "source", None)
+            if tid is None or not norm or not src:
+                continue
+            terms_by_key[(norm, src)] = tid
+        for r in term_rows:
+            tid = getattr(r, "id", None)
+            norm = getattr(r, "term_norm", None)
+            src = getattr(r, "source", None)
+            if tid is None or not norm or not src:
+                continue
+            tnode = f"t:{tid}"
+            for field in ("broader", "narrower", "related"):
+                rels = getattr(r, field, None)
+                if isinstance(rels, str):
+                    try:
+                        rels = json.loads(rels)
+                    except Exception:  # noqa: BLE001 — JSONB malformado
+                        rels = []
+                if not isinstance(rels, list):
+                    continue
+                for other in rels:
+                    other_norm = normalize_entity_name(str(other))
+                    if not other_norm:
+                        continue
+                    other_id = terms_by_key.get((other_norm, src))
+                    if other_id is None:
+                        continue
+                    onode = f"t:{other_id}"
+                    adj.setdefault(tnode, {})
+                    adj.setdefault(onode, {})
+                    adj[tnode][onode] = 1
+                    adj[onode][tnode] = 1
 
     if version is not None:
         _adjacency_cache = adj
@@ -1311,7 +1411,8 @@ def ppr_entity_selection(
     if not scores:
         return []
     # Solo nodos entidad (keys INT): los nodos "p:..." (capa proposicional,
-    # 0034) propagan el PPR pero no se seleccionan como semilla de chunks.
+    # 0034) y "d:..."/"t:..." (capa tesauro, 0035) propagan el PPR pero no
+    # se seleccionan como semilla de chunks.
     entity_items = [(eid, s) for eid, s in scores.items() if isinstance(eid, int)]
     if not entity_items:
         return []
