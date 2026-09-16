@@ -72,6 +72,7 @@ TASK_DOCUMENT_SEPARATION = "kag_document_separation"
 TASK_DOCUMENT_ANALYSIS = "kag_document_analysis"
 TASK_CHUNK_PARAPHRASE = "kag_chunk_paraphrase"
 TASK_CHAPTER_PROPOSITIONS = "kag_chapter_propositions"
+TASK_DOCUMENT_EXTRACT = "kag_document_extract"
 
 # System prompts cortos actuales — fallback EXACTO de hoy cuando no hay
 # artefacto compilado (tests sin DB: get_active_prompt devuelve None).
@@ -977,6 +978,51 @@ Paráfrasis del capítulo:
 
 Extrae las proposiciones atomicas y devuelve el JSON:
 {{"propositions": [{{"chunk_index": int, "core_idea_id": str, "argument_id": str, "statement": str, "text_span": str, "citations_references": [str]}}], "entities": [{{"name": str, "type": str, "description": str}}], "relations": [{{"source": str, "target": str, "type": str, "description": str}}]}}"""
+
+# Extracción FUSIONADA por documento (Fases 4+5 en UNA llamada, spec
+# kag_document_extract) — fallback EXACTO cuando no hay artefacto compilado
+# (tests sin DB: get_active_prompt devuelve None). El SYSTEM define las TRES
+# capas lingüísticas DISTINTAS que el modelo debe producir en el mismo JSON:
+# paráfrasis (chunk, para info específica), proposición (hecho atómico) y
+# resumen (capítulo/documento, solo para indexing).
+DOCUMENT_EXTRACT_SYSTEM_SHORT = (
+    "Eres un analista de epistemología y análisis del discurso. Procesas los "
+    "chunks de un documento y produces TRES capas lingüísticas DISTINTAS en "
+    "UNA sola respuesta JSON:\n"
+    "1. PARÁFRASIS (por chunk): reescritura del chunk preservando TODOS los "
+    "detalles, la estructura argumentativa y las referencias, sin añadir ni "
+    "omitir información. Se usa para recuperar información ESPECÍFICA "
+    "(búsqueda textual sobre la paráfrasis). NO es un resumen: debe ser tan "
+    "detallada como el original.\n"
+    "2. PROPOSICIÓN (por chunk): hecho atómico autocontenido y "
+    "gramaticalmente independiente (reemplaza anáforas por el sujeto "
+    "explícito). 'text_span' debe contener el fragmento de texto EXACTO del "
+    "chunk del que deriva. REGLA DE REFERENCIAS DUPLICADAS: si una frase "
+    "contiene una referencia académica, debe preservarse y duplicarse en "
+    "'citations_references' de TODAS las proposiciones que deriven de ella.\n"
+    "3. RESUMEN (por capítulo y documento): condensación jerárquica de "
+    "abajo-arriba. Cada 'section_summaries' resume UN capítulo (chapter_id); "
+    "'document_summary' sintetiza el documento completo a partir de los "
+    "resúmenes de capítulo. Los resúmenes se usan SOLO para indexación y "
+    "marco temático (NUNCA para responder detalles específicos).\n"
+    "Devuelve JSON válido."
+)
+
+DOCUMENT_EXTRACT_USER_SHORT = """Archivo: {source_file}
+Documento: {document_id}
+
+Capítulos del documento (para los resúmenes de sección):
+---
+{chapters_json}
+---
+
+Chunks del documento (texto a procesar):
+---
+{chunks_json}
+---
+
+Procesa los chunks y devuelve el JSON:
+{{"paraphrases": [{{"chunk_index": int, "paraphrase": str}}], "propositions": [{{"chunk_index": int, "core_idea_id": str, "argument_id": str, "statement": str, "text_span": str, "citations_references": [str]}}], "entities": [{{"name": str, "type": str, "description": str}}], "relations": [{{"source": str, "target": str, "type": str, "description": str}}], "section_summaries": [{{"chapter_id": str, "summary": str}}], "document_summary": str}}"""
 
 
 def _span_offsets(content: str, char_start: int, char_end: int):
@@ -1894,6 +1940,411 @@ def _extract_document_propositions(
 
 
 # ---------------------------------------------------------------------
+# Extracción FUSIONADA por documento (Fases 4+5 en UNA llamada por lote)
+# ---------------------------------------------------------------------
+
+
+def _extract_document_fused_batch(
+    session, doc_id, chunks, doc_path, verbose, model_size="large", chapter_id=""
+):
+    """UNA llamada LLM grande por lote: paráfrasis + proposiciones + entidades
+    + relaciones + resúmenes de sección + resumen de documento (spec
+    `kag_document_extract`).
+
+    `chunks`: lista de dicts {id, content, chunk_index, chapter_id} donde
+    `content` es el texto a procesar (paráfrasis o content si NULL). El LLM
+    devuelve el JSON fusionado con las TRES capas lingüísticas (paráfrasis por
+    chunk, proposiciones atómicas por chunk, resúmenes por capítulo/documento).
+    Asignación de proposiciones a chunks: primario = chunk_index declarado por
+    el LLM; si falta o es inválido, secundario = _locate_span_in_batch. Si
+    ambos fallan → la proposición se descarta (chunk_id es NOT NULL).
+
+    Devuelve dict con las claves "paraphrases", "propositions", "entities",
+    "relations", "section_summaries" y "document_summary". Si el LLM falla o
+    devuelve JSON inválido → dict vacío (degradación: la ingesta sigue).
+    """
+    if model_size not in ("small", "large"):
+        model_size = "large"
+    settings = load_settings(session)
+    retries = int(getattr(settings, "llm_retries", 3) or 3) if settings else 3
+    fallback = getattr(settings, "fallback_model", None) if settings else None
+    model_name = (
+        (
+            getattr(settings, "large_model", None)
+            if model_size == "large"
+            else getattr(settings, "small_model", None)
+        )
+        if settings
+        else None
+    )
+    system, user_template = _get_prompt_pair(
+        session,
+        model_name,
+        TASK_DOCUMENT_EXTRACT,
+        DOCUMENT_EXTRACT_SYSTEM_SHORT,
+        DOCUMENT_EXTRACT_USER_SHORT,
+    )
+    # Capítulos del documento (para los resúmenes de sección): solo los que
+    # cubre el lote (chapter_id de los chunks).
+    chapters_json = "[]"
+    try:
+        chapter_rows = session.execute(
+            text(
+                "SELECT id, title FROM kag_chapters WHERE doc_id = :doc_id "
+                "ORDER BY line_start"
+            ),
+            {"doc_id": doc_id},
+        ).fetchall()
+        batch_chapter_ids = {
+            str(ch.get("chapter_id") or "") for ch in chunks if ch.get("chapter_id")
+        }
+        chapters_json = json.dumps(
+            [
+                {"chapter_id": str(r.id), "title": r.title}
+                for r in chapter_rows
+                if str(r.id) in batch_chapter_ids
+            ],
+            ensure_ascii=False,
+        )
+    except Exception:  # noqa: BLE001 — sin capítulos: el prompt degrada a []
+        chapters_json = "[]"
+    chunks_json = json.dumps(
+        [{"chunk_index": ch["chunk_index"], "content": ch["content"]} for ch in chunks],
+        ensure_ascii=False,
+    )
+    prompt = _fill_prompt(
+        user_template,
+        source_file=str(Path(doc_path)).replace("\\", "/"),
+        document_id=str(doc_id),
+        chapters_json=chapters_json,
+        chunks_json=chunks_json,
+    )
+    try:
+        text_out, _model, _used_fallback = call_with_retries(
+            session,
+            prompt=prompt,
+            system=system,
+            model_size=model_size,
+            response_format={"type": "json_object"},
+            retries=retries,
+            fallback_model=fallback,
+        )
+        data = parse_llm_output(text_out)
+    except Exception as exc:  # noqa: BLE001 — LLM no disponible: degradación
+        if verbose:
+            first_idx = chunks[0]["chunk_index"]
+            last_idx = chunks[-1]["chunk_index"]
+            label = (
+                f"{first_idx}-{last_idx}" if first_idx != last_idx else str(first_idx)
+            )
+            print(f"[KAG] ⚠ Extracción fusionada falló (lote {label}): {exc}")
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    # Paráfrasis: por chunk_index.
+    paraphrases = []
+    for p in data.get("paraphrases") or []:
+        if not isinstance(p, dict):
+            continue
+        try:
+            idx = int(p.get("chunk_index"))
+        except (TypeError, ValueError):
+            continue
+        paraphrase = str(p.get("paraphrase") or "").strip()
+        if not paraphrase:
+            continue
+        paraphrases.append({"chunk_index": idx, "paraphrase": paraphrase})
+    # Proposiciones: primario chunk_index, secundario _locate_span_in_batch.
+    sep = "\n\n---\n\n"
+    batch_text = sep.join(ch["content"] for ch in chunks)
+    offsets = []
+    cursor = 0
+    for ch in chunks:
+        start = cursor
+        cursor += len(ch["content"])
+        offsets.append((ch["id"], start, cursor))
+        cursor += len(sep)
+    index_to_id = {ch["chunk_index"]: ch["id"] for ch in chunks}
+    chunk_chapters = {ch["id"]: (ch.get("chapter_id") or "") for ch in chunks}
+    propositions = []
+    for p in data.get("propositions") or []:
+        if not isinstance(p, dict):
+            continue
+        statement = str(p.get("statement") or "").strip()
+        if not statement:
+            continue
+        text_span = str(p.get("text_span") or "")
+        chunk_id = None
+        char_start = char_end = line_start = line_end = None
+        try:
+            idx = int(p.get("chunk_index"))
+        except (TypeError, ValueError):
+            idx = None
+        if idx is not None and idx in index_to_id:
+            chunk_id = index_to_id[idx]
+        if chunk_id is None:
+            chunk_id, char_start, char_end, line_start, line_end = (
+                _locate_span_in_batch(chunks, batch_text, offsets, text_span)
+            )
+        if chunk_id is None:
+            continue  # sin chunk asignable → descartar (chunk_id NOT NULL)
+        citations = p.get("citations_references") or []
+        if not isinstance(citations, list):
+            citations = []
+        propositions.append(
+            {
+                "doc_id": doc_id,
+                "chunk_id": chunk_id,
+                "chapter_id": chunk_chapters.get(chunk_id, ""),
+                "core_idea_id": str(p.get("core_idea_id") or "")[:50],
+                "argument_id": str(p.get("argument_id") or "")[:50],
+                "statement": statement,
+                "text_span": text_span,
+                "char_start": char_start,
+                "char_end": char_end,
+                "line_start": line_start,
+                "line_end": line_end,
+                "citations": [str(c) for c in citations],
+            }
+        )
+    # Entidades y relaciones (nivel lote/documento).
+    entities = []
+    for e in data.get("entities") or []:
+        if not isinstance(e, dict):
+            continue
+        name = str(e.get("name") or "").strip()
+        if not name:
+            continue
+        entities.append(
+            {
+                "name": name,
+                "type": str(e.get("type") or "concept"),
+                "description": str(e.get("description") or ""),
+            }
+        )
+    relations = []
+    for r in data.get("relations") or []:
+        if not isinstance(r, dict):
+            continue
+        src = str(r.get("source") or "").strip()
+        tgt = str(r.get("target") or "").strip()
+        if not src or not tgt:
+            continue
+        relations.append(
+            {
+                "source": src,
+                "target": tgt,
+                "type": str(r.get("type") or "RELACIONA"),
+                "description": str(r.get("description") or ""),
+            }
+        )
+    # Resúmenes de sección (por capítulo) + resumen de documento.
+    section_summaries = []
+    for s in data.get("section_summaries") or []:
+        if not isinstance(s, dict):
+            continue
+        chapter_id = str(s.get("chapter_id") or "").strip()
+        summary = str(s.get("summary") or "").strip()
+        if not chapter_id or not summary:
+            continue
+        section_summaries.append({"chapter_id": chapter_id, "summary": summary})
+    document_summary = str(data.get("document_summary") or "").strip()
+    return {
+        "paraphrases": paraphrases,
+        "propositions": propositions,
+        "entities": entities,
+        "relations": relations,
+        "section_summaries": section_summaries,
+        "document_summary": document_summary,
+    }
+
+
+def _extract_document_fused(
+    session,
+    doc_id,
+    doc_path,
+    verbose,
+    batch_size_tokens,
+    embed_fn=None,
+    model_size="large",
+    max_parallel=3,
+):
+    """Extrae paráfrasis + proposiciones + entidades + relaciones + resúmenes
+    de TODOS los chunks del doc con UNA llamada LLM por lote (etapa
+    'paraphrased', Fases 4+5 fusionadas).
+
+    Flujo por DOCUMENTO (decisión: todo en UNA llamada por lote, mapeo
+    jerárquico de abajo-arriba — chunks → paráfrasis + proposiciones +
+    entidades/relaciones + resúmenes de sección + resumen de documento):
+    1. Lee TODOS los chunks del documento (paraphrase or content si NULL).
+    2. Cache por content_hash (0026): los chunks que ya tienen proposiciones
+       persistidas y cuyo content_hash no cambió se saltan.
+    3. Agrupación por DOCUMENTO: todos los chunks pendientes se parten en
+       lotes por presupuesto de tokens (_batch_chunks_by_tokens,
+       KAG_PROPOSITION_BATCH_SIZE=400000). Cada lote = UNA llamada LLM.
+    4. _extract_document_fused_batch: LLM grande con spec `kag_document_extract`
+       → {"paraphrases", "propositions", "entities", "relations",
+       "section_summaries", "document_summary"}.
+    5. Persistencia por lote: paráfrasis (UPDATE kag_chunks.paraphrase),
+       proposiciones (_store_propositions), entidades + relaciones
+       (_store_entities_relations, dedup por name_norm), links
+       proposicionales (_store_proposition_links) y content_hash.
+    6. Resúmenes: se recolectan las secciones de todos los lotes (dedup por
+       chapter_id) y el primer document_summary no vacío; si hay resumen de
+       documento, se persiste el índice temático (_persist_summary_index).
+    7. Paralelismo: lotes independientes → _run_proposition_batches_parallel
+       (ThreadPoolExecutor + semáforo, batch_fn=_extract_document_fused_batch).
+    8. Degradación: LLM falla o JSON inválido en un lote → log + skip del
+       lote (la ingesta sigue).
+    """
+    rows = session.execute(
+        text(
+            "SELECT id, chunk_index, content, paraphrase, chapter_id, content_hash "
+            "FROM kag_chunks WHERE doc_id = :id ORDER BY chunk_index"
+        ),
+        {"id": doc_id},
+    ).fetchall()
+    if not rows:
+        return
+    cached_ids = {
+        r[0]
+        for r in session.execute(
+            text("SELECT DISTINCT chunk_id FROM kag_propositions WHERE doc_id = :id"),
+            {"id": doc_id},
+        ).fetchall()
+    }
+    pending = []
+    for r in rows:
+        h = _chunk_content_hash(r.content)
+        if r.id in cached_ids and r.content_hash == h:
+            continue  # ya extraído con hash idéntico (cache)
+        pending.append(
+            {
+                "id": r.id,
+                # Texto a procesar: paráfrasis o content si NULL (degradación
+                # natural si una corrida previa no parafraseó).
+                "content": (getattr(r, "paraphrase", None) or r.content),
+                # Content original para el content_hash (cache 0026).
+                "original_content": r.content,
+                "chunk_index": r.chunk_index,
+                "chapter_id": r.chapter_id,
+            }
+        )
+    if not pending:
+        if verbose:
+            print(
+                "[KAG] ⏭ extracción fusionada: todos los chunks ya extraídos (cache)."
+            )
+        return
+    # Agrupación por DOCUMENTO: todos los chunks pendientes se parten en
+    # lotes por presupuesto de tokens (cada lote = UNA llamada LLM).
+    units: list[tuple[str, list]] = []  # (chapter_id, chunks)
+    for batch in _batch_chunks_by_tokens(pending, batch_size_tokens):
+        units.append(("", batch))
+    # Orden de persistencia determinista: por chunk_index (aunque los lotes
+    # se procesen en paralelo).
+    units.sort(key=lambda u: u[1][0]["chunk_index"])
+    if verbose:
+        for i, (_ch_id, batch) in enumerate(units, 1):
+            total = sum(estimate_tokens(c["content"]) for c in batch)
+            print(
+                f"[KAG] ⚙ extracción fusionada: lote {i}/{len(units)} "
+                f"({len(batch)} chunks, ~{total} tokens)..."
+            )
+    results = _run_proposition_batches_parallel(
+        session,
+        doc_id,
+        doc_path,
+        units,
+        verbose,
+        model_size=model_size,
+        max_parallel=max_parallel,
+        batch_fn=_extract_document_fused_batch,
+    )
+    all_section_summaries: list[dict] = []
+    document_summary = ""
+    for (_ch_id, batch), result in zip(units, results):
+        if not result:
+            continue  # degradación: lote fallido → skip
+        # Paráfrasis: UPDATE por chunk_index (los sin paraphrase quedan NULL).
+        by_index = {
+            int(p.get("chunk_index")): p.get("paraphrase")
+            for p in result.get("paraphrases") or []
+        }
+        for ch in batch:
+            paraphrase = by_index.get(ch["chunk_index"])
+            if not paraphrase:
+                continue
+            session.execute(
+                text("UPDATE kag_chunks SET paraphrase = :p WHERE id = :id"),
+                {"p": sanitize_text(str(paraphrase)), "id": ch["id"]},
+            )
+        # Proposiciones: descartar las sin chunk asignable (chunk_id NOT NULL).
+        props = [
+            p for p in result.get("propositions") or [] if p["chunk_id"] is not None
+        ]
+        prop_ids = _store_propositions(session, doc_id, props, embed_fn=embed_fn) or []
+        # Entidades + relaciones LLM: se persisten contra el primer chunk del
+        # lote (dedup por name_norm por doc — no duplica con las de spaCy).
+        entities = result.get("entities") or []
+        relations = result.get("relations") or []
+        entity_ids_by_norm = {}
+        if entities or relations:
+            entity_ids_by_norm = (
+                _store_entities_relations(
+                    session,
+                    doc_id,
+                    batch[0]["id"],
+                    {"entities": entities, "relations": relations},
+                    embed_fn=embed_fn,
+                )
+                or {}
+            )
+        # Capa proposicional (0034): enlazar proposiciones ↔ entidades del
+        # lote. Degradación: si falla, rollback + log — la ingesta sigue.
+        try:
+            _store_proposition_links(
+                session, doc_id, props, entities, prop_ids, entity_ids_by_norm
+            )
+        except Exception as exc:  # noqa: BLE001 — capa de mejora, no crítica
+            session.rollback()
+            if verbose:
+                print(f"[KAG] ⚠ links proposicionales fallaron: {exc}")
+        for ch in batch:
+            session.execute(
+                text("UPDATE kag_chunks SET content_hash = :h WHERE id = :id"),
+                {"h": _chunk_content_hash(ch["original_content"]), "id": ch["id"]},
+            )
+        # Resúmenes de sección (dedup por chapter_id) + resumen de documento.
+        for s in result.get("section_summaries") or []:
+            if isinstance(s, dict) and s.get("chapter_id") and s.get("summary"):
+                all_section_summaries.append(
+                    {"chapter_id": str(s["chapter_id"]), "summary": str(s["summary"])}
+                )
+        if not document_summary:
+            document_summary = str(result.get("document_summary") or "").strip()
+    # Dedup de secciones por chapter_id (orden de aparición).
+    seen_chapters: set = set()
+    section_summaries: list[str] = []
+    section_chapter_ids: list = []
+    for s in all_section_summaries:
+        if s["chapter_id"] in seen_chapters:
+            continue
+        seen_chapters.add(s["chapter_id"])
+        section_summaries.append(s["summary"])
+        section_chapter_ids.append(s["chapter_id"])
+    if document_summary:
+        _persist_summary_index(
+            session,
+            doc_id,
+            section_summaries,
+            document_summary,
+            section_chapter_ids=section_chapter_ids,
+        )
+    session.commit()
+
+
+# ---------------------------------------------------------------------
 # Paráfrasis de chunks (Fase 4, etapa 'paraphrased')
 # ---------------------------------------------------------------------
 
@@ -2053,22 +2504,24 @@ def _paraphrase_group(session, doc_id, doc_path, chapter_id, chunks, verbose=Tru
 # Resumen jerárquico con Qwen 2.5 local
 # ---------------------------------------------------------------------
 
-QWEN_SUMMARY_SYSTEM = """You are a summarization assistant. Follow these rules strictly:
-- Output exactly ONE sentence, maximum 30 words.
-- No preamble, no explanations, no markdown, no bullet points.
+QWEN_SUMMARY_SYSTEM = """You are a summarization assistant. Given a document divided into sections, produce a JSON object with one summary per section and a final document summary. Follow these rules strictly:
+- Output a JSON object: {"section_summaries": [{"section": str, "summary": str}], "document_summary": str}
+- Each section summary: exactly ONE sentence, maximum 30 words.
+- document_summary: 2-3 sentences synthesizing the whole document.
+- No preamble, no explanations, no markdown outside the JSON.
 - Only facts present in the text. Do not invent.
 - Do not start with phrases like "This text..." or "The text describes...".
 - Respond in the same language as the text.
 
 Example:
-Text: <text>El backpropagation es un algoritmo que ajusta los pesos de una red neuronal calculando el gradiente de la función de pérdida.</text>
-Summary: El backpropagation ajusta los pesos de una red neuronal mediante el gradiente de la función de pérdida."""
+Text: <text># Cap 1\nEl backpropagation ajusta los pesos de una red neuronal calculando el gradiente de la función de pérdida.\n# Cap 2\nLa función de pérdida mide el error entre la salida predicha y la esperada.</text>
+JSON: {"section_summaries": [{"section": "# Cap 1", "summary": "El backpropagation ajusta los pesos de una red neuronal mediante el gradiente de la función de pérdida."}, {"section": "# Cap 2", "summary": "La función de pérdida mide el error entre la salida predicha y la esperada."}], "document_summary": "El texto explica el backpropagation y la función de pérdida en el entrenamiento de redes neuronales."}"""
 
 QWEN_SUMMARY_USER = """<text>
 {text}
 </text>
 
-Summary:"""
+JSON:"""
 
 
 def _split_h1_h2(text: str) -> list:
@@ -2087,7 +2540,9 @@ def _split_h1_h2(text: str) -> list:
     return [s.strip() for s in sections if s.strip()]
 
 
-def _persist_summary_index(session, doc_id, section_summaries, final_summary):
+def _persist_summary_index(
+    session, doc_id, section_summaries, final_summary, section_chapter_ids=None
+):
     """Persiste el índice de resúmenes jerárquicos (nivel 'document' + 'section').
 
     Solo persiste si `doc_id` no es None y `final_summary` no es '' (el árbol
@@ -2096,6 +2551,12 @@ def _persist_summary_index(session, doc_id, section_summaries, final_summary):
     [final] + secciones (degradación: embedding NULL si falla — el FTS sigue
     funcionando). Nunca rompe el flujo del resumen: cualquier excepción se
     loguea y el resumen se devuelve igual.
+
+    `section_chapter_ids` (opcional): lista paralela a `section_summaries` con
+    el chapter_id (kag_chapters.id) de cada sección — la extracción fusionada
+    (kag_document_extract) produce resúmenes por capítulo y los persiste con
+    su chapter_id para que el índice temático sepa a qué capítulo pertenece
+    cada resumen de sección.
     """
     if doc_id is None:
         return
@@ -2137,14 +2598,18 @@ def _persist_summary_index(session, doc_id, section_summaries, final_summary):
             # una lista de dicts haría executemany, y psycopg2 no devuelve
             # filas con executemany + RETURNING (ResourceClosedError).
             placeholders = ", ".join(
-                f"(:d{i}, 'section', NULL, :p{i}, :t{i}, CAST(:emb{i} AS vector))"
+                f"(:d{i}, 'section', :ch{i}, :p{i}, :t{i}, CAST(:emb{i} AS vector))"
                 for i in range(len(sections))
             )
             params: dict = {}
             for i, s in enumerate(sections):
+                chapter_id = None
+                if section_chapter_ids and i < len(section_chapter_ids):
+                    chapter_id = section_chapter_ids[i]
                 params.update(
                     {
                         f"d{i}": doc_id,
+                        f"ch{i}": chapter_id,
                         f"p{i}": doc_row_id,
                         f"t{i}": s,
                         f"emb{i}": embedding_to_sql(embs[i + 1]),
@@ -2162,11 +2627,118 @@ def _persist_summary_index(session, doc_id, section_summaries, final_summary):
         print(f"[KAG] ⚠ summary_index no persistido: {exc}")
 
 
-def summarize_document(session, text, doc_type, doc_id=None):
-    """Resumen jerárquico con Qwen 2.5 local. Devuelve '' si falla (degradación).
+def _parse_summary_json(out: str):
+    """Parsea el JSON del resumen fusionado (Qwen local, spec kag_qwen_summary).
 
-    short: una llamada con el texto truncado a ~16k tokens.
-    long:  map-reduce por secciones H1/H2 + llamada reduce.
+    Devuelve dict {"section_summaries": [...], "document_summary": str} o None
+    si el output no es JSON válido o no tiene document_summary (degradación al
+    map-reduce).
+    """
+    if not out:
+        return None
+    try:
+        data = json.loads(out)
+    except (ValueError, TypeError):
+        # El modelo a veces envuelve el JSON en markdown ```json ... ```.
+        m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", out, re.DOTALL)
+        if not m:
+            return None
+        try:
+            data = json.loads(m.group(1))
+        except (ValueError, TypeError):
+            return None
+    if not isinstance(data, dict):
+        return None
+    document_summary = str(data.get("document_summary") or "").strip()
+    if not document_summary:
+        return None
+    section_summaries = []
+    for s in data.get("section_summaries") or []:
+        if isinstance(s, dict):
+            summary = str(s.get("summary") or "").strip()
+            if summary:
+                section_summaries.append(summary)
+    return {
+        "section_summaries": section_summaries,
+        "document_summary": document_summary,
+    }
+
+
+def _summarize_map_reduce(
+    session, text, doc_type, doc_id, summary_system, summary_user
+) -> str:
+    """Map-reduce por secciones H1/H2 (fallback del resumen fusionado).
+
+    Fase map en paralelo (KAG_SUMMARY_PARALLEL) + reduce final secuencial.
+    Devuelve el resumen final ('' si falla). Persiste el índice temático si
+    `doc_id` no es None.
+    """
+    section_summaries = []
+    sections = _split_h1_h2(text)
+    if not sections:
+        return ""
+    max_parallel = get_config_value(resolve_config(session), "KAG_SUMMARY_PARALLEL", 3)
+    if max_parallel and max_parallel > 1 and len(sections) > 1:
+
+        def _map_section(i, sec):
+            truncated = sec[:SUMMARY_MAX_CHARS]
+            s = _with_own_session(
+                complete_local,
+                summary_user.format(text=truncated),
+                system=summary_system,
+                max_tokens=60,
+            ).strip()
+            return i, s
+
+        try:
+            with ThreadPoolExecutor(max_workers=max_parallel) as ex:
+                results = list(ex.map(_map_section, range(len(sections)), sections))
+            for i, s in results:
+                if s:
+                    section_summaries.append(s)
+        except Exception as exc:  # noqa: BLE001 — degradación no bloqueante
+            print(f"[KAG] ⚠ Fase map paralela no disponible: {exc}")
+            for sec in sections:
+                truncated = sec[:SUMMARY_MAX_CHARS]
+                s = complete_local(
+                    session,
+                    summary_user.format(text=truncated),
+                    system=summary_system,
+                    max_tokens=60,
+                ).strip()
+                if s:
+                    section_summaries.append(s)
+    else:
+        for sec in sections:
+            truncated = sec[:SUMMARY_MAX_CHARS]
+            s = complete_local(
+                session,
+                summary_user.format(text=truncated),
+                system=summary_system,
+                max_tokens=60,
+            ).strip()
+            if s:
+                section_summaries.append(s)
+    if not section_summaries:
+        return ""
+    combined = "\n".join(f"- {s}" for s in section_summaries)
+    final = complete_local(
+        session,
+        summary_user.format(text=combined),
+        system=summary_system,
+        max_tokens=200,
+    ).strip()
+    _persist_summary_index(session, doc_id, section_summaries, final)
+    return final
+
+
+def summarize_document(session, text, doc_type, doc_id=None):
+    """Resumen jerárquico con Qwen 2.5 local — UNA llamada por documento.
+
+    Divide el texto en secciones H1/H2 y pide al modelo el JSON
+    {"section_summaries": [...], "document_summary": str} en UNA sola llamada
+    (spec kag_qwen_summary v2.0). Si el JSON falla o viene malformado, degrada
+    al map-reduce actual (N+1 llamadas) — nunca romper.
 
     Si `doc_id` no es None, persiste el índice de resúmenes jerárquicos
     (fila 'document' + filas 'section' con parent_id) en summary_index
@@ -2184,79 +2756,26 @@ def summarize_document(session, text, doc_type, doc_id=None):
             QWEN_SUMMARY_SYSTEM,
             QWEN_SUMMARY_USER,
         )
-        if doc_type == "short":
-            truncated = text[:SUMMARY_MAX_CHARS]
-            final = complete_local(
-                session,
-                summary_user.format(text=truncated),
-                system=summary_system,
-                max_tokens=200,
-            ).strip()
-            _persist_summary_index(session, doc_id, [], final)
-            return final
-        section_summaries = []
         sections = _split_h1_h2(text)
         if not sections:
             return ""
-        max_parallel = get_config_value(
-            resolve_config(session), "KAG_SUMMARY_PARALLEL", 3
-        )
-        if max_parallel and max_parallel > 1 and len(sections) > 1:
-            # Fase map en paralelo: cada sección es una llamada complete_local
-            # independiente. Se recolectan los resultados indexados para
-            # preservar el orden original de _split_h1_h2 (el combined va en
-            # el orden del documento). El reduce final sigue siendo secuencial.
-            def _map_section(i, sec):
-                truncated = sec[:SUMMARY_MAX_CHARS]
-                s = _with_own_session(
-                    complete_local,
-                    summary_user.format(text=truncated),
-                    system=summary_system,
-                    max_tokens=60,
-                ).strip()
-                return i, s
-
-            try:
-                with ThreadPoolExecutor(max_workers=max_parallel) as ex:
-                    results = list(ex.map(_map_section, range(len(sections)), sections))
-                for i, s in results:
-                    if s:
-                        section_summaries.append(s)
-            except Exception as exc:  # noqa: BLE001 — degradación no bloqueante
-                print(f"[KAG] ⚠ Fase map paralela no disponible: {exc}")
-                # Fallback secuencial: mismo resultado, solo más lento.
-                for sec in sections:
-                    truncated = sec[:SUMMARY_MAX_CHARS]
-                    s = complete_local(
-                        session,
-                        summary_user.format(text=truncated),
-                        system=summary_system,
-                        max_tokens=60,
-                    ).strip()
-                    if s:
-                        section_summaries.append(s)
-        else:
-            for sec in sections:
-                truncated = sec[:SUMMARY_MAX_CHARS]
-                s = complete_local(
-                    session,
-                    summary_user.format(text=truncated),
-                    system=summary_system,
-                    max_tokens=60,
-                ).strip()
-                if s:
-                    section_summaries.append(s)
-        if not section_summaries:
-            return ""
-        combined = "\n".join(f"- {s}" for s in section_summaries)
-        final = complete_local(
+        truncated = text[:SUMMARY_MAX_CHARS]
+        out = complete_local(
             session,
-            summary_user.format(text=combined),
+            summary_user.format(text=truncated),
             system=summary_system,
-            max_tokens=200,
+            max_tokens=400,
         ).strip()
-        _persist_summary_index(session, doc_id, section_summaries, final)
-        return final
+        parsed = _parse_summary_json(out)
+        if parsed is not None:
+            _persist_summary_index(
+                session, doc_id, parsed["section_summaries"], parsed["document_summary"]
+            )
+            return parsed["document_summary"]
+        # Degradación: JSON inválido → map-reduce actual (N+1 llamadas).
+        return _summarize_map_reduce(
+            session, text, doc_type, doc_id, summary_system, summary_user
+        )
     except Exception as exc:  # noqa: BLE001 — degradación no bloqueante
         print(f"[KAG] ⚠ Resumen local no disponible: {exc}")
         return ""
@@ -3564,15 +4083,33 @@ def _index_document_slice(
             if verbose:
                 print(f"[KAG] ✂ {label}: {chunk_count} chunks segmentados.")
 
-        # ── Etapa: paraphrased (paráfrasis de chunks, Fase 4) ───────────────
-        # Una llamada LLM grande por capítulo (grupo de chunks); los chunks
-        # sin paraphrase (LLM falló o no los devolvió) quedan NULL y la
-        # ingesta sigue (degradación natural).
+        # ── Etapa: paraphrased (extracción FUSIONADA, Fases 4+5) ────────────
+        # UNA llamada LLM grande por lote de documento: paráfrasis + proposiciones
+        # + entidades + relaciones + resúmenes de sección + resumen de documento
+        # (spec kag_document_extract, mapeo jerárquico de abajo-arriba). Los
+        # chunks sin paráfrasis (LLM falló o no los devolvió) quedan NULL y la
+        # ingesta sigue (degradación natural). Con extract_propositions=False se
+        # conserva el comportamiento clásico: solo paráfrasis por capítulo.
         if resume in ("pending", "analysis", "segmented", "paraphrased"):
             if resume == "paraphrased":
-                # Re-ejecutar la etapa: limpiar paráfrasis parciales primero.
+                # Re-ejecutar la etapa: limpiar paráfrasis/proposiciones/
+                # entidades/relaciones/resúmenes parciales primero.
                 cleanup_stage(session, "kag_documents", doc_id, "paraphrased")
-            _paraphrase_chunks(session, doc_id, doc_path, verbose)
+            if extract_propositions:
+                from src.embeddings import embed_texts
+
+                _extract_document_fused(
+                    session,
+                    doc_id,
+                    doc_path,
+                    verbose,
+                    prop_batch_size,
+                    embed_fn=embed_texts,
+                    model_size=prop_model_size,
+                    max_parallel=prop_max_parallel,
+                )
+            else:
+                _paraphrase_chunks(session, doc_id, doc_path, verbose)
             set_stage(session, "kag_documents", doc_id, "paraphrased")
 
         # ── Etapa: chunked (embeddings + entidades + relaciones) ────────────
@@ -3668,23 +4205,10 @@ def _index_document_slice(
                     )
             # ── Paso APARTE del chunking: proposiciones + entidades por
             # documento (Fase 5) ────────────────────────────────────────────
-            # Opera sobre TODOS los chunks ya persistidos (no chunk por chunk
-            # en el bucle de embeddings). Toma las paráfrasis de la Fase 4
-            # (paraphrase or content si NULL) y las agrupa por documento en
-            # lotes por tokens (KAG_PROPOSITION_BATCH_SIZE, default 400k) con
-            # UNA llamada LLM por lote + cache por content_hash (0026): los
-            # chunks ya extraídos con hash idéntico se saltan en re-ingestas.
-            if extract_propositions:
-                _extract_document_propositions(
-                    session,
-                    doc_id,
-                    doc_path,
-                    verbose,
-                    prop_batch_size,
-                    embed_fn=embed_texts,
-                    model_size=prop_model_size,
-                    max_parallel=prop_max_parallel,
-                )
+            # La extracción FUSIONADA (etapa 'paraphrased') ya produjo
+            # proposiciones + entidades + relaciones + resúmenes en UNA llamada
+            # por lote (spec kag_document_extract). Aquí solo quedan los
+            # embeddings de chunks y las entidades deterministas de spaCy.
             set_stage(session, "kag_documents", doc_id, "chunked")
 
         entity_count = session.execute(
@@ -3738,15 +4262,45 @@ def _index_document_slice(
                 ).scalar()
             summary = ""
             if not no_summary:
-                if verbose:
-                    print(
-                        "[KAG] 📝 ready: generando resumen jerárquico (Qwen local)..."
+                # La extracción fusionada (etapa 'paraphrased') ya persiste el
+                # índice temático (summary_index) cuando produce resumen de
+                # documento. Si ya existe la fila 'document', se reutiliza; si
+                # no (extract_propositions=False, LLM falló o doc previo a la
+                # fusión), se genera con summarize_document — UNA llamada por
+                # documento basada en secciones (spec kag_qwen_summary v2.0).
+                try:
+                    has_summary_index = session.execute(
+                        text(
+                            "SELECT COUNT(*) FROM summary_index "
+                            "WHERE doc_id = :id AND level = 'document'"
+                        ),
+                        {"id": doc_id},
+                    ).scalar()
+                except Exception:  # noqa: BLE001 — migración 0032 sin aplicar
+                    has_summary_index = 0
+                if has_summary_index:
+                    try:
+                        summary = session.execute(
+                            text(
+                                "SELECT text FROM summary_index "
+                                "WHERE doc_id = :id AND level = 'document' "
+                                "ORDER BY id DESC LIMIT 1"
+                            ),
+                            {"id": doc_id},
+                        ).scalar()
+                    except Exception:  # noqa: BLE001 — degradación natural
+                        summary = ""
+                    summary = sanitize_text(summary or "")
+                else:
+                    if verbose:
+                        print(
+                            "[KAG] 📝 ready: generando resumen jerárquico (Qwen local)..."
+                        )
+                    summary = sanitize_text(
+                        summarize_document(session, slice_text, doc_type, doc_id=doc_id)
                     )
-                summary = sanitize_text(
-                    summarize_document(session, slice_text, doc_type, doc_id=doc_id)
-                )
-                if verbose:
-                    print("[KAG] 📝 ready: resumen listo.")
+                    if verbose:
+                        print("[KAG] 📝 ready: resumen listo.")
 
             session.execute(
                 text(

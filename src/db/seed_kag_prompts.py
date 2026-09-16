@@ -480,15 +480,22 @@ Texto:
 {text}
 </text>
 
-Summary:""",
-        "version": "1.0",
+JSON:""",
+        "version": "2.0",
         "intent": (
-            "You are a summarization assistant. You produce a single-sentence "
-            "summary of the provided text following strict formatting rules."
+            "You are a summarization assistant. Given a document divided into "
+            "sections, you produce a JSON object with one summary per section "
+            "and a final document summary, following strict formatting rules."
         ),
         "rules": [
-            "Output exactly ONE sentence, maximum 30 words",
-            "No preamble, no explanations, no markdown, no bullet points",
+            (
+                'Output a JSON object: {{"section_summaries": '
+                '[{{"section": str, "summary": str}}], '
+                '"document_summary": str}}'
+            ),
+            "Each section summary: exactly ONE sentence, maximum 30 words",
+            "document_summary: 2-3 sentences synthesizing the whole document",
+            "No preamble, no explanations, no markdown outside the JSON",
             "Only facts present in the text. Do not invent",
             "Do not start with phrases like 'This text...' or 'The text describes...'",
             "Respond in the same language as the text",
@@ -497,7 +504,8 @@ Summary:""",
             "text": "string",
         },
         "output_schema": {
-            "summary": "string",
+            "section_summaries": "array",
+            "document_summary": "string",
         },
         "few_shot": [],
     },
@@ -735,6 +743,86 @@ Extrae las proposiciones atomicas y devuelve el JSON:
             "propositions": "array",
             "entities": "array",
             "relations": "array",
+        },
+        "few_shot": [],
+    },
+    {
+        "task_key": "kag_document_extract",
+        "user_template": """Archivo: {source_file}
+Documento: {document_id}
+
+Capítulos del documento (para los resúmenes de sección):
+---
+{chapters_json}
+---
+
+Chunks del documento (texto a procesar):
+---
+{chunks_json}
+---
+
+Procesa los chunks y devuelve el JSON:
+{{"paraphrases": [{{"chunk_index": int, "paraphrase": str}}], "propositions": [{{"chunk_index": int, "core_idea_id": str, "argument_id": str, "statement": str, "text_span": str, "citations_references": [str]}}], "entities": [{{"name": str, "type": str, "description": str}}], "relations": [{{"source": str, "target": str, "type": str, "description": str}}], "section_summaries": [{{"chapter_id": str, "summary": str}}], "document_summary": str}}""",
+        "version": "1.0",
+        "intent": (
+            "Eres un analista de epistemologia y analisis del discurso. Procesas "
+            "los chunks de un documento y produces TRES capas linguisticas "
+            "DISTINTAS en UNA sola respuesta JSON: (1) PARAFRASIS por chunk: "
+            "reescritura del chunk preservando TODOS los detalles, la estructura "
+            "argumentativa y las referencias, sin anadidos ni omisiones; se usa "
+            "para recuperar informacion ESPECIFICA (busqueda textual sobre la "
+            "parafrasis), NO es un resumen. (2) PROPOSICION por chunk: hecho "
+            "atomico autocontenido y gramaticalmente independiente, con text_span "
+            "EXACTO del chunk del que deriva. (3) RESUMEN por capitulo y "
+            "documento: condensacion jerarquica de abajo-arriba; los resumenes "
+            "se usan SOLO para indexacion y marco tematico, NUNCA para responder "
+            "detalles especificos."
+        ),
+        "rules": [
+            (
+                "PARAFRASIS: cada chunk_index del input debe tener exactamente una "
+                "paraphrase que preserve el significado, la estructura "
+                "argumentativa y las referencias del original, sin anadir ni "
+                "omitir informacion (tan detallada como el original)"
+            ),
+            (
+                "PROPOSICIONES: descomponer cada chunk en proposiciones atomicas "
+                "gramaticalmente independientes y autocontenidas, reemplazando "
+                "anforas por el sujeto explicito; chunk_index: indice del chunk "
+                "(0-based) al que pertenece la proposicion; text_span: fragmento "
+                "de texto EXACTO del chunk del que deriva"
+            ),
+            (
+                "REGLA DE REFERENCIAS DUPLICADAS: si una frase contiene una "
+                "referencia academica, debe preservarse y duplicarse en "
+                "citations_references de TODAS las proposiciones que deriven de ella"
+            ),
+            (
+                "ENTIDADES Y RELACIONES: entidades del documento con su tipo y "
+                "descripcion; relaciones solo entre entidades presentes en el texto"
+            ),
+            (
+                "RESUMENES: section_summaries resume UN capitulo por fila "
+                "(chapter_id del capitulo); document_summary sintetiza el "
+                "documento completo a partir de los resumenes de capitulo; los "
+                "resumenes son condensaciones (solo para indexacion), NUNCA "
+                "sustituyen a las parafrasis para detalles especificos"
+            ),
+            "Salida JSON estricta con el schema indicado",
+        ],
+        "input_schema": {
+            "source_file": "string",
+            "document_id": "string",
+            "chapters_json": "string",
+            "chunks_json": "string",
+        },
+        "output_schema": {
+            "paraphrases": "array",
+            "propositions": "array",
+            "entities": "array",
+            "relations": "array",
+            "section_summaries": "array",
+            "document_summary": "string",
         },
         "few_shot": [],
     },

@@ -129,17 +129,22 @@ CLEANUP_SQL: dict[str, dict[str, list[str]]] = {
             "DELETE FROM kag_propositions WHERE doc_id = :doc_id",
         ],
         "paraphrased": [
-            # Re-parafrasear: borra las paráfrasis (los chunks ya están).
-            "UPDATE kag_chunks SET paraphrase = NULL WHERE doc_id = :doc_id",
-        ],
-        "chunked": [
-            # Re-embeder/entidades: borra entidades y relaciones (los chunks ya
-            # están; se re-insertan con embedding).
+            # Re-ejecutar la extracción FUSIONADA (Fases 4+5): borra las
+            # paráfrasis, el content_hash (cache 0026 — fuerza re-extracción),
+            # las proposiciones, las entidades/relaciones LLM y el índice
+            # temático que la extracción fusionada pudo persistir.
+            "UPDATE kag_chunks SET paraphrase = NULL, content_hash = NULL "
+            "WHERE doc_id = :doc_id",
             "DELETE FROM kag_relations WHERE doc_id = :doc_id",
             "DELETE FROM kag_entities WHERE doc_id = :doc_id",
-            # Las proposiciones NO se borran: la extracción es un paso aparte
-            # con cache por content_hash (0026) — los chunks ya extraídos con
-            # hash idéntico se saltan al reanudar.
+            "DELETE FROM kag_propositions WHERE doc_id = :doc_id",
+            "DELETE FROM summary_index WHERE doc_id = :doc_id",
+        ],
+        "chunked": [
+            # Re-embeder: los chunks ya están; el UPDATE de embedding es
+            # idempotente. Las entidades/relaciones NO se borran: la extracción
+            # fusionada (etapa 'paraphrased') ya las persistió y _store_entities_
+            # relations dedup por name_norm (re-insertar spaCy no duplica).
         ],
         "figures": [
             "DELETE FROM kag_figures WHERE doc_id = :doc_id",

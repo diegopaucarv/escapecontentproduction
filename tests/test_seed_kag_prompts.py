@@ -28,6 +28,8 @@ EXPECTED_TASK_KEYS = {
     "kag_document_analysis",
     "kag_chunk_paraphrase",
     "kag_chapter_propositions",
+    # E. Extracción FUSIONADA por documento (Fases 4+5 en UNA llamada)
+    "kag_document_extract",
     # F. src/kag_query.py (clasificación SLM de la estrategia)
     "kag_query_strategy",
     # F. src/kag_query.py (extracción de filtros de metadatos)
@@ -38,7 +40,7 @@ EXPECTED_TASK_KEYS = {
 
 
 def test_kag_templates_has_11_specs():
-    assert len(KAG_TEMPLATES) == 18
+    assert len(KAG_TEMPLATES) == 19
 
 
 def test_kag_templates_task_keys_match_expected():
@@ -113,3 +115,37 @@ def test_kag_query_subqueries_fallback_igual_a_spec():
 
     by_key = {t["task_key"]: t for t in KAG_TEMPLATES}
     assert QUERY_SUBQUERIES_PROMPT == by_key["kag_query_subqueries"]["user_template"]
+
+
+def test_kag_document_extract_fallback_igual_a_spec():
+    """El fallback DOCUMENT_EXTRACT_USER_SHORT de src/kag_ingest.py debe ser
+    EXACTO al user_template de la spec kag_document_extract (mismos
+    placeholders {source_file}, {document_id}, {chapters_json}, {chunks_json})."""
+    from src.kag_ingest import DOCUMENT_EXTRACT_USER_SHORT
+
+    by_key = {t["task_key"]: t for t in KAG_TEMPLATES}
+    assert (
+        DOCUMENT_EXTRACT_USER_SHORT == by_key["kag_document_extract"]["user_template"]
+    )
+
+
+def test_kag_document_extract_spec_defines_three_layers():
+    """La spec kag_document_extract define las TRES capas lingüísticas
+    (paráfrasis, proposición, resumen) en intent y rules."""
+    by_key = {t["task_key"]: t for t in KAG_TEMPLATES}
+    spec = by_key["kag_document_extract"]
+    intent = spec["intent"].lower()
+    rules_text = " ".join(spec["rules"]).lower()
+    assert "parafrasis" in intent and "proposicion" in intent and "resumen" in intent
+    assert "parafrasis" in rules_text
+    assert "proposicion" in rules_text
+    assert "resumen" in rules_text
+    # El schema de salida incluye las 6 claves del mapeo jerárquico.
+    assert set(spec["output_schema"].keys()) == {
+        "paraphrases",
+        "propositions",
+        "entities",
+        "relations",
+        "section_summaries",
+        "document_summary",
+    }

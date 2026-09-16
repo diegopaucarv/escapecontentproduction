@@ -158,6 +158,8 @@ def _install_ask_mocks(monkeypatch, session, strategy, channels):
             return False
         if name == "KAG_BRANCH_B_MAX_ITERS":
             return 0
+        if name == "KAG_QUERY_ALL_CHANNELS":
+            return False
         return default
 
     def _fake_classify(session, query):

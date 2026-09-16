@@ -3571,11 +3571,22 @@ def _ask_audited(
     if verbose:
         print(f"\n🔎 Pregunta (audited): {query}")
 
-    # 1. Recuperación clásica (misma lógica que ask fast).
-    strategy, channels, top_k_label, reason, used_fallback = classify_query_strategy(
-        session, query
-    )
-    k = _top_k_for(strategy, top_k_label, top_k, global_top_k)
+    # 1. Recuperación clásica (misma lógica que ask fast). Con
+    #    KAG_QUERY_ALL_CHANNELS=True (default) se saltea el routing SLM y se
+    #    recupera de TODOS los canales a la vez.
+    all_channels = _kag_config_value(session, "KAG_QUERY_ALL_CHANNELS", True)
+    if all_channels:
+        strategy = "graph"
+        channels = ["dense", "fts", "paraphrase", "propositions", "graph", "summaries"]
+        top_k_label = "standard"
+        reason = "KAG_QUERY_ALL_CHANNELS: todos los canales a la vez"
+        used_fallback = False
+        k = top_k
+    else:
+        strategy, channels, top_k_label, reason, used_fallback = (
+            classify_query_strategy(session, query)
+        )
+        k = _top_k_for(strategy, top_k_label, top_k, global_top_k)
     if verbose:
         print(f"[KAG] Clasificación: {strategy} (top_k={k})")
         print(f"[KAG] Canales: {channels} | top_k: {top_k_label}")
@@ -3619,10 +3630,8 @@ def _ask_audited(
     #      queda el marco temático. Ambos degradan a [] sin romper;
     #      KAG_SUMMARY_CHANNEL apaga el marco.
     summary_hits = []
-    if (
-        strategy == "hierarchical"
-        and "summaries" in channels
-        and _kag_config_value(session, "KAG_SUMMARY_CHANNEL", True)
+    if "summaries" in channels and _kag_config_value(
+        session, "KAG_SUMMARY_CHANNEL", True
     ):
         try:
             summary_hits = search_summaries(
@@ -3932,10 +3941,25 @@ def ask(
         print(f"\n🔎 Pregunta: {query}")
 
     # 1. Clasificar (SLM decide la estrategia; el LLM planifica — agentes B/C/D).
-    strategy, channels, top_k_label, reason, used_fallback = classify_query_strategy(
-        session, query
-    )
-    k = _top_k_for(strategy, top_k_label, top_k, global_top_k)
+    #    Con KAG_QUERY_ALL_CHANNELS=True (default) se SALTEA el routing: se
+    #    recupera de TODOS los canales a la vez (densa + FTS + paráfrasis +
+    #    proposiciones + grafo + resúmenes) y se le muestran al LLM todos los
+    #    resultados de los índices juntos — los resúmenes dan el marco, pero
+    #    los detalles específicos (que a veces no están en los resúmenes)
+    #    siempre llegan por los canales de chunks/proposiciones.
+    all_channels = _kag_config_value(session, "KAG_QUERY_ALL_CHANNELS", True)
+    if all_channels:
+        strategy = "graph"
+        channels = ["dense", "fts", "paraphrase", "propositions", "graph", "summaries"]
+        top_k_label = "standard"
+        reason = "KAG_QUERY_ALL_CHANNELS: todos los canales a la vez"
+        used_fallback = False
+        k = top_k
+    else:
+        strategy, channels, top_k_label, reason, used_fallback = (
+            classify_query_strategy(session, query)
+        )
+        k = _top_k_for(strategy, top_k_label, top_k, global_top_k)
     if verbose:
         print(f"[KAG] Clasificación: {strategy} (top_k={k})")
         print(f"[KAG] Canales: {channels} | top_k: {top_k_label}")
@@ -3984,10 +4008,8 @@ def ask(
     #      queda el marco temático. Ambos degradan a [] sin romper;
     #      KAG_SUMMARY_CHANNEL apaga el marco.
     summary_hits = []
-    if (
-        strategy == "hierarchical"
-        and "summaries" in channels
-        and _kag_config_value(session, "KAG_SUMMARY_CHANNEL", True)
+    if "summaries" in channels and _kag_config_value(
+        session, "KAG_SUMMARY_CHANNEL", True
     ):
         try:
             summary_hits = search_summaries(

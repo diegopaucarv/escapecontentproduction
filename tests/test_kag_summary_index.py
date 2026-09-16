@@ -7,6 +7,7 @@ _persist_summary_index) para verificar el batch de embeddings y su
 degradación. Sin DB real.
 """
 
+import json
 import uuid
 from types import SimpleNamespace
 
@@ -80,10 +81,40 @@ LONG_MD = (
 
 
 def _fake_complete(session, prompt, system=None, max_tokens=None, **kw):
-    if max_tokens == 200:
-        return "RESUMEN FINAL"
+    if max_tokens == 400:
+        # UNA llamada por documento: el modelo devuelve el JSON fusionado.
+        inner = prompt.split("<text>\n", 1)[1].split("\n</text>", 1)[0]
+        sections = [
+            {"section": sec, "summary": f"map:{sec[:30]}"}
+            for sec in _split_sections(inner)
+        ]
+        return json.dumps(
+            {
+                "section_summaries": sections,
+                "document_summary": "RESUMEN FINAL",
+            },
+            ensure_ascii=False,
+        )
     inner = prompt.split("<text>\n", 1)[1].split("\n</text>", 1)[0]
     return f"map:{inner[:30]}"
+
+
+def _split_sections(text):
+    """Divide el texto por encabezados H1/H2 (mismo criterio que _split_h1_h2)."""
+    import re
+
+    sections = []
+    current = []
+    for line in text.splitlines():
+        if re.match(r"^#{1,2}\s+", line):
+            if current:
+                sections.append("\n".join(current))
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        sections.append("\n".join(current))
+    return [s.strip() for s in sections if s.strip()]
 
 
 def _fake_embed(texts, input_type="document"):
@@ -145,6 +176,8 @@ def test_empty_final_summary_does_not_persist(monkeypatch):
     import src.kag_ingest as ki
 
     def fake_complete(session, prompt, system=None, max_tokens=None, **kw):
+        if max_tokens == 400:
+            return "no es json"  # JSON inválido → degrada al map-reduce
         if max_tokens == 200:
             return ""  # reduce falla → final_summary ''
         inner = prompt.split("<text>\n", 1)[1].split("\n</text>", 1)[0]
@@ -213,3 +246,79 @@ def test_persistence_failure_does_not_break_summary(monkeypatch):
     result = ki.summarize_document(session, LONG_MD, "long", doc_id=42)
 
     assert result == "RESUMEN FINAL"
+
+
+def test_summary_json_invalid_degrades_to_map_reduce(monkeypatch):
+    """JSON inválido en la llamada fusionada → degrada al map-reduce (N+1)."""
+    import src.kag_ingest as ki
+
+    def fake_complete(session, prompt, system=None, max_tokens=None, **kw):
+        if max_tokens == 400:
+            return "no es json"  # fusionada falla → map-reduce
+        if max_tokens == 200:
+            return "RESUMEN FINAL"
+        inner = prompt.split("<text>\n", 1)[1].split("\n</text>", 1)[0]
+        return f"map:{inner[:30]}"
+
+    session = _SummarySession()
+    ki = _patch_summary_deps(monkeypatch, fake_complete, _fake_embed)
+
+    result = ki.summarize_document(session, LONG_MD, "long", doc_id=42)
+
+    assert result == "RESUMEN FINAL"
+    inserts = _insert_calls(session)
+    assert len(inserts) == 2
+    assert sec_params_ok(inserts[1][1], 4)
+
+
+def test_summary_json_wrapped_in_markdown_parses(monkeypatch):
+    """El modelo a veces envuelve el JSON en ```json ... ``` → se parsea igual."""
+    import src.kag_ingest as ki
+
+    def fake_complete(session, prompt, system=None, max_tokens=None, **kw):
+        if max_tokens == 400:
+            return (
+                '```json\n{"section_summaries": [], '
+                '"document_summary": "RESUMEN FINAL"}\n```'
+            )
+        return ""
+
+    session = _SummarySession()
+    ki = _patch_summary_deps(monkeypatch, fake_complete, _fake_embed)
+
+    result = ki.summarize_document(session, LONG_MD, "long", doc_id=42)
+
+    assert result == "RESUMEN FINAL"
+
+
+def test_persist_summary_index_with_section_chapter_ids(monkeypatch):
+    """_persist_summary_index con section_chapter_ids persiste el chapter_id de
+    cada sección (extracción fusionada)."""
+    import src.kag_ingest as ki
+
+    session = _SummarySession()
+    ki = _patch_summary_deps(monkeypatch, _fake_complete, _fake_embed)
+
+    ki._persist_summary_index(
+        session,
+        42,
+        ["Resumen cap 1.", "Resumen cap 2."],
+        "Resumen del documento.",
+        section_chapter_ids=["ch1", "ch2"],
+    )
+    inserts = _insert_calls(session)
+    assert len(inserts) == 2
+    sec_stmt, sec_params = inserts[1]
+    assert sec_stmt.count("'section'") == 2
+    assert sec_params["ch0"] == "ch1"
+    assert sec_params["ch1"] == "ch2"
+
+
+def sec_params_ok(sec_params, n):
+    """Helper: verifica que los params de secciones tienen d/p/t/emb por fila."""
+    for i in range(n):
+        if f"d{i}" not in sec_params or f"p{i}" not in sec_params:
+            return False
+        if f"t{i}" not in sec_params or f"emb{i}" not in sec_params:
+            return False
+    return True
