@@ -551,7 +551,10 @@ def complete_local(
             "No hay modelo local activo (provider='local') en llm_models."
         )
     profile = row.syntax_profile or {}
-    base_url = (profile.get("base_url") or "http://localhost:8080/v1").rstrip("/")
+    base_url = (
+        os.environ.get("KAG_LOCAL_BASE_URL")
+        or (profile.get("base_url") or "http://localhost:8080/v1")
+    ).rstrip("/")
     sampling = profile.get("sampling") or {}
 
     messages = []
