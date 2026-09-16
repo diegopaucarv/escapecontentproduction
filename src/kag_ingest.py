@@ -4,8 +4,8 @@ Ingesta del sistema KAG (Fase 1 del diseño).
 Indexa los `.md` de `data/knowledge_repository/docs/` (+ figuras de
 `images/[docname]/` si existen) en las tablas KAG: segmentación con el
 segmentador propio, embeddings locales Jina, extracción LLM de entidades y
-relaciones, descripción VLM de figuras y resumen jerárquico con Qwen 2.5
-local (fuente secundaria).
+relaciones, descripción VLM de figuras y resumen jerárquico con el modelo
+grande de TogetherAI (spec kag_qwen_summary).
 
 Módulo LIGERO a propósito: el segmentador (torch/spacy/sentence-transformers)
 se importa SOLO dentro de las funciones que lo necesitan, nunca a nivel de
@@ -24,14 +24,12 @@ import argparse
 import base64
 import hashlib
 import json
-import os
 import re
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import httpx
 from sqlalchemy import text
 
 from src.kag.config import get_config_value, resolve_config
@@ -61,7 +59,7 @@ from src.kag.stages import (
     set_stage,
 )
 from src.llm.base import call_with_retries, load_settings, parse_llm_output
-from src.llm.together import complete_vision
+from src.llm.together import complete, complete_vision
 
 
 def _with_own_session(fn, *args, **kwargs):
@@ -88,8 +86,10 @@ IMAGES_DIR = REPO_ROOT / "data" / "knowledge_repository" / "images"
 LONG_DOC_THRESHOLD = 20000
 # Tamaño máximo de chunk (tokens) para el segmentador.
 CHUNK_MAX_TOKENS = 800
-# Truncado del texto para el resumen local (~16k tokens ≈ 64k chars).
-SUMMARY_MAX_CHARS = 16000 * 4
+# Truncado del texto para el resumen (modelo grande: contexto 128k).
+# ~100k tokens de presupuesto de entrada ≈ 400k chars; deja margen para
+# el output (hasta 8k tokens) y el overhead del prompt.
+SUMMARY_MAX_CHARS = 100000 * 4
 # Límite de contexto del LLM por llamada (chars) para la extracción de
 # proposiciones atómicas (mismo valor que el proposicional).
 MAX_CONTEXT_CHARS = 12000
@@ -418,84 +418,6 @@ def _merge_segments(segments, chapter_id, max_tokens):
             }
         )
     return chunks
-
-
-# ---------------------------------------------------------------------
-# LLM local (Qwen 2.5 vía llama.cpp server, API OpenAI-compatible)
-# ---------------------------------------------------------------------
-
-
-def complete_local(
-    session,
-    prompt,
-    system=None,
-    max_tokens=None,
-    temperature=None,
-    timeout=120.0,
-):
-    """Llama al modelo local activo (provider='local') en {base_url}/chat/completions.
-
-    Lee el syntax_profile del modelo (base_url, sampling) de la DB. Retry
-    simple (2 intentos). Lanza excepción si no hay modelo local o el servidor
-    no responde — el caller degrada (p. ej. summary='').
-    """
-    row = session.execute(
-        text(
-            "SELECT model_name, syntax_profile FROM llm_models "
-            "WHERE provider = 'local' AND is_active = TRUE "
-            "ORDER BY created_at DESC LIMIT 1"
-        )
-    ).first()
-    if row is None:
-        raise RuntimeError(
-            "No hay modelo local activo (provider='local') en llm_models."
-        )
-    profile = row.syntax_profile or {}
-    base_url = (
-        os.environ.get("KAG_LOCAL_BASE_URL")
-        or (profile.get("base_url") or "http://localhost:8080/v1")
-    ).rstrip("/")
-    sampling = profile.get("sampling") or {}
-
-    messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
-
-    body = {
-        "model": row.model_name,
-        "messages": messages,
-        "temperature": (
-            temperature if temperature is not None else sampling.get("temperature", 0.1)
-        ),
-        "max_tokens": (
-            max_tokens if max_tokens is not None else sampling.get("max_tokens", 60)
-        ),
-    }
-    if sampling.get("top_p") is not None:
-        body["top_p"] = sampling["top_p"]
-    if sampling.get("repetition_penalty") is not None:
-        body["repetition_penalty"] = sampling["repetition_penalty"]
-    if sampling.get("stop"):
-        body["stop"] = sampling["stop"]
-
-    last_error = None
-    for _attempt in range(2):
-        try:
-            resp = httpx.post(
-                f"{base_url}/chat/completions",
-                headers={
-                    "Content-Type": "application/json",
-                },
-                json=body,
-                timeout=timeout,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return data["choices"][0]["message"]["content"]
-        except Exception as exc:  # noqa: BLE001 — reintento simple
-            last_error = exc
-    raise last_error  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------
@@ -2232,7 +2154,7 @@ def _paraphrase_group(session, doc_id, doc_path, chapter_id, chunks, verbose=Tru
 
 
 # ---------------------------------------------------------------------
-# Resumen jerárquico con Qwen 2.5 local
+# Resumen jerárquico (modelo grande TogetherAI, spec kag_qwen_summary)
 # ---------------------------------------------------------------------
 
 
@@ -2340,7 +2262,7 @@ def _persist_summary_index(
 
 
 def _parse_summary_json(out: str):
-    """Parsea el JSON del resumen fusionado (Qwen local, spec kag_qwen_summary).
+    """Parsea el JSON del resumen fusionado (spec kag_qwen_summary).
 
     Devuelve dict {"section_summaries": [...], "document_summary": str} o None
     si el output no es JSON válido o no tiene document_summary (degradación al
@@ -2379,7 +2301,7 @@ def _parse_summary_json(out: str):
 def _summarize_map_reduce(
     session, text, doc_type, doc_id, summary_system, summary_user
 ) -> str:
-    """Map-reduce por secciones H1/H2 (fallback del resumen fusionado).
+    """Map-reduce por secciones H1/H2 (cubre TODO el documento).
 
     Fase map en paralelo (KAG_SUMMARY_PARALLEL) + reduce final secuencial.
     Devuelve el resumen final ('' si falla). Persiste el índice temático si
@@ -2395,10 +2317,11 @@ def _summarize_map_reduce(
         def _map_section(i, sec):
             truncated = sec[:SUMMARY_MAX_CHARS]
             s = _with_own_session(
-                complete_local,
+                complete,
                 summary_user.format(text=truncated),
+                model_size="large",
                 system=summary_system,
-                max_tokens=60,
+                max_tokens=500,
             ).strip()
             return i, s
 
@@ -2412,45 +2335,53 @@ def _summarize_map_reduce(
             print(f"[KAG] ⚠ Fase map paralela no disponible: {exc}")
             for sec in sections:
                 truncated = sec[:SUMMARY_MAX_CHARS]
-                s = complete_local(
+                s = complete(
                     session,
                     summary_user.format(text=truncated),
+                    model_size="large",
                     system=summary_system,
-                    max_tokens=60,
+                    max_tokens=500,
                 ).strip()
                 if s:
                     section_summaries.append(s)
     else:
         for sec in sections:
             truncated = sec[:SUMMARY_MAX_CHARS]
-            s = complete_local(
+            s = complete(
                 session,
                 summary_user.format(text=truncated),
+                model_size="large",
                 system=summary_system,
-                max_tokens=60,
+                max_tokens=500,
             ).strip()
             if s:
                 section_summaries.append(s)
     if not section_summaries:
         return ""
     combined = "\n".join(f"- {s}" for s in section_summaries)
-    final = complete_local(
+    final = complete(
         session,
         summary_user.format(text=combined),
+        model_size="large",
         system=summary_system,
-        max_tokens=200,
+        max_tokens=2000,
     ).strip()
     _persist_summary_index(session, doc_id, section_summaries, final)
     return final
 
 
 def summarize_document(session, text, doc_type, doc_id=None):
-    """Resumen jerárquico con Qwen 2.5 local — UNA llamada por documento.
+    """Resumen jerárquico con el modelo grande (TogetherAI) — UNA llamada
+    para docs cortos, map-reduce para docs largos.
 
-    Divide el texto en secciones H1/H2 y pide al modelo el JSON
-    {"section_summaries": [...], "document_summary": str} en UNA sola llamada
-    (spec kag_qwen_summary v2.0). Si el JSON falla o viene malformado, degrada
-    al map-reduce actual (N+1 llamadas) — nunca romper.
+    - `doc_type='short'` (texto < LONG_DOC_THRESHOLD): el texto completo cabe
+      en el contexto del modelo grande (128k) → UNA llamada fused que pide el
+      JSON {"section_summaries": [...], "document_summary": str} (spec
+      kag_qwen_summary v2.0). Si el JSON falla o viene malformado, degrada al
+      map-reduce (N+1 llamadas) — nunca romper.
+    - `doc_type='long'`: el texto NO cabe en una llamada → map-reduce directo
+      por secciones H1/H2, que SÍ cubre el documento completo (antes se
+      intentaba la fused truncada primero y el resumen solo cubría el inicio).
 
     Si `doc_id` no es None, persiste el índice de resúmenes jerárquicos
     (fila 'document' + filas 'section' con parent_id) en summary_index
@@ -2470,12 +2401,19 @@ def summarize_document(session, text, doc_type, doc_id=None):
         sections = _split_h1_h2(text)
         if not sections:
             return ""
+        if doc_type == "long":
+            # El texto no cabe en una llamada: map-reduce cubre TODO el
+            # documento (todas las secciones H1/H2), no solo el inicio.
+            return _summarize_map_reduce(
+                session, text, doc_type, doc_id, summary_system, summary_user
+            )
         truncated = text[:SUMMARY_MAX_CHARS]
-        out = complete_local(
+        out = complete(
             session,
             summary_user.format(text=truncated),
+            model_size="large",
             system=summary_system,
-            max_tokens=400,
+            max_tokens=4000,
         ).strip()
         parsed = _parse_summary_json(out)
         if parsed is not None:
@@ -2488,7 +2426,7 @@ def summarize_document(session, text, doc_type, doc_id=None):
             session, text, doc_type, doc_id, summary_system, summary_user
         )
     except Exception as exc:  # noqa: BLE001 — degradación no bloqueante
-        print(f"[KAG] ⚠ Resumen local no disponible: {exc}")
+        print(f"[KAG] ⚠ Resumen no disponible: {exc}")
         return ""
 
 
@@ -4003,7 +3941,7 @@ def _index_document_slice(
                 else:
                     if verbose:
                         print(
-                            "[KAG] 📝 ready: generando resumen jerárquico (Qwen local)..."
+                            "[KAG] 📝 ready: generando resumen jerárquico (modelo grande)..."
                         )
                     summary = sanitize_text(
                         summarize_document(session, slice_text, doc_type, doc_id=doc_id)
@@ -4202,7 +4140,7 @@ def main() -> None:
         "--force", action="store_true", help="Re-indexa aunque el hash no cambió."
     )
     parser.add_argument(
-        "--no-summary", action="store_true", help="Omite el resumen local Qwen 2.5."
+        "--no-summary", action="store_true", help="Omite el resumen jerárquico."
     )
     parser.add_argument(
         "--llm-entities",

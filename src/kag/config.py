@@ -48,9 +48,10 @@ KAG_DEFAULTS: dict[str, Any] = {
     # if __name__ == "__main__"); >1 solo si el entorno lo soporta.
     "KAG_ENTITY_N_PROCESS": 1,
     "KAG_FIGURE_PARALLEL": 3,  # hilos para describe_figure (VLM)
-    # Fase map de resúmenes jerárquicos (long docs): llamadas complete_local
-    # de las secciones H1/H2 en paralelo. 1 = secuencial (comportamiento
-    # clásico). El reduce final siempre es secuencial.
+    # Fase map de resúmenes jerárquicos (long docs): llamadas complete
+    # (TogetherAI, modelo grande) de las secciones H1/H2 en paralelo.
+    # 1 = secuencial (comportamiento clásico). El reduce final siempre es
+    # secuencial.
     "KAG_SUMMARY_PARALLEL": 3,
 }
 

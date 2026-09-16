@@ -10,12 +10,10 @@ import json
 import re
 from types import SimpleNamespace
 
-import httpx
 import pytest
 
 from src.kag_ingest import (
     chunk_markdown,
-    complete_local,
     detect_language,
     estimate_tokens,
     normalize_entity_name,
@@ -749,106 +747,6 @@ def test_assemble_context_with_history():
 def test_assemble_context_without_history_omits_section():
     ctx = assemble_context([], [], [], [], "pregunta")
     assert "HISTORIAL DE CONVERSACIÓN" not in ctx
-
-
-# ---------------------------------------------------------------------
-# complete_local
-# ---------------------------------------------------------------------
-
-
-def _local_model_row():
-    return SimpleNamespace(
-        model_name="qwen2.5-3b-instruct-q4_k_m",
-        syntax_profile={
-            "base_url": "http://localhost:8080/v1",
-            "sampling": {
-                "temperature": 0.1,
-                "top_p": 0.9,
-                "repetition_penalty": 1.05,
-                "max_tokens": 60,
-                "stop": ["\n", ""],
-            },
-        },
-    )
-
-
-class _LocalSession:
-    def __init__(self, row):
-        self._row = row
-
-    def execute(self, stmt, params=None):
-        class _Result:
-            def __init__(self, row):
-                self._row = row
-
-            def first(self):
-                return self._row
-
-        return _Result(self._row)
-
-
-def test_complete_local_builds_body(monkeypatch):
-    import src.kag_ingest as ingest
-
-    captured = {}
-
-    def fake_post(url, headers=None, json=None, timeout=None):
-        captured["url"] = url
-        captured["headers"] = headers
-        captured["json"] = json
-        captured["timeout"] = timeout
-
-        class _Resp:
-            def raise_for_status(self):
-                pass
-
-            def json(self):
-                return {"choices": [{"message": {"content": "resumen"}}]}
-
-        return _Resp()
-
-    monkeypatch.setattr(ingest.httpx, "post", fake_post)
-
-    text = complete_local(
-        _LocalSession(_local_model_row()),
-        "prompt",
-        system="sys",
-        max_tokens=60,
-        temperature=0.1,
-    )
-
-    assert text == "resumen"
-    assert captured["url"] == "http://localhost:8080/v1/chat/completions"
-    assert captured["json"]["messages"] == [
-        {"role": "system", "content": "sys"},
-        {"role": "user", "content": "prompt"},
-    ]
-    assert captured["json"]["temperature"] == 0.1
-    assert captured["json"]["max_tokens"] == 60
-    assert captured["json"]["top_p"] == 0.9
-    assert captured["json"]["repetition_penalty"] == 1.05
-    assert captured["json"]["stop"] == ["\n", ""]
-
-
-def test_complete_local_raises_without_local_model():
-    with pytest.raises(RuntimeError, match="local"):
-        complete_local(_LocalSession(None), "prompt")
-
-
-def test_complete_local_retries_then_raises(monkeypatch):
-    import src.kag_ingest as ingest
-
-    calls = []
-
-    def fake_post(url, headers=None, json=None, timeout=None):
-        calls.append(url)
-        raise httpx.ConnectError("no server")
-
-    monkeypatch.setattr(ingest.httpx, "post", fake_post)
-
-    with pytest.raises(httpx.ConnectError):
-        complete_local(_LocalSession(_local_model_row()), "prompt")
-    assert len(calls) == 2  # retry simple de 2 intentos
 
 
 # ---------------------------------------------------------------------
@@ -2535,7 +2433,7 @@ class _SummarySession:
 
 
 def _patch_summary_deps(monkeypatch, fake_complete):
-    """Parchea load_settings/_get_prompt_pair/complete_local de kag_ingest."""
+    """Parchea load_settings/_get_prompt_pair/complete de kag_ingest."""
     import src.kag_ingest as ki
 
     monkeypatch.setattr(
@@ -2548,7 +2446,7 @@ def _patch_summary_deps(monkeypatch, fake_complete):
         "_get_prompt_pair",
         lambda *a, **k: ("SYS", "<text>\n{text}\n</text>\n\nSummary:"),
     )
-    monkeypatch.setattr(ki, "complete_local", fake_complete)
+    monkeypatch.setattr(ki, "complete", fake_complete)
     # La fase map paralela abre su propia sesión real (run_in_own_session,
     # src/db/session.py) — sin DB real en tests, se parchea para que use la
     # sesión fake del test directamente (mismo patrón que _patch_own_session).
@@ -2588,12 +2486,12 @@ def test_summarize_long_map_parallel_preserves_order(monkeypatch):
 
     result = ki.summarize_document(_SummarySession(), LONG_MD, "long")
 
-    # 1 fused (max_tokens=400, JSON inválido → degrada) + 4 secciones H1/H2
-    # + 1 reduce = 6 llamadas.
-    assert len(calls) == 6
-    # Las 4 llamadas map usan max_tokens=60; el reduce usa 200.
-    map_calls = [c for c in calls if c[1] == 60]
-    reduce_calls = [c for c in calls if c[1] == 200]
+    # 4 secciones H1/H2 (map) + 1 reduce = 5 llamadas (long va directo a
+    # map-reduce, sin fused).
+    assert len(calls) == 5
+    # Las 4 llamadas map usan max_tokens=500; el reduce usa 2000.
+    map_calls = [c for c in calls if c[1] == 500]
+    reduce_calls = [c for c in calls if c[1] == 2000]
     assert len(map_calls) == 4
     assert len(reduce_calls) == 1
     # El combined del reduce contiene los resúmenes en el orden del documento.
@@ -2644,7 +2542,7 @@ def test_summarize_long_reduce_called_once_with_combined(monkeypatch):
     reduce_prompts = []
 
     def fake_complete(session, prompt, system=None, max_tokens=None, **kw):
-        if max_tokens == 200:
+        if max_tokens == 2000:
             reduce_prompts.append(prompt)
             return "RESUMEN FINAL"
         inner = prompt.split("<text>\n", 1)[1].split("\n</text>", 1)[0]
@@ -2672,7 +2570,7 @@ def test_summarize_long_map_skips_failed_sections(monkeypatch):
     import src.kag_ingest as ki
 
     def fake_complete(session, prompt, system=None, max_tokens=None, **kw):
-        if max_tokens == 200:
+        if max_tokens == 2000:
             return "RESUMEN FINAL"
         if "Cap 2" in prompt:
             return ""  # sección fallida → se omite
@@ -2721,8 +2619,8 @@ def test_summarize_long_parallel_1_is_sequential(monkeypatch):
 
     result = ki.summarize_document(_SummarySession(), LONG_MD, "long")
     assert result.startswith("s:- s:# Cap")
-    # 1 fused + 4 map + 1 reduce, en orden.
-    assert calls == [400, 60, 60, 60, 60, 200]
+    # 4 map + 1 reduce, en orden (long va directo a map-reduce, sin fused).
+    assert calls == [500, 500, 500, 500, 2000]
 
 
 def test_summarize_long_pool_failure_degrades_to_sequential(monkeypatch):
@@ -2750,13 +2648,13 @@ def test_summarize_long_pool_failure_degrades_to_sequential(monkeypatch):
 
     result = ki.summarize_document(_SummarySession(), LONG_MD, "long")
     assert result.startswith("s:- s:# Cap")
-    # 1 fused + 4 map + 1 reduce (fallback secuencial completo).
-    assert calls == [400, 60, 60, 60, 60, 200]
+    # 4 map + 1 reduce (fallback secuencial completo, sin fused).
+    assert calls == [500, 500, 500, 500, 2000]
 
 
 def test_summarize_short_unchanged(monkeypatch):
-    """doc_type='short' degrada igual: fused (400) → JSON inválido →
-    map-reduce con 1 sección (1 map 60 + 1 reduce 200)."""
+    """doc_type='short' degrada igual: fused (4000) → JSON inválido →
+    map-reduce con 1 sección (1 map 500 + 1 reduce 2000)."""
     import src.kag_ingest as ki
 
     calls = []
@@ -2772,7 +2670,7 @@ def test_summarize_short_unchanged(monkeypatch):
 
     result = ki.summarize_document(_SummarySession(), "texto corto", "short")
     assert result == "RESUMEN CORTO"
-    assert calls == [400, 60, 200]
+    assert calls == [4000, 500, 2000]
 
 
 def test_summarize_long_reads_parallel_from_config(monkeypatch):

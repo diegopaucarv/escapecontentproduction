@@ -1,7 +1,7 @@
 """Tests del índice de resúmenes jerárquicos (summary_index, migración 0032).
 
-Patrón de tests/test_kag.py (summarize_document, L2456-2723): sesión falsa
-+ monkeypatch de load_settings/_get_prompt_pair/complete_local. Aquí además
+Patrón de tests/test_kag.py (summarize_document): sesión falsa
++ monkeypatch de load_settings/_get_prompt_pair/complete. Aquí además
 se parchea src.embeddings.embed_texts (import perezoso dentro de
 _persist_summary_index) para verificar el batch de embeddings y su
 degradación. Sin DB real.
@@ -50,7 +50,7 @@ class _BrokenSession(_SummarySession):
 
 
 def _patch_summary_deps(monkeypatch, fake_complete, fake_embed=None):
-    """Parchea load_settings/_get_prompt_pair/complete_local/embed_texts."""
+    """Parchea load_settings/_get_prompt_pair/complete/embed_texts."""
     import src.kag_ingest as ki
 
     monkeypatch.setattr(
@@ -63,7 +63,7 @@ def _patch_summary_deps(monkeypatch, fake_complete, fake_embed=None):
         "_get_prompt_pair",
         lambda *a, **k: ("SYS", "<text>\n{text}\n</text>\n\nSummary:"),
     )
-    monkeypatch.setattr(ki, "complete_local", fake_complete)
+    monkeypatch.setattr(ki, "complete", fake_complete)
     monkeypatch.setattr(
         ki, "resolve_config", lambda session: {"KAG_SUMMARY_PARALLEL": 3}
     )
@@ -81,8 +81,9 @@ LONG_MD = (
 
 
 def _fake_complete(session, prompt, system=None, max_tokens=None, **kw):
-    if max_tokens == 400:
-        # UNA llamada por documento: el modelo devuelve el JSON fusionado.
+    if max_tokens == 4000:
+        # UNA llamada por documento (solo doc_type='short'): el modelo
+        # devuelve el JSON fusionado.
         inner = prompt.split("<text>\n", 1)[1].split("\n</text>", 1)[0]
         sections = [
             {"section": sec, "summary": f"map:{sec[:30]}"}
@@ -95,6 +96,9 @@ def _fake_complete(session, prompt, system=None, max_tokens=None, **kw):
             },
             ensure_ascii=False,
         )
+    if max_tokens == 2000:
+        # Reduce final (map-reduce de long docs).
+        return "RESUMEN FINAL"
     inner = prompt.split("<text>\n", 1)[1].split("\n</text>", 1)[0]
     return f"map:{inner[:30]}"
 
@@ -176,9 +180,9 @@ def test_empty_final_summary_does_not_persist(monkeypatch):
     import src.kag_ingest as ki
 
     def fake_complete(session, prompt, system=None, max_tokens=None, **kw):
-        if max_tokens == 400:
+        if max_tokens == 4000:
             return "no es json"  # JSON inválido → degrada al map-reduce
-        if max_tokens == 200:
+        if max_tokens == 2000:
             return ""  # reduce falla → final_summary ''
         inner = prompt.split("<text>\n", 1)[1].split("\n</text>", 1)[0]
         return f"map:{inner[:30]}"
@@ -253,9 +257,9 @@ def test_summary_json_invalid_degrades_to_map_reduce(monkeypatch):
     import src.kag_ingest as ki
 
     def fake_complete(session, prompt, system=None, max_tokens=None, **kw):
-        if max_tokens == 400:
+        if max_tokens == 4000:
             return "no es json"  # fusionada falla → map-reduce
-        if max_tokens == 200:
+        if max_tokens == 2000:
             return "RESUMEN FINAL"
         inner = prompt.split("<text>\n", 1)[1].split("\n</text>", 1)[0]
         return f"map:{inner[:30]}"
@@ -272,11 +276,12 @@ def test_summary_json_invalid_degrades_to_map_reduce(monkeypatch):
 
 
 def test_summary_json_wrapped_in_markdown_parses(monkeypatch):
-    """El modelo a veces envuelve el JSON en ```json ... ``` → se parsea igual."""
+    """El modelo a veces envuelve el JSON en ```json ... ``` → se parsea igual.
+    (Solo aplica a doc_type='short': la fused ya no se usa en long docs.)"""
     import src.kag_ingest as ki
 
     def fake_complete(session, prompt, system=None, max_tokens=None, **kw):
-        if max_tokens == 400:
+        if max_tokens == 4000:
             return (
                 '```json\n{"section_summaries": [], '
                 '"document_summary": "RESUMEN FINAL"}\n```'
@@ -286,7 +291,7 @@ def test_summary_json_wrapped_in_markdown_parses(monkeypatch):
     session = _SummarySession()
     ki = _patch_summary_deps(monkeypatch, fake_complete, _fake_embed)
 
-    result = ki.summarize_document(session, LONG_MD, "long", doc_id=42)
+    result = ki.summarize_document(session, "texto corto", "short", doc_id=42)
 
     assert result == "RESUMEN FINAL"
 

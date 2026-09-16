@@ -459,7 +459,7 @@ Texto:
 </text>
 
 JSON:""",
-        "version": "2.0",
+        "version": "2.1",
         "intent": (
             "You are a summarization assistant. Given a document divided into "
             "sections, you produce a JSON object with one summary per section "
@@ -471,8 +471,8 @@ JSON:""",
                 '[{{"section": str, "summary": str}}], '
                 '"document_summary": str}}'
             ),
-            "Each section summary: exactly ONE sentence, maximum 30 words",
-            "document_summary: 2-3 sentences synthesizing the whole document",
+            "Each section summary: 2-3 sentences capturing the key ideas, evidence and conclusions of the section (up to ~80 words)",
+            "document_summary: a substantive paragraph (4-6 sentences) synthesizing the whole document: main thesis, key arguments, and overall conclusions",
             "No preamble, no explanations, no markdown outside the JSON",
             "Only facts present in the text. Do not invent",
             "Do not start with phrases like 'This text...' or 'The text describes...'",
@@ -1031,8 +1031,16 @@ Reglas:
             "sufficiency.confidence: float 0.0–1.0",
             "Salida JSON estricta con el schema indicado",
         ],
-        "input_schema": {"query": "string", "active_corpus_metadata": "string", "candidate_chunks_json": "string"},
-        "output_schema": {"facts": "array", "contradictions": "array", "sufficiency": "object"},
+        "input_schema": {
+            "query": "string",
+            "active_corpus_metadata": "string",
+            "candidate_chunks_json": "string",
+        },
+        "output_schema": {
+            "facts": "array",
+            "contradictions": "array",
+            "sufficiency": "object",
+        },
         "few_shot": [],
     },
 ]
