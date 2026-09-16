@@ -738,6 +738,202 @@ Extrae las proposiciones atomicas y devuelve el JSON:
         },
         "few_shot": [],
     },
+    # --- F. src/kag_query.py (clasificación SLM de la estrategia) ---------
+    {
+        "task_key": "kag_query_strategy",
+        "user_template": """Consulta del usuario: "{query}"
+
+Clasifica la consulta en UNA de las cinco estrategias de recuperación y
+justifica brevemente tu elección.
+
+Devuelve SOLO JSON:
+{{"strategy": "subqueries|metadata|hierarchical|graph|multidoc", "reason": "string"}}
+
+- strategy: una de las cinco claves exactas.
+- reason: frase breve (1-2 líneas) en el idioma de la consulta explicando
+  por qué esa estrategia sirve a la intención del usuario.
+""",
+        "version": "1.0",
+        "intent": (
+            "Eres un clasificador de estrategias de consulta. Dada la consulta "
+            "del usuario, eliges UNA de las cinco estrategias de recuperacion "
+            "y justificas brevemente tu eleccion en el idioma de la consulta."
+        ),
+        "rules": [
+            (
+                "subqueries (Descomposicion): consulta AMBIGUA o de multiples "
+                "facetas que puede activar otras consultas. Limitacion: mas "
+                "llamadas LLM y latencia"
+            ),
+            (
+                "metadata (Filtrado guiado): el usuario menciona autores, "
+                "fechas, campos de conocimiento u obras especificas. "
+                "Limitacion: requiere conocer de antemano que docs son "
+                "relevantes"
+            ),
+            (
+                "hierarchical (Arboles jerarquicos / RAPTOR): pregunta ABIERTA "
+                'para entender un tema amplio ("de que trata X?", "cuales '
+                'son los temas principales?"). Limitacion: pierde precision '
+                "en detalles facticos"
+            ),
+            (
+                "graph (Grafos de conocimiento / HippoRAG): preguntas sobre "
+                "RELACIONES, temas concretos o subtemas, multi-hop. Limitacion: "
+                "requiere extraccion limpia de entidades/relaciones"
+            ),
+            (
+                "multidoc (comparativa multi-doc): consulta COMPARATIVA entre "
+                'casos/documentos ("como difieren X e Y en Z?"). Se responde '
+                "con busqueda por documento y agrupacion"
+            ),
+            (
+                "Si hay ambiguedad entre dos estrategias, elegir la que mejor "
+                "sirva a la intencion del usuario"
+            ),
+            (
+                "channels: subconjunto de canales que sirven a la consulta "
+                "(nunca vacio; dense+fts casi siempre; paraphrase si el fraseo "
+                "difiere del texto fuente; propositions para afirmaciones "
+                "atomicas; graph para relaciones/multi-hop; summaries para "
+                "preguntas amplias)"
+            ),
+            (
+                "top_k: narrow (<=6, consulta especifica), standard (8-12), "
+                "wide (15-20, tematica)"
+            ),
+            "reason: frase breve en el idioma de la consulta",
+            "Salida JSON estricta con el schema indicado",
+        ],
+        "input_schema": {
+            "query": "string",
+        },
+        "output_schema": {
+            "strategy": "subqueries|metadata|hierarchical|graph|multidoc",
+            "channels": [
+                "dense",
+                "fts",
+                "paraphrase",
+                "propositions",
+                "graph",
+                "summaries",
+            ],
+            "top_k": "narrow|standard|wide",
+            "reason": "string",
+        },
+        "few_shot": [],
+    },
+    # --- F. src/kag_query.py (extracción de filtros de metadatos) ---------
+    {
+        "task_key": "kag_query_metadata",
+        "user_template": """Consulta del usuario: "{query}"
+
+Metadatos del corpus disponible:
+{corpus_metadata}
+
+Extrae los filtros de metadatos que la consulta menciona EXPLÍCITAMENTE o
+implica inequívocamente. Devuelve SOLO JSON:
+{{"filters": {{"authors": ["string"], "years": ["string"], "fields": ["string"], "works": ["string"], "languages": ["string"]}}, "reason": "string"}}
+
+- authors: nombres de personas (autores, editores, pensadores citados).
+- years: años o rangos ("1975", "década de 1990", "2005-2010").
+- fields: campos de conocimiento (matchear contra LCSH/temáticas del corpus).
+- works: títulos de obras específicas.
+- languages: idiomas de los documentos.
+- Si la consulta no menciona ningún filtro, devuelve arrays VACÍOS.
+- reason: frase breve (1-2 líneas) en el idioma de la consulta explicando
+  qué filtros extrajiste y por qué.
+""",
+        "version": "1.0",
+        "intent": (
+            "Eres un extractor de filtros de metadatos. Dada la consulta del "
+            "usuario y los metadatos del corpus, extraes SOLO los filtros "
+            "explicitamente mencionados o inequivocamente implicados, y "
+            "justificas brevemente tu extraccion en el idioma de la consulta."
+        ),
+        "rules": [
+            "Extraer SOLO filtros explicitamente mencionados o inequivocamente implicados por la consulta",
+            "authors: nombres de personas (autores, editores, pensadores citados)",
+            'years: anos o rangos ("1975", "decada de 1990", "2005-2010")',
+            "fields: campos de conocimiento (matchear contra LCSH/tematicas del corpus)",
+            "works: titulos de obras especificas",
+            "languages: idiomas de los documentos",
+            "Si no hay filtros explicitos, devolver arrays VACIOS",
+            "reason: frase breve en el idioma de la consulta",
+            "Salida JSON estricta con el schema indicado",
+        ],
+        "input_schema": {
+            "query": "string",
+            "corpus_metadata": "string",
+        },
+        "output_schema": {
+            "filters": {
+                "authors": "array",
+                "years": "array",
+                "fields": "array",
+                "works": "array",
+                "languages": "array",
+            },
+            "reason": "string",
+        },
+        "few_shot": [],
+    },
+    # --- G. src/kag_query.py (descomposición en subconsultas) ------------
+    {
+        "task_key": "kag_query_subqueries",
+        "user_template": """Consulta del usuario: "{query}"
+
+Metadatos del corpus disponible:
+{corpus_metadata}
+
+Descompón la consulta en subconsultas ATÓMICAS, cada una orientada a UNA
+faceta distinta del corpus y recuperable de forma INDEPENDIENTE. Devuelve
+SOLO JSON:
+{{"subqueries": [{{"query": "string", "intent": "string"}}], "reason": "string"}}
+
+- 2-4 subconsultas si la consulta es ambigua o multifacética; UNA subconsulta
+  (= la original) si ya es atómica.
+- Cada subconsulta debe ser AUTOCONTENIDA: sin pronombres ni referencias que
+  dependan de la consulta original.
+- Cada subconsulta se orienta a UNA faceta (autor, obra, concepto, periodo,
+  comparación, etc.) para que la recuperación apunte a partes distintas del
+  corpus.
+- reason: frase breve (1-2 líneas) en el idioma de la consulta explicando la
+  descomposición.
+""",
+        "version": "1.0",
+        "intent": (
+            "Eres un planificador de recuperación. Dada la consulta del usuario "
+            "y los metadatos del corpus, descompones la consulta ambigua o "
+            "multifacetica en 2-4 subconsultas atomicas, cada una autocontenida "
+            "y orientada a UNA faceta del corpus. Si la consulta ya es atomica, "
+            "devuelves UNA subconsulta igual a la original. Justificas "
+            "brevemente la descomposicion en el idioma de la consulta."
+        ),
+        "rules": [
+            "Descomponer la consulta ambigua o multifacetica en 2-4 subconsultas atomicas",
+            "Cada subconsulta orientada a UNA faceta (autor, obra, concepto, periodo, comparacion, etc.)",
+            "Cada subconsulta AUTOCONTENIDA: sin pronombres ni referencias que dependan de la consulta original",
+            "Cada subconsulta recuperable de forma INDEPENDIENTE",
+            "Si la consulta ya es atomica, devolver UNA subconsulta igual a la original",
+            "reason: frase breve en el idioma de la consulta",
+            "Salida JSON estricta con el schema indicado",
+        ],
+        "input_schema": {
+            "query": "string",
+            "corpus_metadata": "string",
+        },
+        "output_schema": {
+            "subqueries": [
+                {
+                    "query": "string",
+                    "intent": "string",
+                }
+            ],
+            "reason": "string",
+        },
+        "few_shot": [],
+    },
 ]
 
 

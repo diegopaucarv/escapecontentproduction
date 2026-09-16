@@ -88,9 +88,9 @@ def _summary_hit(doc_id=1, level="document", chapter_id=None, text="resumen"):
 
 
 def test_assemble_context_summary_hits_section_with_text():
-    """summary_hits → sección 'RESUMENES RECUPERADOS' con el texto."""
+    """summary_hits → bloque MARCO TEMÁTICO con el texto."""
     ctx = assemble_context([], [], [], [], "pregunta", summary_hits=[_summary_hit()])
-    assert "--- RESUMENES RECUPERADOS (marco temático) ---" in ctx
+    assert "--- MARCO TEMÁTICO (resúmenes de documento/sección) ---" in ctx
     assert "[doc_id: 1 | nivel: document] resumen" in ctx
 
 
@@ -108,21 +108,22 @@ def test_assemble_context_summary_hits_section_level():
 
 
 def test_assemble_context_no_summary_hits_no_section():
-    """summary_hits=None (default) → la sección NO aparece."""
+    """summary_hits=None (default) → el bloque MARCO NO aparece."""
     ctx = assemble_context([], [], [], [], "pregunta")
-    assert "RESUMENES RECUPERADOS" not in ctx
+    assert "MARCO TEMÁTICO" not in ctx
 
 
 def test_assemble_context_empty_summary_hits_placeholder():
-    """summary_hits=[] → sección con placeholder (consistente con el resto)."""
+    """summary_hits=[] → bloque MARCO con placeholder (consistente con el resto)."""
     ctx = assemble_context([], [], [], [], "pregunta", summary_hits=[])
-    assert "--- RESUMENES RECUPERADOS (marco temático) ---" in ctx
+    assert "--- MARCO TEMÁTICO (resúmenes de documento/sección) ---" in ctx
     assert "(sin resúmenes recuperados)" in ctx
 
 
 def test_assemble_context_summary_section_after_doc_summaries():
-    """La sección va DESPUÉS de los resúmenes de documento y ANTES de los
-    fragmentos recuperados."""
+    """El bloque MARCO va PRIMERO (antes de los resúmenes de documento y de la
+    evidencia textual): las tres capas (marco → chunks → proposiciones) se
+    entregan separadas y etiquetadas."""
     ctx = assemble_context(
         [],
         [],
@@ -132,9 +133,9 @@ def test_assemble_context_summary_section_after_doc_summaries():
         summary_hits=[_summary_hit()],
     )
     assert (
-        ctx.index("--- RESUMENES DE DOCUMENTO (referencia secundaria) ---")
-        < ctx.index("--- RESUMENES RECUPERADOS (marco temático) ---")
-        < ctx.index("--- FRAGMENTOS RECUPERADOS (orden de importancia) ---")
+        ctx.index("--- MARCO TEMÁTICO (resúmenes de documento/sección) ---")
+        < ctx.index("--- EVIDENCIA TEXTUAL (chunks con cita) ---")
+        < ctx.index("--- RESUMENES DE DOCUMENTO (referencia secundaria) ---")
     )
 
 
@@ -147,8 +148,9 @@ def _install_ask_mocks(monkeypatch, prop_hits=None, summary_hits=None):
     """Mockea las dependencias de ask() para aislar los canales nuevos.
 
     KAG_QUERY_PARALLEL=False fuerza el camino secuencial (sin sesiones
-    propias de hilo); los canales nuevos quedan activos. Devuelve un dict
-    con los callables capturados para aserciones.
+    propias de hilo); el canal de proposiciones ya vive DENTRO de
+    hybrid_search (mockeado aquí), así que ask() no lo invoca. Devuelve un
+    dict con los callables capturados para aserciones.
     """
     import src.kag_query as kq
 
@@ -182,12 +184,36 @@ def _install_ask_mocks(monkeypatch, prop_hits=None, summary_hits=None):
     monkeypatch.setattr(kq, "doc_summaries", lambda *a, **k: [])
     monkeypatch.setattr(kq, "propositions_for_chunks", lambda *a, **k: [])
     monkeypatch.setattr(kq, "generate_answer", lambda *a, **k: "respuesta")
+    # El SLM de estrategia se mockea con el mapeo de la heurística vieja
+    # (global→hierarchical, local→graph): los tests de routing verifican el
+    # comportamiento de los canales, no la clasificación en sí.
+    monkeypatch.setattr(
+        kq,
+        "classify_query_strategy",
+        lambda session, query: (
+            (
+                "hierarchical",
+                ["dense", "fts", "summaries"],
+                "wide",
+                "",
+                False,
+            )
+            if classify_query(query) == "global"
+            else (
+                "graph",
+                ["dense", "fts", "paraphrase", "propositions", "graph"],
+                "standard",
+                "",
+                False,
+            )
+        ),
+    )
     return captured
 
 
 def test_ask_global_routes_summaries_and_propositions(monkeypatch):
-    """Consulta global → search_summaries con top_k=global_top_k y el canal
-    de proposiciones entra como 4ª lista del RRF."""
+    """Consulta global → search_summaries con top_k=global_top_k; el RRF final
+    NO recibe prop_channel como lista extra (vive en hybrid_search)."""
     import src.kag_query as kq
 
     prop_hits = [
@@ -204,19 +230,16 @@ def test_ask_global_routes_summaries_and_propositions(monkeypatch):
     assert len(captured["summary_calls"]) == 1
     _query, _q_emb, top_k = captured["summary_calls"][0]
     assert top_k == 20
-    # proposition_vector_search se invocó con k=global_top_k (consulta global).
-    assert len(captured["prop_calls"]) == 1
-    _q_emb, prop_k = captured["prop_calls"][0]
-    assert prop_k == 20
-    # RRF con 4 listas: vec, regex, ppr, proposiciones.
+    # ask() ya no invoca proposition_vector_search (lo hace hybrid_search).
+    assert captured["prop_calls"] == []
+    # RRF final con 3 listas: vec, regex, ppr — sin prop_channel.
     assert captured["merge_lists"] is not None
-    assert len(captured["merge_lists"]) == 4
-    assert captured["merge_lists"][3] == [("c1", 0.9)]
+    assert len(captured["merge_lists"]) == 3
 
 
 def test_ask_global_context_contains_summary_section(monkeypatch):
-    """El contexto ensamblado (vía generate_answer) incluye la sección de
-    resúmenes recuperados como marco temático."""
+    """El contexto ensamblado (vía generate_answer) incluye el bloque MARCO
+    TEMÁTICO como marco de la consulta global."""
     import src.kag_query as kq
 
     captured = {}
@@ -235,13 +258,15 @@ def test_ask_global_context_contains_summary_section(monkeypatch):
     session = _FakeSession()
     kq.ask(session, "¿De qué trata el libro?", verbose=False)
 
-    assert "--- RESUMENES RECUPERADOS (marco temático) ---" in captured["context"]
+    assert (
+        "--- MARCO TEMÁTICO (resúmenes de documento/sección) ---" in captured["context"]
+    )
     assert "[doc_id: 3 | nivel: document] marco del libro" in captured["context"]
 
 
 def test_ask_local_skips_summaries_keeps_propositions(monkeypatch):
-    """Consulta local → search_summaries NO se llama; el canal de
-    proposiciones sigue activo."""
+    """Consulta local → search_summaries NO se llama; el RRF final sigue sin
+    prop_channel (el canal de proposiciones vive en hybrid_search)."""
     import src.kag_query as kq
 
     prop_hits = [
@@ -257,14 +282,14 @@ def test_ask_local_skips_summaries_keeps_propositions(monkeypatch):
     )
 
     assert captured["summary_calls"] == []
-    assert len(captured["prop_calls"]) == 1
-    _q_emb, prop_k = captured["prop_calls"][0]
-    assert prop_k == 8  # top_k local
-    assert captured["merge_lists"][3] == [("c1", 0.9)]
+    assert captured["prop_calls"] == []
+    assert len(captured["merge_lists"]) == 3
 
 
 def test_ask_prop_channel_skips_missing_chunk_id(monkeypatch):
-    """Hits sin chunk_id se descartan del canal de proposiciones."""
+    """ask() ya no filtra hits de proposiciones: el canal vive en
+    hybrid_search (cubierto en test_kag_hybrid_channels.py). El RRF final
+    no recibe prop_channel."""
     import src.kag_query as kq
 
     prop_hits = [
@@ -276,11 +301,13 @@ def test_ask_prop_channel_skips_missing_chunk_id(monkeypatch):
     session = _FakeSession()
     kq.ask(session, "¿De qué trata el libro?", verbose=False)
 
-    assert captured["merge_lists"][3] == [("c1", 0.9)]
+    assert captured["prop_calls"] == []
+    assert len(captured["merge_lists"]) == 3
 
 
 def test_ask_prop_channel_failure_degrades(monkeypatch):
-    """Si proposition_vector_search lanza, el flujo sigue (degradación)."""
+    """ask() ya no invoca proposition_vector_search (vive en hybrid_search,
+    que degrada solo); el flujo sigue intacto."""
     import src.kag_query as kq
 
     def _boom(session, q_emb, top_k):
@@ -293,8 +320,8 @@ def test_ask_prop_channel_failure_degrades(monkeypatch):
     answer = kq.ask(session, "¿De qué trata el libro?", verbose=False)
 
     assert answer == "respuesta"
-    assert captured["merge_lists"][3] == []
-    assert session.rolled_back >= 1
+    assert captured["prop_calls"] == []
+    assert len(captured["merge_lists"]) == 3
 
 
 def test_ask_summary_channel_failure_degrades(monkeypatch):
@@ -345,6 +372,17 @@ def test_ask_channels_disabled_by_config(monkeypatch):
     monkeypatch.setattr(kq, "doc_summaries", lambda *a, **k: [])
     monkeypatch.setattr(kq, "propositions_for_chunks", lambda *a, **k: [])
     monkeypatch.setattr(kq, "generate_answer", lambda *a, **k: "respuesta")
+    monkeypatch.setattr(
+        kq,
+        "classify_query_strategy",
+        lambda session, query: (
+            "hierarchical",
+            ["dense", "fts"],
+            "standard",
+            "",
+            False,
+        ),
+    )
 
     session = _FakeSession()
     answer = kq.ask(session, "¿De qué trata el libro?", verbose=False)
@@ -360,7 +398,8 @@ def test_ask_channels_disabled_by_config(monkeypatch):
 
 
 def test_audit_fused_summary_hits_in_prompt(monkeypatch):
-    """summary_hits se anexa al prompt de la auditoría fusionada."""
+    """summary_hits + chunks → el prompt recibe los TRES bloques de evidencia
+    separados con los mismos encabezados que assemble_context."""
     import src.kag_query as kq
 
     props = [
@@ -403,15 +442,20 @@ def test_audit_fused_summary_hits_in_prompt(monkeypatch):
         props,
         [],
         summary_hits=[_summary_hit(doc_id=2, text="marco temático")],
+        chunks=[{"chunk_id": "c1", "content": "texto"}],
     )
     assert evaluation["verdict"] == "SUFFICIENT_FOR_SYNTHESIS"
     assert len(facts) == 1
-    assert "Resúmenes recuperados (marco temático)" in captured["prompt"]
+    assert (
+        "--- MARCO TEMÁTICO (resúmenes de documento/sección) ---" in captured["prompt"]
+    )
+    assert "--- EVIDENCIA TEXTUAL (chunks con cita) ---" in captured["prompt"]
+    assert "--- CAPA ATÓMICA (proposiciones) ---" in captured["prompt"]
     assert "marco temático" in captured["prompt"]
 
 
 def test_audit_fused_no_summary_hits_prompt_unchanged(monkeypatch):
-    """Sin summary_hits el prompt no lleva la sección de marco temático."""
+    """Sin summary_hits ni chunks el prompt no lleva los bloques de evidencia."""
     import src.kag_query as kq
 
     props = [
@@ -449,7 +493,9 @@ def test_audit_fused_no_summary_hits_prompt_unchanged(monkeypatch):
     monkeypatch.setattr(kq, "call_with_retries", _fake_call)
     session = _FakeSession()
     _audit_epistemic_fused(session, "q", props, [])
-    assert "Resúmenes recuperados (marco temático)" not in captured["prompt"]
+    assert "MARCO TEMÁTICO" not in captured["prompt"]
+    assert "EVIDENCIA TEXTUAL" not in captured["prompt"]
+    assert "CAPA ATÓMICA" not in captured["prompt"]
 
 
 # ---------------------------------------------------------------------

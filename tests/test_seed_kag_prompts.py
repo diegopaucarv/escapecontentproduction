@@ -28,11 +28,17 @@ EXPECTED_TASK_KEYS = {
     "kag_document_analysis",
     "kag_chunk_paraphrase",
     "kag_chapter_propositions",
+    # F. src/kag_query.py (clasificación SLM de la estrategia)
+    "kag_query_strategy",
+    # F. src/kag_query.py (extracción de filtros de metadatos)
+    "kag_query_metadata",
+    # G. src/kag_query.py (descomposición en subconsultas)
+    "kag_query_subqueries",
 }
 
 
 def test_kag_templates_has_11_specs():
-    assert len(KAG_TEMPLATES) == 15
+    assert len(KAG_TEMPLATES) == 18
 
 
 def test_kag_templates_task_keys_match_expected():
@@ -77,3 +83,33 @@ def test_kag_ingest_fallbacks_iguales_a_spec_v11():
     assert (
         DOCUMENT_ANALYSIS_USER_SHORT == by_key["kag_document_analysis"]["user_template"]
     )
+
+
+def test_kag_query_strategy_fallback_igual_a_spec():
+    """El fallback QUERY_STRATEGY_PROMPT de src/kag_query.py debe ser EXACTO
+    al user_template de la spec kag_query_strategy (mismo placeholder
+    {query}); los tests comparan fallbacks con specs."""
+    from src.kag_query import QUERY_STRATEGY_PROMPT
+
+    by_key = {t["task_key"]: t for t in KAG_TEMPLATES}
+    assert QUERY_STRATEGY_PROMPT == by_key["kag_query_strategy"]["user_template"]
+
+
+def test_kag_query_metadata_fallback_igual_a_spec():
+    """El fallback QUERY_METADATA_PROMPT de src/kag_query.py debe ser EXACTO
+    al user_template de la spec kag_query_metadata (mismos placeholders
+    {query} y {corpus_metadata}); los tests comparan fallbacks con specs."""
+    from src.kag_query import QUERY_METADATA_PROMPT
+
+    by_key = {t["task_key"]: t for t in KAG_TEMPLATES}
+    assert QUERY_METADATA_PROMPT == by_key["kag_query_metadata"]["user_template"]
+
+
+def test_kag_query_subqueries_fallback_igual_a_spec():
+    """El fallback QUERY_SUBQUERIES_PROMPT de src/kag_query.py debe ser EXACTO
+    al user_template de la spec kag_query_subqueries (mismos placeholders
+    {query} y {corpus_metadata}); los tests comparan fallbacks con specs."""
+    from src.kag_query import QUERY_SUBQUERIES_PROMPT
+
+    by_key = {t["task_key"]: t for t in KAG_TEMPLATES}
+    assert QUERY_SUBQUERIES_PROMPT == by_key["kag_query_subqueries"]["user_template"]

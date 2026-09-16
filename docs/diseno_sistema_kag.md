@@ -382,11 +382,19 @@ python -m src.kag_ingest --llm-entities # extracción LLM por chunk (opt-in, cos
 
 ### 3.1 Flujo de `ask(session, query)`
 
-1. **Clasificar** (`classify_query`): heurística determinista de keywords.
-   - **Global:** "resumen", "conclusiones", "principales", "temas", "overview", "summary", "main topics", "libro", "book", "¿de qué trata?"...
-   - **Local:** todo lo demás (preguntas específicas sobre datos, fórmulas, conceptos).
-2. **Búsqueda híbrida (keywords):** `embed_text(query, input_type="query")` → `hybrid_search(session, query, q_emb, k)`: búsqueda densa (pgvector `<=>`, coseno, índice HNSW `ix_kag_chunks_embedding` de la migración `0015_kag_hnsw`) + búsqueda léxica FTS (`ts_rank_cd` sobre `content_tsv`, config `'simple'`) fusionadas con **RRF** (`rrf_merge`, k=60). K = `top_k` (8) local, `global_top_k` (20) global. Si `embed_text` falla (p. ej. sin `embedding_settings` activa) → `q_emb=None` y `hybrid_search` degrada a **solo FTS** (rollback + log). Si la migración `0014_kag_fts` no está aplicada → degrada a solo búsqueda densa (rollback + log). Si todo falla → `session.rollback()` (la transacción queda abortada tras el error) y `vec_hits = []` (degradación natural). Después, `apply_relevance_threshold` descarta la cola larga: score < `MIN_SCORE_RATIO` × max_score o < `MIN_ABS_SCORE` (escala-agnóstico: funciona con RRF, coseno o ts_rank).
-   2.5. **CRIT + EL fusionados en UNA llamada LLM** (`critic_and_linking`): el crítico (modelo pequeño) decide si la pregunta contiene términos EXACTOS (nombres propios, países, códigos alfanuméricos como CVE-2024-3094, acrónimos, fechas, cifras) Y selecciona las entidades canónicas del pool del grafo en el mismo prompt estructurado (JSON mode). Devuelve `(regex_hits, regex_terms, names)`: los `hits` son chunks por FTS combinada (config `'simple'`, alta precisión); los `terms` alimentan el entity linking + PPR del paso 3 — el grafo se aplica sobre las keywords de la pregunta Y sobre las del crítico. `names` ya viene anclado al pool (solo entidades reales del grafo). Si el LLM falla → degrada por separado: heurística determinista (`_deterministic_regex_terms`) para los términos y pool determinista (`_noun_chunk_fallback`) para las entidades. Ahorra un round-trip LLM por consulta (antes: CRIT → EL secuenciales).
+1. **Clasificar** (`classify_query_strategy`): UNA llamada al SLM (spec `kag_query_strategy`, JSON mode) que decide la ESTRATEGIA de recuperación y su `reason`. Si el SLM falla o el JSON es inválido → fallback determinista (`classify_query`): global→`hierarchical`, local→`graph`. Estrategias:
+   - **hierarchical** (pregunta abierta/temática): activa `search_summaries` (marco temático) + `global_top_k`.
+   - **graph** (relaciones, temas concretos, multi-hop): flujo clásico con PPR, `top_k`.
+   - **metadata** (autores/fechas/campos/obras): `extract_metadata_filters` (LLM grande, spec `kag_query_metadata`) → `_doc_ids_for_filters` → filtro `doc_id` en la búsqueda.
+   - **subqueries** (ambigua/multifacética): `generate_subqueries` (LLM grande, spec `kag_query_subqueries`) → recuperación paralela por subconsulta + RRF.
+   - **multidoc** (comparativa entre casos): `select_multidoc_documents` (LLM grande, spec `kag_query_multidoc`) → `search_summaries` por doc en paralelo, agrupado por documento.
+2. **Búsqueda híbrida (keywords):** `embed_text(query, input_type="query")` → `hybrid_search(session, query, q_emb, k, doc_ids=None)`: **4 canales** fusionados con **RRF** (`rrf_merge`, k=60):
+   - **Densa** (pgvector `<=>`, coseno, índice HNSW `ix_kag_chunks_embedding`, migración `0015_kag_hnsw`).
+   - **FTS** (`ts_rank_cd` sobre `content_tsv`, config `'simple'`, migración `0014_kag_fts`).
+   - **Paráfrasis** (FTS sobre `paraphrase_tsv`, migración `0033_kag_paraphrase_fts` — captura el fraseo reescrito de la Fase 4).
+   - **Proposiciones** (`proposition_vector_search` sobre `kag_propositions.embedding` — capa atómica, migración `0024`).
+     `doc_ids` (estrategia metadata) filtra los canales SQL con `AND doc_id = ANY(:ids)`. K = `top_k` (8) local, `global_top_k` (20) hierarchical. Si `embed_text` falla (p. ej. sin `embedding_settings` activa) → `q_emb=None` y `hybrid_search` degrada a **solo FTS** (rollback + log). Si la migración `0014_kag_fts` no está aplicada → degrada a solo búsqueda densa (rollback + log). Si todo falla → `session.rollback()` (la transacción queda abortada tras el error) y `vec_hits = []` (degradación natural). Después, `apply_relevance_threshold` descarta la cola larga: score < `MIN_SCORE_RATIO` × max_score o < `MIN_ABS_SCORE` (escala-agnóstico: funciona con RRF, coseno o ts_rank).
+     2.5. **CRIT + EL fusionados en UNA llamada LLM** (`critic_and_linking`): el crítico (modelo pequeño) decide si la pregunta contiene términos EXACTOS (nombres propios, países, códigos alfanuméricos como CVE-2024-3094, acrónimos, fechas, cifras) Y selecciona las entidades canónicas del pool del grafo en el mismo prompt estructurado (JSON mode). Devuelve `(regex_hits, regex_terms, names)`: los `hits` son chunks por FTS combinada (config `'simple'`, alta precisión); los `terms` alimentan el entity linking + PPR del paso 3 — el grafo se aplica sobre las keywords de la pregunta Y sobre las del crítico. `names` ya viene anclado al pool (solo entidades reales del grafo). Si el LLM falla → degrada por separado: heurística determinista (`_deterministic_regex_terms`) para los términos y pool determinista (`_noun_chunk_fallback`) para las entidades. Ahorra un round-trip LLM por consulta (antes: CRIT → EL secuenciales).
 3. **Entity linking anclado + copresencia** (sobre `names` del paso 2.5):
    - `match_entities_candidates`: por mención, candidatos del grafo — exacto por `name_norm` primero, luego `LIKE` (hasta 5). El `LIKE` con comodín a la izquierda se acelera con el índice GIN trigram de la migración `0017_kag_trgm` (pg_trgm).
    - `disambiguate_by_cooccurrence`: para cada mención ambigua, elige el candidato que comparte más vecinos (a 1 salto) con las entidades confirmadas (menciones con un solo candidato). La cercanía se mide con el **overlap coefficient** (vecinos compartidos / min(grado del candidato, vecinos confirmados)) — normaliza por grado. Confianza: el mejor debe superar `DISAMBIG_MIN_OVERLAP` Y tener margen ≥ `DISAMBIG_MARGIN` sobre el segundo; si no → primer candidato (ambiguo). Sin confirmadas → primer candidato de cada mención.
@@ -888,12 +896,17 @@ query ──► 1. Embedding (input_type='query')
 
 ## 9. Diagrama de secuencias unificado
 
-> **Arquitectura real (2026-09-15):** pipeline KAG unificado tras la eliminación
-> del motor proposicional (migración `0025_kag_drop_propositional`). La ingesta
-> clásica expandida (`src/kag_ingest.py`) extrae proposiciones atómicas en la
-> etapa `chunked` (`kag_propositions`, migración `0024_kag_propositions`), y la
-> consulta (`src/kag_query.py`) ofrece dos modos: `fast` (default CLI, respuesta
-> `str`) y `audited` (default API, respuesta `dict` con auditoría epistémica).
+> **Arquitectura real (2026-09-15):** pipeline documental unificado. La ingesta
+> (`src/kag_ingest.py`) corre la máquina de estados
+> `pending → analysis → segmented → paraphrased → chunked → figures → ready`:
+> separación de documentos por archivo (LLM grande), ficha documental + capítulos
+> (LLM grande, contexto completo), segmentación por capítulo, paráfrasis por
+> capítulo, proposiciones+entidades por documento, figuras (VLM) y resúmenes
+> jerárquicos (`summary_index`, migración `0032`). La consulta (`src/kag_query.py`)
+> ofrece dos modos: `fast` (default CLI, respuesta `str`) y `audited` (default API,
+> respuesta `dict` con auditoría epistémica). Un SLM clasifica la estrategia de
+> consulta (hierarchical|graph|metadata|subqueries|multidoc) y `hybrid_search`
+> fusiona 4 canales (densa + FTS + paráfrasis + proposiciones) con RRF.
 > Los diagramas reflejan el flujo REAL del código actual.
 
 ### 9.1 Ingesta — `index_document` (máquina de estados `pending → segmented → chunked → figures → ready`)
@@ -905,40 +918,48 @@ sequenceDiagram
     participant I as kag_ingest (index_document)
     participant S as Segmentador (ProgressiveSegmenter)
     participant E as Embeddings (Jina local)
-    participant L as LLM (pequeño / Qwen local / VLM)
+    participant L as LLM (grande / VLM)
     participant DB as Postgres (kag_*)
 
-    U->>I: python -m src.kag_ingest [--doc X.md] [--no-propositions]
+    U->>I: python -m src.kag_ingest [--doc X.md] [--force]
     I->>DB: INSERT kag_documents (status pending, stage pending)
     Note over I,DB: Etapa pending
-    I->>S: build_segmenter(session, lang) + chunk_markdown (coref solo short)
-    S-->>I: chunks con section_path y token_estimate
-    I->>DB: INSERT kag_chunks (embedding NULL) + kag_word_freq
+    I->>L: _index_document_separation (spec kag_document_separation, LLM grande)
+    L-->>I: documentos del archivo (document_id, title, line_start, line_end, language)
+    I->>DB: INSERT kag_documents (una fila por documento)
+    I->>DB: set_stage analysis
+    Note over I,DB: Etapa analysis
+    I->>L: _index_document_analysis (spec kag_document_analysis, contexto COMPLETO)
+    L-->>I: ficha documental (LCSH/LCC/ISO 25964) + índice jerárquico de capítulos
+    I->>DB: UPDATE ficha_jsonb + sections_json + INSERT kag_chapters
     I->>DB: set_stage segmented
     Note over I,DB: Etapa segmented
-    I->>E: embed_texts (batch 32, input_type document)
-    E-->>I: embeddings vector(768)
-    I->>DB: UPDATE kag_chunks.embedding
-    I->>I: extract_entities_deterministic (spaCy) o --llm-entities
-    I->>DB: INSERT kag_entities + kag_relations (CO_OCURRE)
-    opt extract_propositions=True (default)
-        I->>L: _extract_propositions (spec kag_proposition_chunking, JSON mode)
-        L-->>I: proposiciones atómicas (statement, text_span, spans, citas)
-        I->>E: embed statements (batch)
-        I->>DB: INSERT kag_propositions (multi-VALUES)
-    end
+    I->>S: chunk_markdown (segmentación DENTRO de cada capítulo)
+    S-->>I: chunks con chapter_id y token_estimate
+    I->>DB: INSERT kag_chunks (embedding NULL)
+    I->>DB: set_stage paraphrased
+    Note over I,DB: Etapa paraphrased
+    I->>L: _paraphrase_chunks (spec kag_chunk_paraphrase, UNA llamada por capítulo, paralelo)
+    L-->>I: paráfrasis por chunk
+    I->>DB: UPDATE kag_chunks.paraphrase
     I->>DB: set_stage chunked
-    Note over I,DB: Etapa chunked (embeddings + entidades + relaciones + proposiciones)
-    I->>L: describe_figure (VLM, data URL base64)
-    L-->>I: descripción de la figura
-    I->>DB: INSERT kag_figures
+    Note over I,DB: Etapa chunked
+    I->>E: embed_texts (chunks + proposiciones)
+    I->>I: entidades deterministas (spaCy) + relaciones
+    I->>DB: INSERT kag_entities + kag_relations
+    I->>L: _extract_document_propositions (spec kag_chapter_propositions, por DOCUMENTO, lotes por tokens)
+    L-->>I: proposiciones + entidades + relaciones
+    I->>E: embed statements
+    I->>DB: INSERT kag_propositions (multi-VALUES)
     I->>DB: set_stage figures
     Note over I,DB: Etapa figures
-    I->>L: summarize_document (Qwen 2.5 local, map-reduce si long)
-    L-->>I: resumen del documento
-    I->>DB: UPDATE kag_documents (status ready, counts, summary)
+    I->>L: describe_figure (VLM, FAQ Reverse HyDE) — solo si hay imágenes
+    I->>DB: INSERT kag_figures
     I->>DB: set_stage ready
-    I-->>U: resumen de ingesta (chunks, entidades, relaciones, figuras)
+    Note over I,DB: Etapa ready
+    I->>L: summarize_document (Qwen local) + persistir summary_index (sección + documento)
+    I->>DB: UPDATE kag_documents (status ready, summary) + INSERT summary_index
+    I-->>U: resumen de ingesta (docs, capítulos, chunks, proposiciones, entidades, figuras)
 ```
 
 ### 9.2 Consulta `mode="fast"` — `ask` (flujo clásico + proposiciones de los chunks ganadores)
@@ -953,10 +974,23 @@ sequenceDiagram
     participant DB as Postgres (kag_*)
 
     U->>Q: python -m src.kag_query "pregunta" [--mode fast]
-    Q->>Q: classify_query (global / local)
+    Q->>L: classify_query_strategy (SLM, spec kag_query_strategy, JSON)
+    L-->>Q: strategy (hierarchical|graph|metadata|subqueries|multidoc) + reason
     Q->>E: embed_text (input_type query)
     E-->>Q: q_emb
-    Q->>DB: hybrid_search (densa pgvector + FTS ts_rank_cd + RRF k=60)
+    alt strategy = hierarchical
+        Q->>DB: search_summaries (marco temático, summary_index)
+    else strategy = metadata
+        Q->>L: extract_metadata_filters (LLM grande, spec kag_query_metadata)
+        Q->>DB: _doc_ids_for_filters → filtro doc_id en hybrid_search
+    else strategy = subqueries
+        Q->>L: generate_subqueries (LLM grande, spec kag_query_subqueries)
+        Q->>Q: recuperación paralela por subconsulta + rrf_merge
+    else strategy = multidoc
+        Q->>L: select_multidoc_documents (LLM grande, spec kag_query_multidoc)
+        Q->>DB: search_summaries por doc en paralelo → grupos por documento
+    end
+    Q->>DB: hybrid_search (4 canales: densa + FTS + paráfrasis + proposiciones, RRF k=60)
     DB-->>Q: vec_hits
     Q->>Q: apply_relevance_threshold (codo Kneedle / piso relativo)
     Q->>L: critic_and_linking (CRIT + EL en UNA llamada, JSON mode)
@@ -967,12 +1001,12 @@ sequenceDiagram
     Q->>Q: ego_network (2-hop) + personalized_pagerank (HippoRAG)
     Q->>Q: ppr_entity_selection (umbral relativo)
     Q->>DB: chunks_for_entities (entidades PPR)
-    Q->>Q: rrf_merge (vector + regex + PPR, 3 capas)
+    Q->>Q: rrf_merge (vector + regex + PPR + proposiciones)
     Q->>DB: chunks_by_ids (ANY(:ids) + array_position)
     Q->>Q: _group_chunks_with_window (±5 vecinos, cap MAX_CONTEXT_CHUNKS)
     Q->>DB: subgraph_triples + figures_for_chunks + doc_summaries
     Q->>DB: propositions_for_chunks (kag_propositions de chunks ganadores)
-    Q->>Q: assemble_context (subgrafo + resúmenes + fragmentos + proposiciones + figuras)
+    Q->>Q: assemble_context (MARCO → EVIDENCIA → CAPA ATÓMICA, bloques separados)
     Q->>L: generate_answer (LLM grande, prompt kag_query_answer)
     L-->>Q: respuesta
     Q-->>U: str (respuesta)
@@ -989,22 +1023,18 @@ sequenceDiagram
     participant DB as Postgres (kag_*)
 
     U->>Q: ask(query, mode="audited")
-    Note over Q: 1. Recuperación clásica (misma lógica que fast)
-    Q->>Q: classify_query + hybrid_search + critic_and_linking
+    Note over Q: 1. Recuperación (misma lógica que fast + estrategia SLM)
+    Q->>Q: classify_query_strategy + hybrid_search (4 canales) + critic_and_linking
     Q->>Q: entity linking + PPR + merge + ventana ±5
     Q->>DB: propositions_for_chunks (chunks ganadores)
-    Q->>L: _synthesize_facts (LLM pequeño, prompt kag_synthesis)
-    L-->>Q: hechos atómicos (relevance_level, verbatim_evidence)
-    Q->>L: _resolve_contradictions (prompt kag_contradictions)
-    L-->>Q: tipología de contradicciones
-    Q->>L: _evaluate_sufficiency (prompt kag_sufficiency)
-    L-->>Q: verdict (SUFFICIENT / INSUFFICIENT / NEGATIVE_REJECTION)
+    Q->>L: _audit_epistemic_fused (UNA llamada: síntesis + contradicciones + suficiencia)
+    L-->>Q: facts + contradictions + sufficiency (verdict)
     alt NEGATIVE_REJECTION
         Q-->>U: abstención formal (verdict incluido)
     else INSUFFICIENT_TRIGGER_BRANCH_B
-        loop hasta max_iterations=2
+        loop hasta max_iterations=2 (early exit si Δ < 0.05 o sin novedades)
             Q->>DB: _branch_b_expand (FTS kag_propositions + vecinos del grafo)
-            Q->>L: re-sintetizar + re-evaluar suficiencia
+            Q->>L: re-auditar (fused)
         end
     end
     Q->>L: _verify_grounding (rapidfuzz partial_ratio >= 95)

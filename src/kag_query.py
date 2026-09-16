@@ -63,6 +63,9 @@ def _with_own_session(fn, *args, **kwargs):
 TASK_GROUNDED_ENTITIES = "kag_grounded_entities"
 TASK_CRITIC_REGEX = "kag_critic_regex"
 TASK_CRITIC_LINKING = "kag_critic_linking"
+TASK_QUERY_STRATEGY = "kag_query_strategy"
+TASK_QUERY_METADATA = "kag_query_metadata"
+TASK_QUERY_SUBQUERIES = "kag_query_subqueries"
 TASK_QUERY_ANSWER = "kag_query_answer"
 # Auditoría epistémica (modo audited) — specs en src/db/seed_kag_prompts.py.
 TASK_SYNTHESIS = "kag_synthesis"
@@ -268,6 +271,318 @@ def classify_query(query: str) -> str:
         if kw in q:
             return "global"
     return "local"
+
+
+# Estrategias de consulta que el SLM puede devolver (spec kag_query_strategy).
+QUERY_STRATEGIES = {"subqueries", "metadata", "hierarchical", "graph", "multidoc"}
+
+# Canales de recuperación que el SLM puede seleccionar (spec kag_query_strategy).
+CHANNEL_SET = {"dense", "fts", "paraphrase", "propositions", "graph", "summaries"}
+
+# Canales por defecto por estrategia (validación post-parseo y fallback).
+DEFAULT_CHANNELS = {
+    "hierarchical": ["dense", "fts", "summaries"],
+    "graph": ["dense", "fts", "paraphrase", "propositions", "graph"],
+    "metadata": ["dense", "fts"],
+    "subqueries": ["dense", "fts", "paraphrase", "propositions", "graph"],
+    "multidoc": ["dense", "fts", "summaries"],
+}
+
+
+def _validated_channels(strategy, raw):
+    """Valida channels del SLM: subconjunto no vacío de CHANNEL_SET.
+
+    Si raw no es una lista no vacía o contiene canales fuera del set →
+    default por estrategia (DEFAULT_CHANNELS).
+    """
+    if isinstance(raw, list) and raw:
+        channels = [str(c).strip() for c in raw]
+        if all(c in CHANNEL_SET for c in channels):
+            seen = set()
+            out = []
+            for c in channels:
+                if c not in seen:
+                    seen.add(c)
+                    out.append(c)
+            return out
+    return list(DEFAULT_CHANNELS[strategy])
+
+
+def _top_k_for(strategy, top_k_label, top_k, global_top_k) -> int:
+    """Resuelve el k efectivo según la etiqueta de amplitud del SLM.
+
+    narrow → acotado a [3, 6]; standard → top_k del caller; wide → el
+    global_top_k (marco temático amplio). `strategy` se conserva en la
+    firma por si una estrategia necesita afinar el mapeo.
+    """
+    if top_k_label == "narrow":
+        return max(3, min(top_k, 6))
+    if top_k_label == "wide":
+        return global_top_k
+    return top_k
+
+
+def classify_query_strategy(session, query) -> tuple[str, list[str], str, str, bool]:
+    """Clasifica la estrategia de consulta con UNA llamada al SLM.
+
+    El SLM (model_size="small") NO corre tools: solo clasifica la consulta
+    en una de las cinco estrategias (spec kag_query_strategy) y selecciona
+    los canales de recuperación + la amplitud de top_k. El LLM grande
+    planifica según la clase (agentes B/C/D). Devuelve
+    (strategy, channels, top_k_label, reason, used_fallback).
+
+    Fallback: si la llamada lanza, el JSON es inválido o la estrategia no
+    está en el set → degrada a la heurística actual (classify_query):
+    "global"→"hierarchical", "local"→"graph", reason="fallback: <motivo>",
+    used_fallback=True.
+    """
+    if not _kag_config_value(session, "KAG_QUERY_STRATEGY_SLM", True):
+        return _query_strategy_fallback(query, "KAG_QUERY_STRATEGY_SLM=False")
+    settings = load_settings(session)
+    retries = int(getattr(settings, "llm_retries", 3) or 3) if settings else 3
+    fallback = getattr(settings, "fallback_model", None) if settings else None
+    small_model = getattr(settings, "small_model", None) if settings else None
+    system, user_template = _get_prompt_pair(
+        session,
+        small_model,
+        TASK_QUERY_STRATEGY,
+        QUERY_STRATEGY_SYSTEM_SHORT,
+        QUERY_STRATEGY_PROMPT,
+    )
+    try:
+        text_out, _model, _used_fallback = call_with_retries(
+            session,
+            prompt=user_template.replace("{query}", query),
+            system=system,
+            model_size="small",
+            response_format={"type": "json_object"},
+            retries=retries,
+            fallback_model=fallback,
+        )
+        data = parse_llm_output(text_out)
+        strategy = str(data.get("strategy", "")).strip()
+        if strategy not in QUERY_STRATEGIES:
+            return _query_strategy_fallback(query, f"estrategia inválida: {strategy!r}")
+        channels = _validated_channels(strategy, data.get("channels"))
+        top_k_label = str(data.get("top_k") or "").strip()
+        if top_k_label not in {"narrow", "standard", "wide"}:
+            top_k_label = "standard"
+        reason = str(data.get("reason") or "").strip()
+        return strategy, channels, top_k_label, reason, False
+    except Exception as exc:  # noqa: BLE001 — degradación natural
+        return _query_strategy_fallback(query, str(exc))
+
+
+def _query_strategy_fallback(
+    query: str, motivo: str
+) -> tuple[str, list[str], str, str, bool]:
+    """Degrada a la heurística actual: 'global'→'hierarchical', 'local'→'graph'."""
+    qtype = classify_query(query)
+    if qtype == "global":
+        return (
+            "hierarchical",
+            ["dense", "fts", "summaries"],
+            "wide",
+            f"fallback: {motivo}",
+            True,
+        )
+    return (
+        "graph",
+        ["dense", "fts", "paraphrase", "propositions", "graph"],
+        "standard",
+        f"fallback: {motivo}",
+        True,
+    )
+
+
+# ---------------------------------------------------------------------
+# Estrategia metadata: filtrado guiado por metadatos
+# ---------------------------------------------------------------------
+
+
+def _corpus_metadata_brief(session) -> str:
+    """JSON breve de títulos/doc_types/idiomas del corpus (para el prompt del
+    extractor de filtros). Degradación: error SQL → "[]" sin romper."""
+    rows = []
+    try:
+        rows = session.execute(
+            text(
+                "SELECT title, doc_type, language FROM kag_documents "
+                "WHERE status = 'ready' LIMIT 50"
+            )
+        ).fetchall()
+    except Exception:  # noqa: BLE001 — degradación natural
+        _safe_rollback(session)
+        rows = []
+    return _json_dumps(
+        [
+            {
+                "title": r.title,
+                "doc_type": r.doc_type,
+                "language": r.language,
+            }
+            for r in rows
+        ]
+    )
+
+
+def extract_metadata_filters(session, query) -> dict:
+    """Extrae filtros de metadatos de la consulta con el LLM grande.
+
+    La EXTRACCIÓN de filtros es PLANIFICACIÓN (el SLM decide la estrategia,
+    el LLM planifica): model_size="large". Devuelve
+    {"filters": {"authors": [], "years": [], "fields": [], "works": [],
+    "languages": []}, "reason": str}. Degradación: flag apagada, llamada
+    falla o JSON inválido → {"filters": {}, "reason": ""} (nunca rompe).
+    """
+    if not _kag_config_value(session, "KAG_METADATA_FILTER", True):
+        return {"filters": {}, "reason": ""}
+    settings = load_settings(session)
+    retries = int(getattr(settings, "llm_retries", 3) or 3) if settings else 3
+    fallback = getattr(settings, "fallback_model", None) if settings else None
+    large_model = getattr(settings, "large_model", None) if settings else None
+    system, user_template = _get_prompt_pair(
+        session,
+        large_model,
+        TASK_QUERY_METADATA,
+        QUERY_METADATA_SYSTEM_SHORT,
+        QUERY_METADATA_PROMPT,
+    )
+    try:
+        text_out, _model, _used_fallback = call_with_retries(
+            session,
+            prompt=user_template.replace("{query}", query).replace(
+                "{corpus_metadata}", _corpus_metadata_brief(session)
+            ),
+            system=system,
+            model_size="large",
+            response_format={"type": "json_object"},
+            retries=retries,
+            fallback_model=fallback,
+        )
+        data = parse_llm_output(text_out)
+        filters = data.get("filters") or {}
+        if not isinstance(filters, dict):
+            filters = {}
+        reason = str(data.get("reason") or "").strip()
+        return {"filters": filters, "reason": reason}
+    except Exception:  # noqa: BLE001 — degradación natural
+        _safe_rollback(session)
+        return {"filters": {}, "reason": ""}
+
+
+def generate_subqueries(session, query) -> list:
+    """Descompone la consulta en subconsultas atómicas con el LLM grande.
+
+    La GENERACIÓN de subconsultas es PLANIFICACIÓN (el SLM decide la
+    estrategia, el LLM planifica): model_size="large". Devuelve lista de
+    dicts [{"query": str, "intent": str}] (máx 4, strings saneados).
+    Degradación: flag apagada, llamada falla, JSON inválido o más de 4
+    subconsultas → [{"query": query, "intent": "consulta original"}]
+    (nunca rompe).
+    """
+    if not _kag_config_value(session, "KAG_SUBQUERIES", True):
+        return [{"query": query, "intent": "consulta original"}]
+    settings = load_settings(session)
+    retries = int(getattr(settings, "llm_retries", 3) or 3) if settings else 3
+    fallback = getattr(settings, "fallback_model", None) if settings else None
+    large_model = getattr(settings, "large_model", None) if settings else None
+    system, user_template = _get_prompt_pair(
+        session,
+        large_model,
+        TASK_QUERY_SUBQUERIES,
+        QUERY_SUBQUERIES_SYSTEM_SHORT,
+        QUERY_SUBQUERIES_PROMPT,
+    )
+    try:
+        text_out, _model, _used_fallback = call_with_retries(
+            session,
+            prompt=user_template.replace("{query}", query).replace(
+                "{corpus_metadata}", _corpus_metadata_brief(session)
+            ),
+            system=system,
+            model_size="large",
+            response_format={"type": "json_object"},
+            retries=retries,
+            fallback_model=fallback,
+        )
+        data = parse_llm_output(text_out)
+        raw = data.get("subqueries") or []
+        if not isinstance(raw, list):
+            raw = []
+        subs = []
+        for item in raw[:4]:
+            if not isinstance(item, dict):
+                continue
+            sub_q = str(item.get("query") or "").strip()
+            if not sub_q:
+                continue
+            subs.append(
+                {
+                    "query": sub_q,
+                    "intent": str(item.get("intent") or "").strip(),
+                }
+            )
+        if subs:
+            return subs
+    except Exception:  # noqa: BLE001 — degradación natural
+        _safe_rollback(session)
+    return [{"query": query, "intent": "consulta original"}]
+
+
+def _doc_ids_for_filters(session, filters) -> list:
+    """Ids de kag_documents que cumplen los filtros de metadatos.
+
+    UN SELECT con ORs sobre kag_documents:
+      - works → title ILIKE '%' || :w || '%' (por cada obra)
+      - authors/years → ficha_jsonb->>'bibtex' ILIKE '%' || :a || '%'
+        (el bibtex contiene autor/año)
+      - fields → ficha_jsonb->'library_of_congress'->'lcsh_terms' @> :f
+        (array) O EXISTS sobre thematic_areas_iso25964
+      - languages → language = ANY(:langs)
+    Si filters vacío → [] (sin filtro). Degradación: error SQL → rollback
+    + [] sin romper.
+    """
+    if not filters:
+        return []
+    works = [str(w).strip() for w in (filters.get("works") or []) if str(w).strip()]
+    authors = [str(a).strip() for a in (filters.get("authors") or []) if str(a).strip()]
+    years = [str(y).strip() for y in (filters.get("years") or []) if str(y).strip()]
+    fields = [str(f).strip() for f in (filters.get("fields") or []) if str(f).strip()]
+    langs = [str(l).strip() for l in (filters.get("languages") or []) if str(l).strip()]
+    if not (works or authors or years or fields or langs):
+        return []
+    conds = []
+    params = {}
+    for i, w in enumerate(works):
+        conds.append(f"title ILIKE '%' || :w{i} || '%'")
+        params[f"w{i}"] = w
+    for i, a in enumerate(authors + years):
+        conds.append(f"ficha_jsonb->>'bibtex' ILIKE '%' || :a{i} || '%'")
+        params[f"a{i}"] = a
+    for i, f in enumerate(fields):
+        conds.append(
+            f"(ficha_jsonb->'library_of_congress'->'lcsh_terms' @> :f{i} "
+            f"OR EXISTS (SELECT 1 FROM jsonb_array_elements("
+            f"ficha_jsonb->'thematic_areas_iso25964') t "
+            f"WHERE t->>'preferred_term' ILIKE '%' || :fl{i} || '%'))"
+        )
+        params[f"f{i}"] = [f]
+        params[f"fl{i}"] = f
+    if langs:
+        conds.append("language = ANY(:langs)")
+        params["langs"] = langs
+    sql = (
+        "SELECT id FROM kag_documents WHERE status = 'ready' AND ("
+        + " OR ".join(conds)
+        + ")"
+    )
+    try:
+        rows = session.execute(text(sql), params).fetchall()
+        return [r.id for r in rows]
+    except Exception:  # noqa: BLE001 — degradación natural
+        _safe_rollback(session)
+        return []
 
 
 # ---------------------------------------------------------------------
@@ -990,22 +1305,30 @@ def ppr_entity_selection(
 # ---------------------------------------------------------------------
 
 
-def vector_search(session, query_embedding, top_k):
+def vector_search(session, query_embedding, top_k, doc_ids=None):
     """pgvector <=> (coseno). Devuelve lista de (chunk_id, score).
 
     Solo chunks de documentos 'ready': los docs pending/failed (proceso
     interrumpido) no deben contaminar los resultados (degradación elegante).
+    `doc_ids` (opcional) restringe a los documentos dados (estrategia
+    metadata).
     """
     q = embedding_to_sql(query_embedding)
+    doc_cond = ""
+    params = {"q": q, "top_k": top_k}
+    if doc_ids:
+        doc_cond = " AND c.doc_id = ANY(:doc_ids)"
+        params["doc_ids"] = list(doc_ids)
     rows = session.execute(
         text(
             "SELECT c.id, 1 - (c.embedding <=> CAST(:q AS vector)) AS score "
             "FROM kag_chunks c "
             "JOIN kag_documents d ON d.id = c.doc_id "
             "WHERE c.embedding IS NOT NULL AND d.status = 'ready' "
-            "ORDER BY c.embedding <=> CAST(:q AS vector) LIMIT :top_k"
+            + doc_cond
+            + " ORDER BY c.embedding <=> CAST(:q AS vector) LIMIT :top_k"
         ),
-        {"q": q, "top_k": top_k},
+        params,
     ).fetchall()
     return [(r.id, float(r.score)) for r in rows]
 
@@ -1030,69 +1353,196 @@ def rrf_merge(*ranked_lists, k=60, top_k=20):
     return sorted(scores.items(), key=lambda x: -x[1])[:top_k]
 
 
-def fts_search(session, query_text, top_k):
+def fts_search(session, query_text, top_k, doc_ids=None):
     """Búsqueda léxica con FTS de Postgres (ts_rank_cd sobre content_tsv).
 
     Requiere la migración 0014 (columna generada content_tsv + índice GIN).
     Config 'simple' a propósito: agnóstica de idioma (el corpus es
     multilingüe) y sin stemming (ideal para términos exactos: acrónimos,
     códigos, nombres propios). Query vacía o sin tokens → [] (sin error).
+    `doc_ids` (opcional) restringe a los documentos dados (estrategia
+    metadata).
     """
     if not query_text or not query_text.strip():
         return []
+    doc_cond = ""
+    params = {"q": query_text, "top_k": top_k}
+    if doc_ids:
+        doc_cond = " AND c.doc_id = ANY(:doc_ids)"
+        params["doc_ids"] = list(doc_ids)
     rows = session.execute(
         text(
             "SELECT c.id, ts_rank_cd(c.content_tsv, plainto_tsquery('simple', :q)) "
             "AS score FROM kag_chunks c "
             "JOIN kag_documents d ON d.id = c.doc_id "
             "WHERE c.content_tsv @@ plainto_tsquery('simple', :q) "
-            "AND d.status = 'ready' "
-            "ORDER BY score DESC LIMIT :top_k"
+            "AND d.status = 'ready' " + doc_cond + " ORDER BY score DESC LIMIT :top_k"
         ),
-        {"q": query_text, "top_k": top_k},
+        params,
     ).fetchall()
     return [(r.id, float(r.score)) for r in rows]
 
 
-def hybrid_search(session, query_text, query_embedding, top_k, rrf_k=60, verbose=False):
+def _paraphrase_fts_search(session, query_text, top_k, doc_ids=None):
+    """Búsqueda léxica sobre paraphrase_tsv (migración 0033).
+
+    Canal de paráfrasis: FTS sobre la columna generada paraphrase_tsv
+    (config 'simple', corpus multilingüe). Devuelve [(chunk_id, score)].
+    Degradación: query vacía → []; columna ausente (migración no aplicada)
+    → ProgrammingError que hybrid_search convierte en [] sin romper.
+    `doc_ids` (opcional) restringe a los documentos dados (estrategia
+    metadata).
+    """
+    if not query_text or not query_text.strip():
+        return []
+    doc_cond = ""
+    params = {"q": query_text, "top_k": top_k}
+    if doc_ids:
+        doc_cond = " AND doc_id = ANY(:doc_ids)"
+        params["doc_ids"] = list(doc_ids)
+    rows = session.execute(
+        text(
+            "SELECT id, ts_rank_cd(paraphrase_tsv, plainto_tsquery('simple', :q)) "
+            "AS score FROM kag_chunks "
+            "WHERE paraphrase_tsv @@ plainto_tsquery('simple', :q) "
+            + doc_cond
+            + " ORDER BY score DESC LIMIT :top_k"
+        ),
+        params,
+    ).fetchall()
+    return [(r.id, float(r.score)) for r in rows]
+
+
+def hybrid_search(
+    session,
+    query_text,
+    query_embedding,
+    top_k,
+    rrf_k=60,
+    verbose=False,
+    doc_ids=None,
+    channels=None,
+):
     """Búsqueda híbrida: densa (pgvector) + léxica (FTS) + RRF.
 
-    La búsqueda densa y la FTS son lecturas read-only independientes y
-    corren en paralelo (ThreadPoolExecutor), cada una con su propia sesión
+    La búsqueda densa, la FTS, el canal de paráfrasis (FTS sobre
+    paraphrase_tsv, migración 0033) y el canal semántico de proposiciones
+    (kag_propositions, migración 0024) son lecturas read-only independientes
+    y corren en paralelo (ThreadPoolExecutor), cada una con su propia sesión
     (_with_own_session: Session no es thread-safe). El resultado es idéntico
     al secuencial: mismo RRF, mismo orden, mismo score.
 
+    Los canales nuevos entran como listas adicionales en el rrf_merge final
+    (junto a densa y FTS), gated por KAG_PARAPHRASE_CHANNEL y
+    KAG_PROPOSITION_CHANNEL (default True vía _kag_config_value).
+
+    `doc_ids` (opcional, lista de ints): restringe TODOS los canales a los
+    documentos dados (estrategia metadata). None/[] = comportamiento actual
+    (sin filtro).
+
+    `channels` (opcional, lista de str): subconjunto de canales a correr
+    ("dense"→vector_search, "fts"→fts_search, "paraphrase"→
+    _paraphrase_fts_search, "propositions"→proposition_vector_search).
+    "graph"/"summaries" se ignoran (no son canales de hybrid_search). None =
+    los 4 canales actuales (gated por KAG_PARAPHRASE_CHANNEL /
+    KAG_PROPOSITION_CHANNEL).
+
     Si query_embedding es None (embeddings no disponibles), degrada a solo
-    FTS. Si la migración 0014 no está aplicada (columna content_tsv ausente,
-    ProgrammingError), degrada a solo búsqueda densa. Otros errores se
-    propagan al caller (ask() los degrada a vec_hits=[]).
+    FTS + paráfrasis (el canal de proposiciones devuelve []). Si la
+    migración 0014 no está aplicada (columna content_tsv ausente,
+    ProgrammingError), degrada a solo búsqueda densa. Si la migración 0033
+    o 0024 no está aplicada, el canal correspondiente degrada a [] sin
+    romper. Otros errores se propagan al caller (ask() los degrada a
+    vec_hits=[]).
     """
     dense_hits = []
     sparse_hits = []
+    para_hits = []
+    prop_hits = []
     fts_error = None
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    # Solo se pasa doc_ids a los canales cuando es no vacío: con None/[] la
+    # firma es EXACTAMENTE la de antes (backward-compatible con los fakes de
+    # tests que no aceptan el kwarg).
+    channel_kwargs = {"doc_ids": doc_ids} if doc_ids else {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
         dense_future = None
-        if query_embedding is not None:
+        if (channels is None or "dense" in channels) and query_embedding is not None:
             dense_future = pool.submit(
-                _with_own_session, vector_search, query_embedding, top_k
+                _with_own_session,
+                vector_search,
+                query_embedding,
+                top_k,
+                **channel_kwargs,
             )
-        sparse_future = pool.submit(_with_own_session, fts_search, query_text, top_k)
+        sparse_future = None
+        if channels is None or "fts" in channels:
+            sparse_future = pool.submit(
+                _with_own_session, fts_search, query_text, top_k, **channel_kwargs
+            )
+        para_future = None
+        if (channels is None or "paraphrase" in channels) and _kag_config_value(
+            session, "KAG_PARAPHRASE_CHANNEL", True
+        ):
+            para_future = pool.submit(
+                _with_own_session,
+                _paraphrase_fts_search,
+                query_text,
+                top_k,
+                **channel_kwargs,
+            )
+        prop_future = None
+        if (channels is None or "propositions" in channels) and _kag_config_value(
+            session, "KAG_PROPOSITION_CHANNEL", True
+        ):
+            prop_future = pool.submit(
+                _with_own_session,
+                proposition_vector_search,
+                query_embedding,
+                top_k,
+                **channel_kwargs,
+            )
         if dense_future is not None:
             # Esperar primero la densa: si falla, su error se propaga (misma
             # precedencia que el flujo secuencial, donde la densa corre antes).
             dense_hits = dense_future.result()
-        try:
-            sparse_hits = sparse_future.result()
-        except ProgrammingError as exc:  # migración 0014 sin aplicar
-            fts_error = exc
+        if sparse_future is not None:
+            try:
+                sparse_hits = sparse_future.result()
+            except ProgrammingError as exc:  # migración 0014 sin aplicar
+                fts_error = exc
+        if para_future is not None:
+            try:
+                para_hits = para_future.result()
+            except ProgrammingError as exc:  # migración 0033 sin aplicar
+                session.rollback()
+                if verbose:
+                    print(f"[KAG] ⚠ Canal paráfrasis no disponible ({exc}); sin canal.")
+                para_hits = []
+        if prop_future is not None:
+            try:
+                prop_rows = prop_future.result()
+                prop_hits = [
+                    (p["chunk_id"], p["score"]) for p in prop_rows if p.get("chunk_id")
+                ]
+            except ProgrammingError as exc:  # migración 0024 sin aplicar
+                session.rollback()
+                if verbose:
+                    print(
+                        f"[KAG] ⚠ Canal proposiciones no disponible ({exc}); sin canal."
+                    )
+                prop_hits = []
     if fts_error is not None:
         session.rollback()
         if verbose:
             print(f"[KAG] ⚠ FTS no disponible ({fts_error}); solo búsqueda densa.")
         return dense_hits
     if not dense_hits:
-        return sparse_hits
-    return rrf_merge(dense_hits, sparse_hits, k=rrf_k, top_k=top_k)
+        # Sin capa densa (embeddings no disponibles): fusionar las capas
+        # léxicas restantes (FTS + paráfrasis + proposiciones).
+        return rrf_merge(sparse_hits, para_hits, prop_hits, k=rrf_k, top_k=top_k)
+    return rrf_merge(
+        dense_hits, sparse_hits, para_hits, prop_hits, k=rrf_k, top_k=top_k
+    )
 
 
 # ---------------------------------------------------------------------
@@ -1191,18 +1641,24 @@ def search_summaries(
     return out
 
 
-def proposition_vector_search(session, query_embedding, top_k):
+def proposition_vector_search(session, query_embedding, top_k, doc_ids=None):
     """Búsqueda semántica directa sobre kag_propositions.embedding (§3.2).
 
     El embedding de proposiciones ya existe (migración 0024) pero nunca se
     usa para búsqueda directa: esta función lo explota como capa micro.
     Devuelve lista de dicts con id, chunk_id, doc_id, statement y score.
     Degradación: query_embedding None o tabla ausente (migración no
-    aplicada) → [] sin romper.
+    aplicada) → [] sin romper. `doc_ids` (opcional) restringe a los
+    documentos dados (estrategia metadata).
     """
     if query_embedding is None:
         return []
     q = embedding_to_sql(query_embedding)
+    doc_cond = ""
+    params = {"q": q, "top_k": top_k}
+    if doc_ids:
+        doc_cond = " AND doc_id = ANY(:doc_ids)"
+        params["doc_ids"] = list(doc_ids)
     try:
         rows = session.execute(
             text(
@@ -1210,9 +1666,10 @@ def proposition_vector_search(session, query_embedding, top_k):
                 "1 - (embedding <=> CAST(:q AS vector)) AS score "
                 "FROM kag_propositions "
                 "WHERE embedding IS NOT NULL "
-                "ORDER BY embedding <=> CAST(:q AS vector) LIMIT :top_k"
+                + doc_cond
+                + " ORDER BY embedding <=> CAST(:q AS vector) LIMIT :top_k"
             ),
-            {"q": q, "top_k": top_k},
+            params,
         ).fetchall()
     except ProgrammingError:  # migración 0024 no aplicada
         session.rollback()
@@ -1809,6 +2266,68 @@ Devuelve SOLO JSON:
 Pregunta: {query}
 """
 
+QUERY_STRATEGY_SYSTEM_SHORT = (
+    "Eres un clasificador de estrategias de consulta. Devuelve JSON válido."
+)
+QUERY_STRATEGY_PROMPT = """Consulta del usuario: "{query}"
+
+Clasifica la consulta en UNA de las cinco estrategias de recuperación y
+justifica brevemente tu elección.
+
+Devuelve SOLO JSON:
+{{"strategy": "subqueries|metadata|hierarchical|graph|multidoc", "reason": "string"}}
+
+- strategy: una de las cinco claves exactas.
+- reason: frase breve (1-2 líneas) en el idioma de la consulta explicando
+  por qué esa estrategia sirve a la intención del usuario.
+"""
+
+QUERY_METADATA_SYSTEM_SHORT = (
+    "Eres un extractor de filtros de metadatos. Devuelve JSON válido."
+)
+QUERY_METADATA_PROMPT = """Consulta del usuario: "{query}"
+
+Metadatos del corpus disponible:
+{corpus_metadata}
+
+Extrae los filtros de metadatos que la consulta menciona EXPLÍCITAMENTE o
+implica inequívocamente. Devuelve SOLO JSON:
+{{"filters": {{"authors": ["string"], "years": ["string"], "fields": ["string"], "works": ["string"], "languages": ["string"]}}, "reason": "string"}}
+
+- authors: nombres de personas (autores, editores, pensadores citados).
+- years: años o rangos ("1975", "década de 1990", "2005-2010").
+- fields: campos de conocimiento (matchear contra LCSH/temáticas del corpus).
+- works: títulos de obras específicas.
+- languages: idiomas de los documentos.
+- Si la consulta no menciona ningún filtro, devuelve arrays VACÍOS.
+- reason: frase breve (1-2 líneas) en el idioma de la consulta explicando
+  qué filtros extrajiste y por qué.
+"""
+
+QUERY_SUBQUERIES_SYSTEM_SHORT = (
+    "Eres un planificador de recuperación. Devuelve JSON válido."
+)
+QUERY_SUBQUERIES_PROMPT = """Consulta del usuario: "{query}"
+
+Metadatos del corpus disponible:
+{corpus_metadata}
+
+Descompón la consulta en subconsultas ATÓMICAS, cada una orientada a UNA
+faceta distinta del corpus y recuperable de forma INDEPENDIENTE. Devuelve
+SOLO JSON:
+{{"subqueries": [{{"query": "string", "intent": "string"}}], "reason": "string"}}
+
+- 2-4 subconsultas si la consulta es ambigua o multifacética; UNA subconsulta
+  (= la original) si ya es atómica.
+- Cada subconsulta debe ser AUTOCONTENIDA: sin pronombres ni referencias que
+  dependan de la consulta original.
+- Cada subconsulta se orienta a UNA faceta (autor, obra, concepto, periodo,
+  comparación, etc.) para que la recuperación apunte a partes distintas del
+  corpus.
+- reason: frase breve (1-2 líneas) en el idioma de la consulta explicando la
+  descomposición.
+"""
+
 
 def critic_and_linking(session, query, top_k=10, verbose=False):
     """Fusiona el LLM crítico y el entity linking anclado en UNA llamada.
@@ -1919,28 +2438,83 @@ def assemble_context(
 ):
     """Ensambla el bloque de contexto para la respuesta final.
 
+    Las tres capas de evidencia se entregan como bloques EXPLÍCITAMENTE
+    separados y etiquetados (diseño §3.3): el resumen da el MARCO, el chunk
+    da la CITA verificable y la proposición da la CAPA ATÓMICA. No se
+    mezclan en un solo ranking: cada bloque tiene su encabezado para que el
+    LLM distinga la granularidad.
+
     Los chunks llegan ya agrupados con su ventana (ancla + vecinos) y
     ordenados por importancia. Cada chunk muestra su procedencia exacta
-    (doc, sección, chunk_index) y si es resultado directo o contexto
-    adyacente. `history` (opcional) es una lista de dicts {"role",
-    "content"} del historial de conversación — se incluye como sección
-    informativa (preparado, aún sin probar con Docker). `propositions`
-    (opcional) es la capa micro: proposiciones atómicas de los chunks
-    ganadores (kag_propositions) — se muestran DESPUÉS de los fragmentos
-    y ANTES de las figuras. `summary_hits` (opcional) son los resúmenes
-    recuperados del índice temático (search_summaries, §3.3): dan el
-    MARCO de la consulta global, separados de los resúmenes de documento
-    (referencia secundaria) — se muestran entre esos resúmenes y los
-    fragmentos.
-
-    ORDEN PARA PROMPT CACHING: el subgrafo y los resúmenes (bloques
-    semi-estáticos, ordenados de forma determinista por doc) van ANTES de
-    los fragmentos y figuras (dinámicos). Así el prefijo del prompt
-    (system + subgrafo + resúmenes) es cacheable entre queries que
-    comparten documentos; la cola dinámica (chunks + figuras) y la query
-    del usuario quedan al final.
+    (doc, doc_id, capítulo, chapter_id, chunk_index) y si es resultado
+    directo o contexto adyacente. `history` (opcional) es una lista de
+    dicts {"role", "content"} del historial de conversación — se incluye
+    como sección informativa (preparado, aún sin probar con Docker).
+    `propositions` (opcional) es la capa micro: proposiciones atómicas de
+    los chunks ganadores (kag_propositions) con su chunk_id y span.
+    `summary_hits` (opcional) son los resúmenes recuperados del índice
+    temático (search_summaries, §3.3): dan el MARCO de la consulta global.
     """
     parts = []
+    # 1. MARCO TEMÁTICO: resúmenes de documento/sección (índice temático).
+    if summary_hits is not None:
+        parts.append("--- MARCO TEMÁTICO (resúmenes de documento/sección) ---")
+        if summary_hits:
+            for s in summary_hits:
+                doc_id = s.get("doc_id", "?")
+                level = s.get("level", "document")
+                chapter = s.get("chapter_id")
+                if level == "section" and chapter:
+                    parts.append(
+                        f"[doc_id: {doc_id} | nivel: section | capítulo: {chapter}] "
+                        f"{s.get('text', '')}"
+                    )
+                else:
+                    parts.append(
+                        f"[doc_id: {doc_id} | nivel: {level}] {s.get('text', '')}"
+                    )
+        else:
+            parts.append("(sin resúmenes recuperados)")
+        parts.append("")
+    # 2. EVIDENCIA TEXTUAL: chunks con cita verificable (doc_id/chapter_id).
+    parts.append("--- EVIDENCIA TEXTUAL (chunks con cita) ---")
+    if chunks:
+        for i, c in enumerate(chunks, start=1):
+            doc = c.get("doc_path", "?")
+            section = c.get("chapter_title", "") or "(sin capítulo)"
+            idx = c.get("chunk_index", "?")
+            score = c.get("score", 0.0)
+            marker = "RESULTADO" if c.get("is_anchor", True) else "contexto"
+            parts.append(
+                f"[{i}] {marker} | doc: {doc} | doc_id: {c.get('doc_id', '?')} | "
+                f"capítulo: {section} | chapter_id: {c.get('chapter_id', '?')} | "
+                f"chunk {idx} | score: {score:.4f}"
+            )
+            parts.append(c.get("content", ""))
+            parts.append("")
+    else:
+        parts.append("(sin fragmentos recuperados)")
+        parts.append("")
+    # 3. CAPA ATÓMICA: proposiciones con chunk_id y span.
+    if propositions is not None:
+        parts.append("--- CAPA ATÓMICA (proposiciones) ---")
+        if propositions:
+            for i, p in enumerate(propositions, start=1):
+                doc = p.get("doc_title", "?")
+                section = p.get("chapter_title", "") or "(sin sección)"
+                line = (
+                    f"[{i}] doc: {doc} | sección: {section} | "
+                    f"chunk_id: {p.get('chunk_id', '?')} | {p.get('statement', '')}"
+                )
+                span = p.get("text_span") or ""
+                if span:
+                    line += f" (cita: {span})"
+                parts.append(line)
+                parts.append("")
+        else:
+            parts.append("(sin proposiciones)")
+            parts.append("")
+    # 4. Historial, subgrafo, resúmenes de documento y figuras (como hoy).
     if history:
         parts.append("--- HISTORIAL DE CONVERSACIÓN (referencia) ---")
         for turn in history[-6:]:
@@ -1967,57 +2541,6 @@ def assemble_context(
     else:
         parts.append("(sin resúmenes)")
     parts.append("")
-    if summary_hits is not None:
-        parts.append("--- RESUMENES RECUPERADOS (marco temático) ---")
-        if summary_hits:
-            for s in summary_hits:
-                doc_id = s.get("doc_id", "?")
-                level = s.get("level", "document")
-                chapter = s.get("chapter_id")
-                if level == "section" and chapter:
-                    parts.append(
-                        f"[doc_id: {doc_id} | nivel: section | capítulo: {chapter}] "
-                        f"{s.get('text', '')}"
-                    )
-                else:
-                    parts.append(
-                        f"[doc_id: {doc_id} | nivel: {level}] {s.get('text', '')}"
-                    )
-        else:
-            parts.append("(sin resúmenes recuperados)")
-        parts.append("")
-    parts.append("--- FRAGMENTOS RECUPERADOS (orden de importancia) ---")
-    if chunks:
-        for i, c in enumerate(chunks, start=1):
-            doc = c.get("doc_path", "?")
-            section = c.get("chapter_title", "") or "(sin capítulo)"
-            idx = c.get("chunk_index", "?")
-            score = c.get("score", 0.0)
-            marker = "RESULTADO" if c.get("is_anchor", True) else "contexto"
-            parts.append(
-                f"[{i}] {marker} | doc: {doc} | capítulo: {section} | "
-                f"chunk {idx} | score: {score:.4f}"
-            )
-            parts.append(c.get("content", ""))
-            parts.append("")
-    else:
-        parts.append("(sin fragmentos recuperados)")
-        parts.append("")
-    if propositions is not None:
-        parts.append("--- PROPOSICIONES ATÓMICAS (capa micro) ---")
-        if propositions:
-            for i, p in enumerate(propositions, start=1):
-                doc = p.get("doc_title", "?")
-                section = p.get("chapter_title", "") or "(sin sección)"
-                line = f"[n] doc: {doc} | sección: {section} | {p.get('statement', '')}"
-                span = p.get("text_span") or ""
-                if span:
-                    line += f" (cita: {span})"
-                parts.append(line)
-                parts.append("")
-        else:
-            parts.append("(sin proposiciones)")
-            parts.append("")
     parts.append("--- FIGURAS ---")
     if figures:
         for f in figures:
@@ -2359,7 +2882,13 @@ def _evaluate_sufficiency(
 
 
 def _audit_epistemic_fused(
-    session, query, propositions, corpus_metadata, verbose=False, summary_hits=None
+    session,
+    query,
+    propositions,
+    corpus_metadata,
+    verbose=False,
+    summary_hits=None,
+    chunks=None,
 ) -> tuple:
     """Auditoría epistémica en UNA llamada al LLM pequeño (fusión de
     síntesis + contradicciones + suficiencia).
@@ -2368,8 +2897,11 @@ def _audit_epistemic_fused(
     que _synthesize_facts / _resolve_contradictions / _evaluate_sufficiency.
     Si el JSON del LLM falla o viene malformado, degrada a las llamadas
     separadas actuales — nunca romper. `summary_hits` (opcional) son los
-    resúmenes recuperados del índice temático (§3.3): se anexan al prompt
-    como marco de la consulta global.
+    resúmenes recuperados del índice temático (§3.3) y `chunks` (opcional)
+    los fragmentos con cita: se entregan al prompt como TRES bloques de
+    evidencia separados (marco → chunks → proposiciones) con los mismos
+    encabezados que assemble_context, para que el LLM distinga la
+    granularidad de cada capa.
     """
     if not propositions:
         return (
@@ -2394,9 +2926,15 @@ def _audit_epistemic_fused(
         .replace("{active_corpus_metadata}", _json_dumps(corpus_metadata))
         .replace("{candidate_chunks_json}", _json_dumps(propositions))
     )
-    if summary_hits:
-        prompt += "\n\nResúmenes recuperados (marco temático):\n" + _json_dumps(
-            summary_hits
+    if chunks is not None or summary_hits is not None:
+        prompt += "\n\nEvidencia por capas de granularidad:\n"
+        prompt += (
+            "--- MARCO TEMÁTICO (resúmenes de documento/sección) ---\n"
+            + _json_dumps(summary_hits or [])
+            + "\n--- EVIDENCIA TEXTUAL (chunks con cita) ---\n"
+            + _json_dumps(chunks or [])
+            + "\n--- CAPA ATÓMICA (proposiciones) ---\n"
+            + _json_dumps(propositions)
         )
     try:
         text_out, _model, _used_fallback = call_with_retries(
@@ -2751,64 +3289,38 @@ def _branch_b_expand(
     return new_props
 
 
-def _ask_audited(
-    session, query, top_k=8, global_top_k=20, verbose=False, rerank=False
+def _retrieval_phase(
+    session, query, k, q_emb, doc_ids=None, verbose=False, channels=None
 ) -> dict:
-    """Flujo audited completo: recuperación clásica → proposiciones → síntesis
-    → contradicciones → suficiencia → Branch B → grounding → respuesta.
+    """Fase de recuperación compartida por ask() y _ask_audited().
 
-    Devuelve dict: {"answer", "verdict", "grounded_evidence",
-    "epistemic_tensions", "used_fallback"}.
+    Encapsula: hybrid_search ∥ critic_and_linking (ThreadPoolExecutor +
+    _with_own_session) → apply_relevance_threshold →
+    match_entities_candidates → build_adjacency →
+    disambiguate_by_cooccurrence → personalized_pagerank_cached →
+    ppr_entity_selection → chunks_for_entities → rrf_merge.
+
+    `channels` (opcional): subconjunto de canales para hybrid_search (None =
+    los 4 actuales).
+
+    Devuelve dict con {"merged_hits", "vec_hits", "regex_hits",
+    "ppr_chunks", "names", "groups", "entity_ids", "ppr_scores"}.
     """
-    if verbose:
-        print(f"\n🔎 Pregunta (audited): {query}")
-
-    # 1. Recuperación clásica (misma lógica que ask fast).
-    qtype = classify_query(query)
-    k = global_top_k if qtype == "global" else top_k
-    q_emb = None
-    try:
-        from src.embeddings import embed_text
-
-        q_emb = embed_text(query, input_type="query")
-    except Exception as exc:  # noqa: BLE001 — degradación natural
-        _safe_rollback(session)
-        if verbose:
-            print(f"[KAG] ⚠ Embeddings no disponibles ({exc}); solo FTS.")
-    # 1.1. Canales nuevos (§3.2/§3.3): proposiciones (capa micro) y
-    #      resúmenes temáticos (marco global). Ambos degradan a [] sin
-    #      romper; KAG_PROPOSITION_CHANNEL / KAG_SUMMARY_CHANNEL los apagan.
-    prop_channel = []
-    if _kag_config_value(session, "KAG_PROPOSITION_CHANNEL", True):
-        try:
-            prop_hits = proposition_vector_search(session, q_emb, k)
-            prop_channel = [
-                (p["chunk_id"], p["score"]) for p in prop_hits if p.get("chunk_id")
-            ]
-        except Exception as exc:  # noqa: BLE001 — degradación natural
-            _safe_rollback(session)
-            if verbose:
-                print(f"[KAG] ⚠ Canal de proposiciones falló: {exc}")
-    summary_hits = []
-    if qtype == "global" and _kag_config_value(session, "KAG_SUMMARY_CHANNEL", True):
-        try:
-            summary_hits = search_summaries(
-                session, query, q_emb, top_k=global_top_k, verbose=verbose
-            )
-        except Exception as exc:  # noqa: BLE001 — degradación natural
-            _safe_rollback(session)
-            if verbose:
-                print(f"[KAG] ⚠ Índice de resúmenes falló: {exc}")
-    # Búsqueda híbrida ∥ CRIT+EL (spaCy + LLM) en paralelo: mismo resultado
-    # que el secuencial; KAG_QUERY_PARALLEL=False restaura el orden viejo.
-    # Cada tarea usa su propia sesión (_with_own_session: Session no es
-    # thread-safe).
     vec_hits = []
     regex_hits, regex_terms, names = [], [], []
     if _kag_config_value(session, "KAG_QUERY_PARALLEL", True):
         with ThreadPoolExecutor(max_workers=2) as pool:
+            hybrid_kwargs = {"doc_ids": doc_ids} if doc_ids else {}
+            if channels is not None:
+                hybrid_kwargs["channels"] = channels
             hybrid_future = pool.submit(
-                _with_own_session, hybrid_search, query, q_emb, k, verbose=verbose
+                _with_own_session,
+                hybrid_search,
+                query,
+                q_emb,
+                k,
+                verbose=verbose,
+                **hybrid_kwargs,
             )
             crit_future = pool.submit(
                 _with_own_session, critic_and_linking, query, top_k=k, verbose=verbose
@@ -2828,7 +3340,12 @@ def _ask_audited(
                     print(f"[KAG] ⚠ CRIT+EL fusionado falló: {exc}")
     else:
         try:
-            vec_hits = hybrid_search(session, query, q_emb, k, verbose=verbose)
+            hybrid_kwargs = {"doc_ids": doc_ids} if doc_ids else {}
+            if channels is not None:
+                hybrid_kwargs["channels"] = channels
+            vec_hits = hybrid_search(
+                session, query, q_emb, k, verbose=verbose, **hybrid_kwargs
+            )
         except Exception as exc:  # noqa: BLE001 — degradación natural
             _safe_rollback(session)
             if verbose:
@@ -2843,6 +3360,15 @@ def _ask_audited(
             if verbose:
                 print(f"[KAG] ⚠ CRIT+EL fusionado falló: {exc}")
     vec_hits = apply_relevance_threshold(vec_hits, verbose=verbose)
+    if verbose:
+        print(f"[KAG] Búsqueda híbrida: {len(vec_hits)} chunks (tras threshold)")
+        for cid, score in vec_hits[:5]:
+            print(f"    - chunk {cid}: score {score:.4f}")
+    if verbose and regex_hits:
+        print(
+            f"[KAG] Crítico: {len(regex_hits)} chunks textuales "
+            f"(términos: {regex_terms})"
+        )
     embed_fn = None
     try:
         from src.embeddings import embed_texts as _embed_texts
@@ -2860,10 +3386,22 @@ def _ask_audited(
         margin=DISAMBIG_MARGIN,
         verbose=verbose,
     )
+    if verbose:
+        print(
+            f"[KAG] Entity linking: {len(names)} nombres → "
+            f"{len(entity_ids)} entidades (tras copresencia)"
+        )
     ppr_scores = {}
     if entity_ids:
         ppr_scores = personalized_pagerank_cached(session, entity_ids)
+        if verbose:
+            top_ppr = sorted(ppr_scores.items(), key=lambda x: -x[1])[:5]
+            print(f"[KAG] PPR: {len(ppr_scores)} entidades rankeadas (ego 2-hop)")
+            for eid, score in top_ppr:
+                print(f"    - entidad {eid}: {score:.4f}")
     ppr_entities = ppr_entity_selection(ppr_scores, verbose=verbose)
+    if verbose:
+        print(f"[KAG] PPR cercanas: {len(ppr_entities)} entidades (umbral relativo)")
     ppr_chunks = (
         chunks_for_entities(session, ppr_entities, top_n=10) if ppr_entities else []
     )
@@ -2871,10 +3409,151 @@ def _ask_audited(
         vec_hits,
         regex_hits,
         [(pc["chunk_id"], 0.0) for pc in ppr_chunks],
-        prop_channel,
         k=60,
-        top_k=len(vec_hits) + len(regex_hits) + len(ppr_chunks) + len(prop_channel),
+        top_k=len(vec_hits) + len(regex_hits) + len(ppr_chunks),
     )
+    return {
+        "merged_hits": merged_hits,
+        "vec_hits": vec_hits,
+        "regex_hits": regex_hits,
+        "ppr_chunks": ppr_chunks,
+        "names": names,
+        "groups": groups,
+        "entity_ids": entity_ids,
+        "ppr_scores": ppr_scores,
+    }
+
+
+def _ask_audited(
+    session, query, top_k=8, global_top_k=20, verbose=False, rerank=False
+) -> dict:
+    """Flujo audited completo: recuperación clásica → proposiciones → síntesis
+    → contradicciones → suficiencia → Branch B → grounding → respuesta.
+
+    Devuelve dict: {"answer", "verdict", "grounded_evidence",
+    "epistemic_tensions", "used_fallback"}.
+    """
+    if verbose:
+        print(f"\n🔎 Pregunta (audited): {query}")
+
+    # 1. Recuperación clásica (misma lógica que ask fast).
+    strategy, channels, top_k_label, reason, used_fallback = classify_query_strategy(
+        session, query
+    )
+    k = _top_k_for(strategy, top_k_label, top_k, global_top_k)
+    if verbose:
+        print(f"[KAG] Clasificación: {strategy} (top_k={k})")
+        print(f"[KAG] Canales: {channels} | top_k: {top_k_label}")
+        if reason:
+            print(f"[KAG]   razón: {reason}")
+        if used_fallback:
+            print(f"[KAG]   ⚠ fallback de estrategia: {reason}")
+        if strategy == "multidoc":
+            print(f"[KAG] Estrategia: {strategy} (planificación LLM pendiente)")
+    # 1.0. Estrategia metadata: extraer filtros de metadatos (LLM grande) y
+    #      resolver los doc_ids que los cumplen. Si la extracción falla
+    #      (filters vacío) → comportamiento local normal (sin filtro).
+    metadata_doc_ids = None
+    if strategy == "metadata":
+        try:
+            filters = extract_metadata_filters(session, query)
+            doc_ids = _doc_ids_for_filters(session, filters.get("filters") or {})
+            if doc_ids:
+                metadata_doc_ids = doc_ids
+                if verbose:
+                    print(
+                        f"[KAG] Metadata: {len(doc_ids)} doc(s) filtrado(s) — "
+                        f"{filters.get('reason') or ''}"
+                    )
+        except Exception as exc:  # noqa: BLE001 — degradación natural
+            _safe_rollback(session)
+            if verbose:
+                print(f"[KAG] ⚠ Filtros de metadatos fallaron ({exc}); sin filtro.")
+    q_emb = None
+    try:
+        from src.embeddings import embed_text
+
+        q_emb = embed_text(query, input_type="query")
+    except Exception as exc:  # noqa: BLE001 — degradación natural
+        _safe_rollback(session)
+        if verbose:
+            print(f"[KAG] ⚠ Embeddings no disponibles ({exc}); solo FTS.")
+    # 1.1. Canales nuevos (§3.2/§3.3): proposiciones (capa micro) y
+    #      resúmenes temáticos (marco global). El canal de proposiciones ya
+    #      vive DENTRO de hybrid_search (KAG_PROPOSITION_CHANNEL); aquí solo
+    #      queda el marco temático. Ambos degradan a [] sin romper;
+    #      KAG_SUMMARY_CHANNEL apaga el marco.
+    summary_hits = []
+    if (
+        strategy == "hierarchical"
+        and "summaries" in channels
+        and _kag_config_value(session, "KAG_SUMMARY_CHANNEL", True)
+    ):
+        try:
+            summary_hits = search_summaries(
+                session, query, q_emb, top_k=global_top_k, verbose=verbose
+            )
+        except Exception as exc:  # noqa: BLE001 — degradación natural
+            _safe_rollback(session)
+            if verbose:
+                print(f"[KAG] ⚠ Índice de resúmenes falló: {exc}")
+    # 1.2. Estrategia subqueries: descomponer la consulta en subconsultas
+    #      atómicas (LLM grande), recuperar cada una en paralelo y fusionar
+    #      con RRF. Si la descomposición degrada a la original → path normal.
+    if strategy == "subqueries":
+        subs = generate_subqueries(session, query)
+        if len(subs) == 1 and subs[0]["query"] == query:
+            # Degradación: la descomposición devolvió la original → path normal.
+            retrieval = _retrieval_phase(
+                session,
+                query,
+                k,
+                q_emb,
+                doc_ids=metadata_doc_ids,
+                verbose=verbose,
+                channels=channels,
+            )
+        else:
+            if verbose:
+                print(f"[KAG] Subqueries: {len(subs)} — {[s['query'] for s in subs]}")
+            with ThreadPoolExecutor(max_workers=min(4, len(subs))) as pool:
+                futures = [
+                    pool.submit(
+                        _with_own_session,
+                        _retrieval_phase,
+                        s["query"],
+                        k,
+                        q_emb,
+                        None,
+                        verbose,
+                        channels,
+                    )
+                    for s in subs
+                ]
+                results = [f.result() for f in futures]
+            merged_hits = rrf_merge(
+                *[r["merged_hits"] for r in results],
+                k=60,
+                top_k=sum(len(r["merged_hits"]) for r in results),
+            )
+            retrieval = {
+                "merged_hits": merged_hits,
+                "entity_ids": list(
+                    dict.fromkeys(eid for r in results for eid in r["entity_ids"])
+                ),
+                "ppr_scores": {},
+            }
+    else:
+        retrieval = _retrieval_phase(
+            session,
+            query,
+            k,
+            q_emb,
+            doc_ids=metadata_doc_ids,
+            verbose=verbose,
+            channels=channels,
+        )
+    merged_hits = retrieval["merged_hits"]
     merged_ids = [cid for cid, _score in merged_hits]
     fetched = chunks_by_ids(session, merged_ids)
     score_by_id = dict(merged_hits)
@@ -2892,6 +3571,7 @@ def _ask_audited(
             print(f"[KAG] Reranker: {len(chunks)} anclas reordenadas (cross-encoder)")
     chunks = _group_chunks_with_window(session, chunks)
     chunk_ids = [c["chunk_id"] for c in chunks]
+    entity_ids = retrieval["entity_ids"]
 
     # 2. Proposiciones de los chunks ganadores.
     propositions = propositions_for_chunks(session, chunk_ids)
@@ -2928,6 +3608,7 @@ def _ask_audited(
         corpus_metadata,
         verbose=verbose,
         summary_hits=summary_hits,
+        chunks=chunks,
     )
     verdict = evaluation.get("verdict", "SUFFICIENT_FOR_SYNTHESIS")
 
@@ -3115,11 +3796,40 @@ def ask(
     if verbose:
         print(f"\n🔎 Pregunta: {query}")
 
-    # 1. Clasificar
-    qtype = classify_query(query)
-    k = global_top_k if qtype == "global" else top_k
+    # 1. Clasificar (SLM decide la estrategia; el LLM planifica — agentes B/C/D).
+    strategy, channels, top_k_label, reason, used_fallback = classify_query_strategy(
+        session, query
+    )
+    k = _top_k_for(strategy, top_k_label, top_k, global_top_k)
     if verbose:
-        print(f"[KAG] Clasificación: {qtype} (top_k={k})")
+        print(f"[KAG] Clasificación: {strategy} (top_k={k})")
+        print(f"[KAG] Canales: {channels} | top_k: {top_k_label}")
+        if reason:
+            print(f"[KAG]   razón: {reason}")
+        if used_fallback:
+            print(f"[KAG]   ⚠ fallback de estrategia: {reason}")
+        if strategy == "multidoc":
+            print(f"[KAG] Estrategia: {strategy} (planificación LLM pendiente)")
+
+    # 1.5. Estrategia metadata: extraer filtros de metadatos (LLM grande) y
+    #      resolver los doc_ids que los cumplen. Si la extracción falla
+    #      (filters vacío) → comportamiento local normal (sin filtro).
+    metadata_doc_ids = None
+    if strategy == "metadata":
+        try:
+            filters = extract_metadata_filters(session, query)
+            doc_ids = _doc_ids_for_filters(session, filters.get("filters") or {})
+            if doc_ids:
+                metadata_doc_ids = doc_ids
+                if verbose:
+                    print(
+                        f"[KAG] Metadata: {len(doc_ids)} doc(s) filtrado(s) — "
+                        f"{filters.get('reason') or ''}"
+                    )
+        except Exception as exc:  # noqa: BLE001 — degradación natural
+            session.rollback()  # la transacción queda abortada tras el error
+            if verbose:
+                print(f"[KAG] ⚠ Filtros de metadatos fallaron ({exc}); sin filtro.")
 
     # 2. Búsqueda híbrida (densa + FTS + RRF)
     q_emb = None
@@ -3134,21 +3844,16 @@ def ask(
         if verbose:
             print(f"[KAG] ⚠ Embeddings no disponibles ({exc}); solo FTS.")
     # 2.1. Canales nuevos (§3.2/§3.3): proposiciones (capa micro) y
-    #      resúmenes temáticos (marco global). Ambos degradan a [] sin
-    #      romper; KAG_PROPOSITION_CHANNEL / KAG_SUMMARY_CHANNEL los apagan.
-    prop_channel = []
-    if _kag_config_value(session, "KAG_PROPOSITION_CHANNEL", True):
-        try:
-            prop_hits = proposition_vector_search(session, q_emb, k)
-            prop_channel = [
-                (p["chunk_id"], p["score"]) for p in prop_hits if p.get("chunk_id")
-            ]
-        except Exception as exc:  # noqa: BLE001 — degradación natural
-            session.rollback()  # la transacción queda abortada tras el error
-            if verbose:
-                print(f"[KAG] ⚠ Canal de proposiciones falló: {exc}")
+    #      resúmenes temáticos (marco global). El canal de proposiciones ya
+    #      vive DENTRO de hybrid_search (KAG_PROPOSITION_CHANNEL); aquí solo
+    #      queda el marco temático. Ambos degradan a [] sin romper;
+    #      KAG_SUMMARY_CHANNEL apaga el marco.
     summary_hits = []
-    if qtype == "global" and _kag_config_value(session, "KAG_SUMMARY_CHANNEL", True):
+    if (
+        strategy == "hierarchical"
+        and "summaries" in channels
+        and _kag_config_value(session, "KAG_SUMMARY_CHANNEL", True)
+    ):
         try:
             summary_hits = search_summaries(
                 session, query, q_emb, top_k=global_top_k, verbose=verbose
@@ -3157,143 +3862,88 @@ def ask(
             session.rollback()  # la transacción queda abortada tras el error
             if verbose:
                 print(f"[KAG] ⚠ Índice de resúmenes falló: {exc}")
-    # 2 + 2.5+3. Búsqueda híbrida ∥ CRIT+EL (spaCy + LLM) en paralelo: la
-    #      extracción de candidatos y la llamada al LLM pequeño corren
-    #      mientras la DB responde la búsqueda híbrida. Resultado idéntico
-    #      al secuencial; KAG_QUERY_PARALLEL=False restaura el orden viejo.
-    #      Cada tarea usa su propia sesión (_with_own_session: Session no es
-    #      thread-safe).
-    vec_hits = []
-    regex_hits, regex_terms, names = [], [], []
-    if _kag_config_value(session, "KAG_QUERY_PARALLEL", True):
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            hybrid_future = pool.submit(
-                _with_own_session, hybrid_search, query, q_emb, k, verbose=verbose
+    # 2.5. Estrategia subqueries: descomponer la consulta en subconsultas
+    #      atómicas (LLM grande), recuperar cada una en paralelo y fusionar
+    #      con RRF. Si la descomposición degrada a la original → path normal.
+    if strategy == "subqueries":
+        subs = generate_subqueries(session, query)
+        if len(subs) == 1 and subs[0]["query"] == query:
+            # Degradación: la descomposición devolvió la original → path normal.
+            retrieval = _retrieval_phase(
+                session,
+                query,
+                k,
+                q_emb,
+                doc_ids=metadata_doc_ids,
+                verbose=verbose,
+                channels=channels,
             )
-            crit_future = pool.submit(
-                _with_own_session, critic_and_linking, query, top_k=k, verbose=verbose
+        else:
+            if verbose:
+                print(f"[KAG] Subqueries: {len(subs)} — {[s['query'] for s in subs]}")
+            with ThreadPoolExecutor(max_workers=min(4, len(subs))) as pool:
+                futures = [
+                    pool.submit(
+                        _with_own_session,
+                        _retrieval_phase,
+                        s["query"],
+                        k,
+                        q_emb,
+                        None,
+                        verbose,
+                        channels,
+                    )
+                    for s in subs
+                ]
+                results = [f.result() for f in futures]
+            merged_hits = rrf_merge(
+                *[r["merged_hits"] for r in results],
+                k=60,
+                top_k=sum(len(r["merged_hits"]) for r in results),
             )
-            try:
-                vec_hits = hybrid_future.result()
-            except Exception as exc:  # noqa: BLE001 — degradación natural
-                session.rollback()  # la transacción queda abortada tras el error
-                if verbose:
-                    print(f"[KAG] ⚠ Búsqueda híbrida falló: {exc}")
-                vec_hits = []
-            try:
-                regex_hits, regex_terms, names = crit_future.result()
-            except Exception as exc:  # noqa: BLE001 — degradación natural
-                session.rollback()
-                if verbose:
-                    print(f"[KAG] ⚠ CRIT+EL fusionado falló: {exc}")
+            retrieval = {
+                "merged_hits": merged_hits,
+                "entity_ids": list(
+                    dict.fromkeys(eid for r in results for eid in r["entity_ids"])
+                ),
+                "ppr_scores": {},
+            }
     else:
-        try:
-            vec_hits = hybrid_search(session, query, q_emb, k, verbose=verbose)
-        except Exception as exc:  # noqa: BLE001 — degradación natural
-            session.rollback()  # la transacción queda abortada tras el error
-            if verbose:
-                print(f"[KAG] ⚠ Búsqueda híbrida falló: {exc}")
-            vec_hits = []
-        try:
-            regex_hits, regex_terms, names = critic_and_linking(
-                session, query, top_k=k, verbose=verbose
-            )
-        except Exception as exc:  # noqa: BLE001 — degradación natural
-            session.rollback()
-            if verbose:
-                print(f"[KAG] ⚠ CRIT+EL fusionado falló: {exc}")
-    # Threshold de relevancia: descarta la cola larga irrelevante.
-    vec_hits = apply_relevance_threshold(vec_hits, verbose=verbose)
-    if verbose:
-        print(f"[KAG] Búsqueda híbrida: {len(vec_hits)} chunks (tras threshold)")
-        for cid, score in vec_hits[:5]:
-            print(f"    - chunk {cid}: score {score:.4f}")
-    if verbose and regex_hits:
-        print(
-            f"[KAG] Crítico: {len(regex_hits)} chunks textuales "
-            f"(términos: {regex_terms})"
+        retrieval = _retrieval_phase(
+            session,
+            query,
+            k,
+            q_emb,
+            doc_ids=metadata_doc_ids,
+            verbose=verbose,
+            channels=channels,
         )
-
-    # 3. Entity linking: candidatos del grafo + desambiguación por
-    #    copresencia. `names` ya viene del LLM fusionado (o del pool
-    #    determinista si falló). embed_fn (carga perezosa) permite el
-    #    fallback por similitud coseno sobre name_embedding (cross-lingual).
-    embed_fn = None
-    try:
-        from src.embeddings import embed_texts as _embed_texts
-
-        embed_fn = _embed_texts
-    except Exception:  # noqa: BLE001 — sin modelo de embeddings: solo léxico
-        pass
-    groups = match_entities_candidates(session, names, embed_fn=embed_fn)
-    adj = build_adjacency(session) if groups else {}
-    entity_ids = disambiguate_by_cooccurrence(
-        session,
-        groups,
-        adjacency=adj,
-        min_overlap=DISAMBIG_MIN_OVERLAP,
-        margin=DISAMBIG_MARGIN,
-        verbose=verbose,
-    )
-    if verbose:
-        print(
-            f"[KAG] Entity linking: {len(names)} nombres → "
-            f"{len(entity_ids)} entidades (tras copresencia)"
-        )
-
-    # 4. PPR (HippoRAG) sobre la vecindad de 2 saltos de la semilla: correr
-    #    PPR sobre el grafo completo es O(N²) y crece con el corpus; con
-    #    alpha=0.15 la masa decae ~×0.15 por salto, así que 2 saltos capturan
-    #    la señal relevante (ego_network extrae el subgrafo inducido).
-    ppr_scores = {}
-    if entity_ids:
-        ppr_scores = personalized_pagerank_cached(session, entity_ids)
-        if verbose:
-            top_ppr = sorted(ppr_scores.items(), key=lambda x: -x[1])[:5]
-            print(f"[KAG] PPR: {len(ppr_scores)} entidades rankeadas (ego 2-hop)")
-            for eid, score in top_ppr:
-                print(f"    - entidad {eid}: {score:.4f}")
-
-    # 4.5. Umbral de cercanía en el grafo: entidades PPR 'cerca' de la
-    #      semilla (relativo al máximo + baseline estadístico). Reemplaza
-    #      el top-10 fijo: si solo 3 entidades están cerca, no arrastra 7
-    #      irrelevantes; si 20 están cerca, no descarta la mitad.
-    ppr_entities = ppr_entity_selection(ppr_scores, verbose=verbose)
-    if verbose:
-        print(f"[KAG] PPR cercanas: {len(ppr_entities)} entidades (umbral relativo)")
-
-    # 5. Merge + dedup: RRF sobre las cuatro capas (vector, regex, PPR,
-    #    proposiciones) → una sola lista de chunks, sin duplicación. Cada
-    #    capa aporta su rank; el RRF es escala-agnóstico (ts_rank, coseno y
-    #    menciones no comparten escala).
-    ppr_chunks = (
-        chunks_for_entities(session, ppr_entities, top_n=10) if ppr_entities else []
-    )
-    merged_hits = rrf_merge(
-        vec_hits,
-        regex_hits,
-        [(pc["chunk_id"], 0.0) for pc in ppr_chunks],
-        prop_channel,
-        k=60,
-        top_k=len(vec_hits) + len(regex_hits) + len(ppr_chunks) + len(prop_channel),
-    )
+    # 3. Merge + dedup: RRF sobre las capas (vector, regex, PPR) → una sola
+    #    lista de chunks, sin duplicación. Cada capa aporta su rank; el RRF
+    #    es escala-agnóstico (ts_rank, coseno y menciones no comparten
+    #    escala). El canal de proposiciones ya vive DENTRO de hybrid_search.
+    merged_hits = retrieval["merged_hits"]
     # Una sola consulta por todos los ids (en vez del loop N+1 por hit),
     # preservando el orden de importancia del RRF (array_position). El
     # subgrafo de tripletas es independiente (solo usa las entidades PPR),
     # así que ambas lecturas corren en paralelo.
     merged_ids = [cid for cid, _score in merged_hits]
     score_by_id = dict(merged_hits)
+    triple_entities = (
+        ppr_entity_selection(retrieval["ppr_scores"], verbose=False)
+        or retrieval["entity_ids"]
+    )
     if _kag_config_value(session, "KAG_QUERY_PARALLEL", True):
         with ThreadPoolExecutor(max_workers=2) as pool:
             chunks_future = pool.submit(_with_own_session, chunks_by_ids, merged_ids)
             triples_future = pool.submit(
-                _with_own_session, subgraph_triples, ppr_entities or entity_ids, 25
+                _with_own_session, subgraph_triples, triple_entities, 25
             )
             fetched = chunks_future.result()
             triples = triples_future.result()
     else:
         fetched = chunks_by_ids(session, merged_ids)
-        triples = subgraph_triples(session, ppr_entities or entity_ids, limit=25)
+        triples = subgraph_triples(session, triple_entities, limit=25)
     chunks = []
     for c in fetched:
         c["score"] = score_by_id.get(c["chunk_id"], 0.0)

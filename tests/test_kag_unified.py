@@ -158,24 +158,24 @@ def test_assemble_context_with_propositions_section_position():
     ctx = assemble_context(
         chunks, [], figures, [], "pregunta", propositions=propositions
     )
-    assert "PROPOSICIONES ATÓMICAS (capa micro)" in ctx
+    assert "--- CAPA ATÓMICA (proposiciones) ---" in ctx
     assert "La cultura afecta a las organizaciones." in ctx
-    # La sección de proposiciones va entre fragmentos y figuras.
-    assert ctx.index("FRAGMENTOS RECUPERADOS") < ctx.index(
-        "PROPOSICIONES ATÓMICAS (capa micro)"
+    # La capa atómica va DESPUÉS de la evidencia textual y ANTES de las figuras.
+    assert ctx.index("--- EVIDENCIA TEXTUAL (chunks con cita) ---") < ctx.index(
+        "--- CAPA ATÓMICA (proposiciones) ---"
     )
-    assert ctx.index("PROPOSICIONES ATÓMICAS (capa micro)") < ctx.index("FIGURAS")
+    assert ctx.index("--- CAPA ATÓMICA (proposiciones) ---") < ctx.index("FIGURAS")
 
 
 def test_assemble_context_with_propositions_empty():
     ctx = assemble_context([], [], [], [], "pregunta", propositions=[])
-    assert "PROPOSICIONES ATÓMICAS (capa micro)" in ctx
+    assert "--- CAPA ATÓMICA (proposiciones) ---" in ctx
     assert "sin proposiciones" in ctx
 
 
 def test_assemble_context_without_propositions_omits_section():
     ctx = assemble_context([], [], [], [], "pregunta")
-    assert "PROPOSICIONES ATÓMICAS (capa micro)" not in ctx
+    assert "--- CAPA ATÓMICA (proposiciones) ---" not in ctx
 
 
 # ---------------------------------------------------------------------

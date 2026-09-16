@@ -698,7 +698,7 @@ def test_assemble_context_contains_sections():
 
     ctx = assemble_context(chunks, triples, figures, summaries, "pregunta")
 
-    assert "FRAGMENTOS RECUPERADOS" in ctx
+    assert "EVIDENCIA TEXTUAL (chunks con cita)" in ctx
     assert "SUBGRAFO DE ENTIDADES" in ctx
     assert "FIGURAS" in ctx
     assert "RESUMENES DE DOCUMENTO" in ctx
@@ -736,7 +736,7 @@ def test_assemble_context_with_history():
     assert "[USER] ¿qué es X?" in ctx
     assert "[ASSISTANT] X es Y." in ctx
     # El historial no rompe las secciones normales.
-    assert "FRAGMENTOS RECUPERADOS" in ctx
+    assert "EVIDENCIA TEXTUAL (chunks con cita)" in ctx
     assert "contenido a" in ctx
 
 
@@ -1924,6 +1924,16 @@ def test_hybrid_search_degrades_to_dense_when_fts_missing(monkeypatch):
 
     monkeypatch.setattr(kq, "vector_search", fake_vector)
     monkeypatch.setattr(kq, "fts_search", fake_fts)
+    # Canales nuevos apagados: este test aísla la degradación densa+FTS.
+    monkeypatch.setattr(
+        kq,
+        "_kag_config_value",
+        lambda session, name, default=None: (
+            False
+            if name in ("KAG_PARAPHRASE_CHANNEL", "KAG_PROPOSITION_CHANNEL")
+            else default
+        ),
+    )
 
     hits = hybrid_search(session, "pregunta", [0.1, 0.2], top_k=5)
     assert hits == [(1, 0.9), (2, 0.8)]
@@ -1946,6 +1956,16 @@ def test_hybrid_search_propagates_non_fts_errors(monkeypatch):
 
     monkeypatch.setattr(kq, "vector_search", fake_vector)
     monkeypatch.setattr(kq, "fts_search", fake_fts)
+    # Canales nuevos apagados: este test aísla la propagación de errores.
+    monkeypatch.setattr(
+        kq,
+        "_kag_config_value",
+        lambda session, name, default=None: (
+            False
+            if name in ("KAG_PARAPHRASE_CHANNEL", "KAG_PROPOSITION_CHANNEL")
+            else default
+        ),
+    )
 
     with pytest.raises(RuntimeError, match="otro error real"):
         hybrid_search(session, "pregunta", [0.1, 0.2], top_k=5)
@@ -1982,6 +2002,16 @@ def test_hybrid_search_merges_dense_and_sparse(monkeypatch):
 
     monkeypatch.setattr(kq, "vector_search", fake_vector)
     monkeypatch.setattr(kq, "fts_search", fake_fts)
+    # Canales nuevos apagados: este test aísla la fusión densa+FTS.
+    monkeypatch.setattr(
+        kq,
+        "_kag_config_value",
+        lambda session, name, default=None: (
+            False
+            if name in ("KAG_PARAPHRASE_CHANNEL", "KAG_PROPOSITION_CHANNEL")
+            else default
+        ),
+    )
 
     hits = hybrid_search(session, "pregunta", [0.1, 0.2], top_k=5)
     ids = [cid for cid, _ in hits]
@@ -1992,7 +2022,7 @@ def test_hybrid_search_merges_dense_and_sparse(monkeypatch):
 
 def test_hybrid_search_none_embedding_degrades_to_fts_only(monkeypatch):
     """Sin query_embedding (embeddings no disponibles), no se llama a
-    vector_search y se devuelven solo los hits de FTS."""
+    vector_search y se devuelven solo los hits de FTS (orden preservado)."""
     import src.kag_query as kq
 
     class _FakeSession:
@@ -2009,9 +2039,20 @@ def test_hybrid_search_none_embedding_degrades_to_fts_only(monkeypatch):
 
     monkeypatch.setattr(kq, "vector_search", fake_vector)
     monkeypatch.setattr(kq, "fts_search", fake_fts)
+    # Canales nuevos apagados: este test aísla la degradación densa→FTS.
+    monkeypatch.setattr(
+        kq,
+        "_kag_config_value",
+        lambda session, name, default=None: (
+            False
+            if name in ("KAG_PARAPHRASE_CHANNEL", "KAG_PROPOSITION_CHANNEL")
+            else default
+        ),
+    )
 
     hits = hybrid_search(session, "pregunta", None, top_k=5)
-    assert hits == [(2, 5.0), (3, 4.0)]
+    # Sin capa densa, el RRF de las capas léxicas preserva el orden de FTS.
+    assert [cid for cid, _ in hits] == [2, 3]
 
 
 def test_hybrid_search_none_embedding_and_no_fts_returns_empty(monkeypatch):
@@ -2036,6 +2077,16 @@ def test_hybrid_search_none_embedding_and_no_fts_returns_empty(monkeypatch):
 
     monkeypatch.setattr(kq, "vector_search", fake_vector)
     monkeypatch.setattr(kq, "fts_search", fake_fts)
+    # Canales nuevos apagados: este test aísla la degradación densa→FTS.
+    monkeypatch.setattr(
+        kq,
+        "_kag_config_value",
+        lambda session, name, default=None: (
+            False
+            if name in ("KAG_PARAPHRASE_CHANNEL", "KAG_PROPOSITION_CHANNEL")
+            else default
+        ),
+    )
 
     hits = hybrid_search(session, "pregunta", None, top_k=5)
     assert hits == []
@@ -2076,9 +2127,13 @@ def test_assemble_context_deterministic_order_for_caching():
     assert ctx.index("(A) -[USA]-> (B)") < ctx.index("(Z) -[USA]-> (A)")
     # Los resúmenes ordenan por doc_path: a.md antes que b.md.
     assert ctx.index("resumen a") < ctx.index("resumen b")
-    # Subgrafo y resúmenes van antes de los fragmentos (prefijo cacheable).
-    assert ctx.index("SUBGRAFO DE ENTIDADES") < ctx.index("FRAGMENTOS RECUPERADOS")
-    assert ctx.index("RESUMENES DE DOCUMENTO") < ctx.index("FRAGMENTOS RECUPERADOS")
+    # Las tres capas de evidencia van PRIMERO (marco → chunks → proposiciones);
+    # subgrafo y resúmenes de documento quedan después, como hoy.
+    assert (
+        ctx.index("--- EVIDENCIA TEXTUAL (chunks con cita) ---")
+        < ctx.index("SUBGRAFO DE ENTIDADES")
+        < ctx.index("RESUMENES DE DOCUMENTO")
+    )
 
 
 # ---------------------------------------------------------------------
