@@ -12,32 +12,12 @@ config se lee de la DB (api_key, modelos) y qué se envía a Together.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import time
 from pathlib import Path
 
 # Asegura que la raíz del proyecto esté en sys.path al correr como script.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-
-def _fix_db_host() -> None:
-    """Reemplaza '@db:' por '@localhost:' en DATABASE_URL/DATABASE_URL_ASYNC.
-
-    El host 'db' es la red Docker y no resuelve desde el host; las credenciales
-    son las mismas. Debe llamarse ANTES de importar src.db.session.
-    """
-    env_path = Path(__file__).resolve().parent.parent / ".env"
-    for var in ("DATABASE_URL", "DATABASE_URL_ASYNC"):
-        val = os.environ.get(var, "")
-        if not val and env_path.exists():
-            for line in env_path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line.startswith(f"{var}="):
-                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    break
-        if "@db:" in val:
-            os.environ[var] = val.replace("@db:", "@localhost:")
 
 
 def main() -> None:
@@ -58,8 +38,6 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=300)
     parser.add_argument("--temperature", type=float, default=0.7)
     args = parser.parse_args()
-
-    _fix_db_host()
 
     from src.db.session import SessionLocal
     from src.llm.together import complete, get_active_llm_config

@@ -1,3 +1,4 @@
+import socket
 from collections.abc import Generator
 from contextlib import contextmanager
 
@@ -6,8 +7,24 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from src.config import get_settings
 
+
+def resolve_db_host(url: str) -> str:
+    """Traduce el host 'db' (red Docker) a 'localhost' si no resuelve.
+
+    Dentro de Docker 'db' resuelve y se mantiene; fuera (host/tests) no
+    resuelve y se usa localhost (mismas credenciales).
+    """
+    if "@db:" in url:
+        try:
+            socket.gethostbyname("db")
+        except socket.gaierror:
+            return url.replace("@db:", "@localhost:")
+    return url
+
+
 _settings = get_settings()
-engine = create_engine(_settings.database_url, pool_pre_ping=True, future=True)
+_database_url = resolve_db_host(_settings.database_url)
+engine = create_engine(_database_url, pool_pre_ping=True, future=True)
 SessionLocal = sessionmaker(
     bind=engine, autoflush=False, expire_on_commit=False, future=True
 )

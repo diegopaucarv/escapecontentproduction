@@ -32,7 +32,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
-from sqlalchemy import bindparam, text
+from sqlalchemy import text
 
 from src.kag.config import get_config_value, resolve_config
 from src.kag.prompts import (
@@ -57,7 +57,6 @@ from src.kag.prompts import (
 from src.kag.stages import (
     KAG_INGEST_STAGES,
     cleanup_stage,
-    get_stage,
     resume_from,
     set_stage,
 )
@@ -105,29 +104,8 @@ CHAPTER_TOKEN_THRESHOLD = 30000
 MIN_CHAPTER_TOKENS = 50
 
 # ---------------------------------------------------------------------
-# Helpers de host / texto
+# Helpers de texto
 # ---------------------------------------------------------------------
-
-
-def _fix_db_host() -> None:
-    """Reemplaza '@db:' por '@localhost:' en DATABASE_URL/DATABASE_URL_ASYNC.
-
-    El host 'db' es la red Docker y no resuelve desde el host; las credenciales
-    son las mismas. Debe llamarse ANTES de importar src.db.session. Si la
-    variable no está en el entorno, la lee del .env (pydantic-settings da
-    prioridad a las env vars reales sobre el archivo .env).
-    """
-    env_path = Path(__file__).resolve().parent.parent / ".env"
-    for var in ("DATABASE_URL", "DATABASE_URL_ASYNC"):
-        val = os.environ.get(var, "")
-        if not val and env_path.exists():
-            for line in env_path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line.startswith(f"{var}="):
-                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    break
-        if "@db:" in val:
-            os.environ[var] = val.replace("@db:", "@localhost:")
 
 
 def estimate_tokens(text: str) -> int:
@@ -2299,7 +2277,7 @@ def _persist_summary_index(
         return
     try:
         # Import perezoso: src.embeddings importa src.db.session (que lee .env
-        # al importar) — debe ocurrir DESPUÉS de _fix_db_host().
+        # al importar) — se difiere para mantener el módulo ligero.
         from src.embeddings import embed_texts
 
         sections = [s for s in section_summaries if s]
@@ -3848,7 +3826,7 @@ def _index_document_slice(
             if resume == "chunked":
                 cleanup_stage(session, "kag_documents", doc_id, "chunked")
             # Import perezoso: src.embeddings importa src.db.session (que lee
-            # .env al importar) — debe ocurrir DESPUÉS de _fix_db_host().
+            # .env al importar) — se difiere para mantener el módulo ligero.
             from src.embeddings import embed_texts
 
             # Si se reanuda desde 'chunked' (segmentación ya hecha), el
@@ -4156,7 +4134,7 @@ def backfill_entity_embeddings(session, batch_size=64, verbose=True):
         if not rows:
             break
         # Import perezoso: src.embeddings importa src.db.session (que lee
-        # .env al importar) — debe ocurrir DESPUÉS de _fix_db_host().
+        # .env al importar) — se difiere para mantener el módulo ligero.
         from src.embeddings import embed_texts
 
         try:
@@ -4253,7 +4231,6 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    _fix_db_host()
     from src.db.session import SessionLocal
 
     session = SessionLocal()

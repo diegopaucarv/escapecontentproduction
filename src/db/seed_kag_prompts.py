@@ -22,32 +22,11 @@ Uso:
 from __future__ import annotations
 
 import argparse
-import os
-from pathlib import Path
 
 from sqlalchemy import select
 
 from src.db.models import PromptTemplate
 from src.kag.prompts.specs import KAG_TEMPLATES
-
-
-def _fix_db_host() -> None:
-    """Reemplaza '@db:' por '@localhost:' en DATABASE_URL/DATABASE_URL_ASYNC.
-
-    El host 'db' es la red Docker y no resuelve desde el host; las credenciales
-    son las mismas. Debe llamarse ANTES de importar src.db.session.
-    """
-    env_path = Path(__file__).resolve().parent.parent.parent / ".env"
-    for var in ("DATABASE_URL", "DATABASE_URL_ASYNC"):
-        val = os.environ.get(var, "")
-        if not val and env_path.exists():
-            for line in env_path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line.startswith(f"{var}="):
-                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    break
-        if "@db:" in val:
-            os.environ[var] = val.replace("@db:", "@localhost:")
 
 
 def _upsert_template(session, data: dict) -> PromptTemplate:
@@ -77,7 +56,6 @@ def seed(session=None) -> dict:
     """
     own_session = session is None
     if own_session:
-        _fix_db_host()
         from src.db.session import SessionLocal
 
         session = SessionLocal()
@@ -103,7 +81,6 @@ def main() -> None:
         description="Seed de specs de prompts KAG (prompt-as-code)."
     )
     parser.parse_args()
-    _fix_db_host()
     result = seed()
     print("Specs de prompts KAG listas:")
     print(f"  Specs de prompts ({len(result['task_keys'])}):")

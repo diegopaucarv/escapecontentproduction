@@ -1,6 +1,5 @@
 """Tests del seed de IA modular (src/db/seed_ai.py) — sin base real."""
 
-import os
 import uuid
 
 from src.db.seed_ai import MODELS, TEMPLATES, seed
@@ -118,16 +117,34 @@ def test_seed_returns_summary_with_ids(monkeypatch):
         uuid.UUID(tid)
 
 
-def test_fix_db_host_replaces_docker_host(monkeypatch):
-    from src.db.seed_ai import _fix_db_host
+def test_resolve_db_host_replaces_docker_host(monkeypatch):
+    import socket
 
-    monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@db:5432/kag")
-    monkeypatch.setenv(
-        "DATABASE_URL_ASYNC", "postgresql+asyncpg://user:pass@db:5432/kag"
+    from src.db.session import resolve_db_host
+
+    # 'db' no resuelve en el host → se traduce a localhost.
+    monkeypatch.setattr(
+        "socket.gethostbyname", lambda name: (_ for _ in ()).throw(socket.gaierror())
     )
-    _fix_db_host()
-    assert os.environ["DATABASE_URL"] == "postgresql://user:pass@localhost:5432/kag"
     assert (
-        os.environ["DATABASE_URL_ASYNC"]
+        resolve_db_host("postgresql://user:pass@db:5432/kag")
+        == "postgresql://user:pass@localhost:5432/kag"
+    )
+    assert (
+        resolve_db_host("postgresql+asyncpg://user:pass@db:5432/kag")
         == "postgresql+asyncpg://user:pass@localhost:5432/kag"
+    )
+
+
+def test_resolve_db_host_keeps_resolvable_host(monkeypatch):
+    from src.db.session import resolve_db_host
+
+    # Si 'db' resuelve (dentro de Docker) se mantiene.
+    monkeypatch.setattr("socket.gethostbyname", lambda name: "172.20.0.2")
+    assert resolve_db_host("postgresql://user:pass@db:5432/kag") == (
+        "postgresql://user:pass@db:5432/kag"
+    )
+    # Sin host 'db' no se toca nada.
+    assert resolve_db_host("postgresql://user:pass@localhost:5432/kag") == (
+        "postgresql://user:pass@localhost:5432/kag"
     )

@@ -1443,10 +1443,20 @@ def test_index_document_extract_propositions_true_calls_step(monkeypatch, tmp_pa
     """extract_propositions=True (default) → el paso de proposiciones se ejecuta."""
     md = _index_document_setup(monkeypatch, tmp_path)
     calls = {"props": 0}
+    # El flujo actual con extract_propositions=True usa la extracción
+    # FUSIONADA (_extract_document_fused), no _extract_document_propositions.
     monkeypatch.setattr(
         ki,
-        "_extract_document_propositions",
+        "_extract_document_fused",
         lambda *a, **k: calls.__setitem__("props", calls["props"] + 1),
+    )
+    # Los workers de _run_proposition_batches_parallel abren su propia sesión
+    # real (run_in_own_session, src/db/session.py) — sin DB real en tests, se
+    # parchea para que usen la sesión fake del test directamente.
+    monkeypatch.setattr(
+        ki,
+        "_with_own_session",
+        lambda fn, *a, **k: fn(_IndexSession(), *a, **k),
     )
     result = ki.index_document(_IndexSession(), md, no_summary=True)
     assert result["status"] == "indexed"

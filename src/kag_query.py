@@ -19,14 +19,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
-from pathlib import Path
 
 from sqlalchemy import bindparam, text
 from sqlalchemy.exc import ProgrammingError
@@ -153,31 +151,6 @@ _reranker_lock = threading.Lock()
 # comportamiento viejo (reconstruir en cada llamada, sin cachear).
 _adjacency_cache: dict | None = None
 _adjacency_version: int = -1
-
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
-
-
-def _fix_db_host() -> None:
-    """Reemplaza '@db:' por '@localhost:' en DATABASE_URL/DATABASE_URL_ASYNC.
-
-    El host 'db' es la red Docker y no resuelve desde el host; las credenciales
-    son las mismas. Debe llamarse ANTES de importar src.db.session. Si la
-    variable no está en el entorno, la lee del .env (pydantic-settings da
-    prioridad a las env vars reales sobre el archivo .env).
-    """
-    env_path = Path(__file__).resolve().parent.parent / ".env"
-    for var in ("DATABASE_URL", "DATABASE_URL_ASYNC"):
-        val = os.environ.get(var, "")
-        if not val and env_path.exists():
-            for line in env_path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line.startswith(f"{var}="):
-                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    break
-        if "@db:" in val:
-            os.environ[var] = val.replace("@db:", "@localhost:")
 
 
 # ---------------------------------------------------------------------
@@ -3718,7 +3691,7 @@ def ask(
     q_emb = None
     try:
         # Import perezoso: src.embeddings importa src.db.session (que lee .env
-        # al importar) — debe ocurrir DESPUÉS de _fix_db_host().
+        # al importar) — se difiere para mantener el módulo ligero.
         from src.embeddings import embed_text
 
         q_emb = embed_text(query, input_type="query")
@@ -3947,7 +3920,6 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    _fix_db_host()
     from src.db.session import SessionLocal
 
     session = SessionLocal()

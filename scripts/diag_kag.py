@@ -7,32 +7,16 @@ una consulta devuelve 0 resultados.
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
-def _fix_db_host() -> None:
-    env_path = Path(__file__).resolve().parent.parent / ".env"
-    for var in ("DATABASE_URL", "DATABASE_URL_ASYNC"):
-        val = os.environ.get(var, "")
-        if not val and env_path.exists():
-            for line in env_path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line.startswith(f"{var}="):
-                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    break
-        if "@db:" in val:
-            os.environ[var] = val.replace("@db:", "@localhost:")
-
-
 def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-    _fix_db_host()
     from sqlalchemy import text
 
     from src.db.session import SessionLocal

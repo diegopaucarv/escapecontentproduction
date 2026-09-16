@@ -2549,6 +2549,14 @@ def _patch_summary_deps(monkeypatch, fake_complete):
         lambda *a, **k: ("SYS", "<text>\n{text}\n</text>\n\nSummary:"),
     )
     monkeypatch.setattr(ki, "complete_local", fake_complete)
+    # La fase map paralela abre su propia sesión real (run_in_own_session,
+    # src/db/session.py) — sin DB real en tests, se parchea para que use la
+    # sesión fake del test directamente (mismo patrón que _patch_own_session).
+    monkeypatch.setattr(
+        ki,
+        "_with_own_session",
+        lambda fn, *a, **k: fn(_SummarySession(), *a, **k),
+    )
     return ki
 
 
@@ -2580,8 +2588,9 @@ def test_summarize_long_map_parallel_preserves_order(monkeypatch):
 
     result = ki.summarize_document(_SummarySession(), LONG_MD, "long")
 
-    # 4 secciones H1/H2 + 1 reduce = 5 llamadas.
-    assert len(calls) == 5
+    # 1 fused (max_tokens=400, JSON inválido → degrada) + 4 secciones H1/H2
+    # + 1 reduce = 6 llamadas.
+    assert len(calls) == 6
     # Las 4 llamadas map usan max_tokens=60; el reduce usa 200.
     map_calls = [c for c in calls if c[1] == 60]
     reduce_calls = [c for c in calls if c[1] == 200]
@@ -2712,7 +2721,8 @@ def test_summarize_long_parallel_1_is_sequential(monkeypatch):
 
     result = ki.summarize_document(_SummarySession(), LONG_MD, "long")
     assert result.startswith("s:- s:# Cap")
-    assert calls == [60, 60, 60, 60, 200]  # 4 map + 1 reduce, en orden
+    # 1 fused + 4 map + 1 reduce, en orden.
+    assert calls == [400, 60, 60, 60, 60, 200]
 
 
 def test_summarize_long_pool_failure_degrades_to_sequential(monkeypatch):
@@ -2740,11 +2750,13 @@ def test_summarize_long_pool_failure_degrades_to_sequential(monkeypatch):
 
     result = ki.summarize_document(_SummarySession(), LONG_MD, "long")
     assert result.startswith("s:- s:# Cap")
-    assert calls == [60, 60, 60, 60, 200]  # fallback secuencial completo
+    # 1 fused + 4 map + 1 reduce (fallback secuencial completo).
+    assert calls == [400, 60, 60, 60, 60, 200]
 
 
 def test_summarize_short_unchanged(monkeypatch):
-    """doc_type='short' sigue siendo una sola llamada (sin map-reduce)."""
+    """doc_type='short' degrada igual: fused (400) → JSON inválido →
+    map-reduce con 1 sección (1 map 60 + 1 reduce 200)."""
     import src.kag_ingest as ki
 
     calls = []
@@ -2760,7 +2772,7 @@ def test_summarize_short_unchanged(monkeypatch):
 
     result = ki.summarize_document(_SummarySession(), "texto corto", "short")
     assert result == "RESUMEN CORTO"
-    assert calls == [200]
+    assert calls == [400, 60, 200]
 
 
 def test_summarize_long_reads_parallel_from_config(monkeypatch):
