@@ -192,7 +192,13 @@ def _chunk_row(
     )
 
 
-def _fake_prompt_pair(session, model_name, task_key, system_fallback, user_fallback):
+def _fake_prompt_pair(
+    session, model_name, task_key, system_fallback, user_fallback=None
+):
+    if user_fallback is None:
+        from src.kag.prompts import get_user_template
+
+        user_fallback = get_user_template(task_key)
     return system_fallback, user_fallback
 
 

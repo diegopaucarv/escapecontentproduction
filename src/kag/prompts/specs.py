@@ -315,7 +315,7 @@ Palabras muy frecuentes en el corpus (NO las propongas: matchearían
 demasiados chunks y no aportan precisión): {common_words}
 
 Candidatos del grafo:
-{{candidates}}
+{candidates}
 
 Devuelve SOLO JSON:
 {{"needs_regex": true/false, "terms": ["término y sus traducciones..."], "entities": ["Entidad 1"]}}

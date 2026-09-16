@@ -89,8 +89,18 @@ def _chunk_row(
     )
 
 
-def _fake_prompt_pair(session, model_name, task_key, system_fallback, user_fallback):
-    """Devuelve los fallbacks (sin artefacto compilado, como en tests sin DB)."""
+def _fake_prompt_pair(
+    session, model_name, task_key, system_fallback, user_fallback=None
+):
+    """Devuelve los fallbacks (sin artefacto compilado, como en tests sin DB).
+
+    user_fallback es opcional: si no se pasa, se resuelve desde el paquete
+    src.kag.prompts igual que la función real (runtime._get_prompt_pair).
+    """
+    if user_fallback is None:
+        from src.kag.prompts import get_user_template
+
+        user_fallback = get_user_template(task_key)
     return system_fallback, user_fallback
 
 
