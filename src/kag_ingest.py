@@ -27,6 +27,7 @@ import json
 import re
 import sys
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -59,6 +60,7 @@ from src.kag.stages import (
     set_stage,
 )
 from src.llm.base import call_with_retries, load_settings, parse_llm_output
+from src.llm.sanitize import LLMJSONError, sanitize_llm_json
 from src.llm.together import complete, complete_vision
 
 
@@ -453,6 +455,7 @@ def extract_entities_relations(session, chunk_text):
             response_format={"type": "json_object"},
             retries=retries,
             fallback_model=fallback,
+            thinking=False,
         )
         return parse_llm_output(text_out)
     except Exception:  # noqa: BLE001 — LLM no disponible: degradación de ingesta
@@ -805,6 +808,7 @@ def _extract_propositions(
             response_format={"type": "json_object"},
             retries=retries,
             fallback_model=fallback,
+            thinking=False,
         )
         data = parse_llm_output(text_out)
     except Exception as exc:  # noqa: BLE001 — LLM no disponible: degradación
@@ -844,6 +848,22 @@ def _extract_propositions(
     return out
 
 
+def _coerce_uuid(value) -> str | None:
+    """Devuelve `value` si es un UUID válido; None si no.
+
+    El LLM puede declarar chapter_id con etiquetas legibles ("archivo
+    completo") en divisiones a nivel de archivo; la columna es UUID, así
+    que esos valores se degradan a NULL (el capítulo se resuelve vía
+    kag_chunks.chapter_id en la consulta).
+    """
+    if not value:
+        return None
+    try:
+        return str(uuid.UUID(str(value)))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
 def _store_propositions(session, doc_id, propositions, embed_fn=None):
     """Guarda proposiciones atómicas de un chunk (multi-VALUES, un statement).
 
@@ -874,7 +894,7 @@ def _store_propositions(session, doc_id, propositions, embed_fn=None):
             {
                 f"d{i}": p["doc_id"],
                 f"c{i}": p["chunk_id"],
-                f"ch{i}": p.get("chapter_id"),
+                f"ch{i}": _coerce_uuid(p.get("chapter_id")),
                 f"ci{i}": p["core_idea_id"],
                 f"a{i}": p["argument_id"],
                 f"s{i}": sanitize_text(p["statement"]),
@@ -916,18 +936,20 @@ def _proposition_flags(
     `extract_propositions` (param de index_document) se combina con la flag
     KAG_EXTRACT_PROPOSITIONS de config: ambas deben estar activas. Devuelve
     (enabled, batch_size_tokens, model_size, max_parallel) con
-    KAG_PROPOSITION_BATCH_SIZE (default 400000 tokens), KAG_PROPOSITION_MODEL
-    (default "large" — la respuesta de un lote de hasta 400k tokens es mucho
-    mayor en extensión que la de un chunk suelto, así que la extracción usa
-    el LLM grande) y KAG_PROPOSITION_PARALLEL (default 3 llamadas LLM
-    concurrentes, semáforo).
+    KAG_PROPOSITION_BATCH_SIZE (default 1500 tokens de entrada — el output
+    con text_span verbatim es ~2-3x el input y debe caber en max_tokens del
+    modelo grande, 8192), KAG_PROPOSITION_MODEL
+    (default "large" — la respuesta de un lote es mucho mayor en extensión
+    que la de un chunk suelto, así que la extracción usa el LLM grande) y
+    KAG_PROPOSITION_PARALLEL (estimado por CPU/memoria del sistema,
+    semáforo).
     """
     config = resolve_config(session)
     enabled = bool(extract_propositions) and bool(
         get_config_value(config, "KAG_EXTRACT_PROPOSITIONS", True)
     )
     batch_size = int(
-        get_config_value(config, "KAG_PROPOSITION_BATCH_SIZE", 400000) or 400000
+        get_config_value(config, "KAG_PROPOSITION_BATCH_SIZE", 1500) or 1500
     )
     model_size = get_config_value(config, "KAG_PROPOSITION_MODEL", "large")
     if model_size not in ("small", "large"):
@@ -1085,7 +1107,7 @@ def _extract_propositions_batch(
     "propositions"}]}) y cada proposición se asigna al chunk que contiene su
     text_span (offsets relativos al chunk). `model_size` ("small" |
     "large", default "large" vía KAG_PROPOSITION_MODEL): la respuesta de un
-    lote de hasta 400k tokens es mucho mayor en extensión que la de un chunk
+    lote es mucho mayor en extensión que la de un chunk
     suelto, así que se usa el LLM grande (max_tokens_large). Si el LLM falla
     o devuelve JSON inválido → [] (degradación: la ingesta sigue).
     """
@@ -1143,6 +1165,7 @@ def _extract_propositions_batch(
             response_format={"type": "json_object"},
             retries=retries,
             fallback_model=fallback,
+            thinking=False,
         )
         data = parse_llm_output(text_out)
     except Exception as exc:  # noqa: BLE001 — LLM no disponible: degradación
@@ -1264,6 +1287,7 @@ def _extract_document_batch(
             response_format={"type": "json_object"},
             retries=retries,
             fallback_model=fallback,
+            thinking=False,
         )
         data = parse_llm_output(text_out)
     except Exception as exc:  # noqa: BLE001 — LLM no disponible: degradación
@@ -1372,7 +1396,7 @@ def _extract_propositions_for_doc(
     2; por ahora NULL → un único grupo a nivel de documento) SOLO si el
     capítulo tiene > CHAPTER_TOKEN_THRESHOLD (30k) tokens; los capítulos ≤
     umbral se agrupan a nivel de archivo. Cada grupo se parte en lotes por
-    presupuesto de tokens (KAG_PROPOSITION_BATCH_SIZE, default 400k); cada
+    presupuesto de tokens (KAG_PROPOSITION_BATCH_SIZE, default 1500); cada
     lote = UNA llamada LLM. Los lotes se disparan en paralelo
     (ThreadPoolExecutor + semáforo, KAG_PROPOSITION_PARALLEL) y se persisten
     en orden de chunk_index (determinista). Cache por content_hash (0026):
@@ -1478,7 +1502,7 @@ def _extract_document_propositions(
     3. Agrupación por DOCUMENTO (no por capítulo >30k): todos los chunks
        pendientes se concatenan (con sus paráfrasis) y se parten en lotes
        por presupuesto de tokens (_batch_chunks_by_tokens,
-       KAG_PROPOSITION_BATCH_SIZE=400000). Cada lote = UNA llamada LLM.
+       KAG_PROPOSITION_BATCH_SIZE=1500). Cada lote = UNA llamada LLM.
     4. _extract_document_batch: LLM grande con spec `kag_chapter_propositions`
        → {"propositions": [...], "entities": [...], "relations": [...]}.
        Asignación de proposiciones a chunks: primario = chunk_index
@@ -1682,6 +1706,7 @@ def _extract_document_fused_batch(
             response_format={"type": "json_object"},
             retries=retries,
             fallback_model=fallback,
+            thinking=False,
         )
         data = parse_llm_output(text_out)
     except Exception as exc:  # noqa: BLE001 — LLM no disponible: degradación
@@ -1835,7 +1860,7 @@ def _extract_document_fused(
        persistidas y cuyo content_hash no cambió se saltan.
     3. Agrupación por DOCUMENTO: todos los chunks pendientes se parten en
        lotes por presupuesto de tokens (_batch_chunks_by_tokens,
-       KAG_PROPOSITION_BATCH_SIZE=400000). Cada lote = UNA llamada LLM.
+       KAG_PROPOSITION_BATCH_SIZE=1500). Cada lote = UNA llamada LLM.
     4. _extract_document_fused_batch: LLM grande con spec `kag_document_extract`
        → {"paraphrases", "propositions", "entities", "relations",
        "section_summaries", "document_summary"}.
@@ -2126,6 +2151,7 @@ def _paraphrase_group(session, doc_id, doc_path, chapter_id, chunks, verbose=Tru
             response_format={"type": "json_object"},
             retries=retries,
             fallback_model=fallback,
+            thinking=False,
         )
         data = parse_llm_output(text_out)
         paraphrases = data.get("paraphrases") if isinstance(data, dict) else None
@@ -2271,16 +2297,9 @@ def _parse_summary_json(out: str):
     if not out:
         return None
     try:
-        data = json.loads(out)
-    except (ValueError, TypeError):
-        # El modelo a veces envuelve el JSON en markdown ```json ... ```.
-        m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", out, re.DOTALL)
-        if not m:
-            return None
-        try:
-            data = json.loads(m.group(1))
-        except (ValueError, TypeError):
-            return None
+        data = sanitize_llm_json(out)
+    except LLMJSONError:
+        return None
     if not isinstance(data, dict):
         return None
     document_summary = str(data.get("document_summary") or "").strip()
@@ -2322,6 +2341,7 @@ def _summarize_map_reduce(
                 model_size="large",
                 system=summary_system,
                 max_tokens=500,
+                thinking=False,
             ).strip()
             return i, s
 
@@ -2341,6 +2361,7 @@ def _summarize_map_reduce(
                     model_size="large",
                     system=summary_system,
                     max_tokens=500,
+                    thinking=False,
                 ).strip()
                 if s:
                     section_summaries.append(s)
@@ -2353,6 +2374,7 @@ def _summarize_map_reduce(
                 model_size="large",
                 system=summary_system,
                 max_tokens=500,
+                thinking=False,
             ).strip()
             if s:
                 section_summaries.append(s)
@@ -2365,6 +2387,7 @@ def _summarize_map_reduce(
         model_size="large",
         system=summary_system,
         max_tokens=2000,
+        thinking=False,
     ).strip()
     _persist_summary_index(session, doc_id, section_summaries, final)
     return final
@@ -2414,6 +2437,7 @@ def summarize_document(session, text, doc_type, doc_id=None):
             model_size="large",
             system=summary_system,
             max_tokens=4000,
+            thinking=False,
         ).strip()
         parsed = _parse_summary_json(out)
         if parsed is not None:
@@ -2448,7 +2472,9 @@ def describe_figure(session, image_path, caption):
         prompt = "Describe esta figura con precisión."
         if caption:
             prompt += f" Caption: {caption}"
-        return complete_vision(session, prompt, image_url=data_url).strip()
+        return complete_vision(
+            session, prompt, image_url=data_url, thinking=False
+        ).strip()
     except Exception as exc:  # noqa: BLE001 — degradación no bloqueante
         print(f"[KAG] ⚠ VLM no disponible para {image_path}: {exc}")
         return ""
@@ -2698,6 +2724,7 @@ def _index_document_analysis(
             response_format={"type": "json_object"},
             retries=retries,
             fallback_model=fallback,
+            thinking=False,
         )
         data = parse_llm_output(text_out)
         ficha = data.get("ficha") if isinstance(data, dict) else None
@@ -3119,7 +3146,7 @@ def _describe_figure_vision(
             prompt += f" Caption: {caption}"
         if context:
             prompt += f"\n\nContexto circundante:\n{context}"
-        text_out = complete_vision(session, prompt, image_url=data_url)
+        text_out = complete_vision(session, prompt, image_url=data_url, thinking=False)
         data = parse_llm_output(text_out)
         if not isinstance(data, dict):
             return {}
@@ -3266,6 +3293,7 @@ def _index_document_separation(session, md_path, md_text, verbose=True) -> list[
             response_format={"type": "json_object"},
             retries=retries,
             fallback_model=fallback,
+            thinking=False,
         )
         data = parse_llm_output(text_out)
         raw = data.get("documents") if isinstance(data, dict) else None
@@ -3416,7 +3444,7 @@ def index_document(
     los chunks ya persistidos): agrupación doc→capítulo (chapter_id
     detectado por LLM, Fase 2; por ahora NULL → un único grupo a nivel de
     documento; capítulos >30k tokens = grupo propio, el resto a nivel de
-    archivo), batching por tokens (KAG_PROPOSITION_BATCH_SIZE, default 400k)
+    archivo), batching por tokens (KAG_PROPOSITION_BATCH_SIZE, default 1500)
     con UNA llamada LLM por lote, llamadas en paralelo (semáforo,
     KAG_PROPOSITION_PARALLEL) y cache por content_hash (0026) — los chunks
     ya extraídos con hash idéntico se saltan en re-ingestas. Con False el
@@ -3507,7 +3535,7 @@ def _index_document_slice(
     verbose=True,
     llm_entities=False,
     extract_propositions=True,
-    prop_batch_size=400000,
+    prop_batch_size=1500,
     prop_model_size="large",
     prop_max_parallel=3,
 ):

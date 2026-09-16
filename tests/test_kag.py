@@ -1052,6 +1052,7 @@ def test_grounded_entity_linking_llm_selects_from_pool(monkeypatch):
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         captured["prompt"] = prompt
         return '{"entities": ["Red Neuronal"]}', "small", False
@@ -1093,6 +1094,7 @@ def test_grounded_entity_linking_llm_fails_returns_pool(monkeypatch):
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         raise RuntimeError("LLM caído")
 
@@ -1143,6 +1145,7 @@ def test_grounded_entity_linking_filters_out_of_pool(monkeypatch):
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         return '{"entities": ["Red de Petri"]}', "small", False
 
@@ -1359,6 +1362,7 @@ def test_critic_regex_search_returns_terms(monkeypatch):
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         return '{"needs_regex": true, "terms": ["CVE-2024-3094"]}', "small", False
 
@@ -1381,6 +1385,7 @@ def test_critic_regex_search_no_terms_returns_empty(monkeypatch):
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         return '{"needs_regex": false, "terms": []}', "small", False
 
@@ -1410,6 +1415,7 @@ def test_critic_regex_search_llm_fails_uses_heuristic(monkeypatch):
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         raise RuntimeError("LLM caído")
 
@@ -1477,6 +1483,7 @@ def test_critic_regex_search_batches_terms_in_one_query(monkeypatch):
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         return (
             '{"needs_regex": true, "terms": ["CVE-2024-3094", "Bourdieu"]}',
@@ -1533,6 +1540,7 @@ def test_critic_regex_search_escapes_quotes_in_terms(monkeypatch):
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         # Término tipo código (pasa el filtro de anclaje) con comilla interna.
         return '{"needs_regex": true, "terms": ["CVE-2024\\"x"]}', "small", False
@@ -1587,6 +1595,7 @@ def test_critic_regex_search_drops_copula_verbs(monkeypatch):
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         return (
             '{"needs_regex": true, "terms": ["Existe", "discriminación negativa"]}',
@@ -1693,6 +1702,7 @@ def test_critic_and_linking_llm_anchors_entities_and_fts(monkeypatch):
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         captured["prompt"] = prompt
         return (
@@ -1740,6 +1750,7 @@ def test_critic_and_linking_llm_fails_degrades(monkeypatch):
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         raise RuntimeError("LLM caído")
 
@@ -1783,6 +1794,7 @@ def test_critic_and_linking_merges_llm_and_pool_entities(monkeypatch):
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         return (
             '{"needs_regex": false, "terms": [], "entities": ["Red de Petri"]}',
@@ -2202,6 +2214,7 @@ def test_critic_prompt_injects_common_words_and_languages(monkeypatch):
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         captured["prompt"] = prompt
         return '{"needs_regex": false, "terms": []}', "small", False

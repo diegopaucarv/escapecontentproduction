@@ -1,0 +1,259 @@
+{
+  "divisions": [
+    {
+      "chapter_id": "Parte III — Teoremas, Relaciones y Operadores",
+      "propositions": [
+        {
+          "core_idea_id": "5.0.1",
+          "argument_id": "5.0.1",
+          "statement": "El error de las ciencias sociales ha sido colapsar tres fenómenos distintos: el sistema psíquico autopoiético, la persona social como constructo comunicativo, y el proceso termodinámico de individualización.",
+          "text_span": "El error de las ciencias sociales ha sido colapsar tres fenómenos distintos: el sistema psíquico autopoiético (Maturana/Luhmann), la persona social como constructo comunicativo, y el proceso termodinámico de individualización (Simondon).",
+          "char_start": 0,
+          "char_end": 0,
+          "line_start": 1,
+          "line_end": 1,
+          "citations_references": ["Maturana/Luhmann", "Simondon"]
+        },
+        {
+          "core_idea_id": "5.0.2",
+          "argument_id": "5.0.2",
+          "statement": "Simondon acierta al ver la individualización como dinámica interna de reestructuración somato-psíquica, pero carece de un marco para la clausura comunicativa.",
+          "text_span": "Simondon acierta al ver la individualización como dinámica interna de reestructuración somato-psíquica, pero carece de un marco para la clausura comunicativa.",
+          "char_start": 0,
+          "char_end": 0,
+          "line_start": 2,
+          "line_end": 2,
+          "citations_references": ["Simondon"]
+        },
+        {
+          "core_idea_id": "5.0.3",
+          "argument_id": "5.0.3",
+          "statement": "Luhmann acierta en la clausura operativa y en situar al humano fuera de la sociedad, pero a veces supedita la individualización psíquica a un mero epifenómeno de la semántica social.",
+          "text_span": "Luhmann acierta en la clausura operativa y en situar al humano fuera de la sociedad, pero a veces supedita la individualización psíquica a un mero epifenómeno de la semántica social.",
+          "char_start": 0,
+          "char_end": 0,
+          "line_start": 3,
+          "line_end": 3,
+          "citations_references": ["Luhmann"]
+        },
+        {
+          "core_idea_id": "5.0.4",
+          "argument_id": "5.0.4",
+          "statement": "Maturana describe la mecánica de la clausura autopoiética, pero ignora la complejidad de las redes transindividuales de sentido.",
+          "text_span": "Maturana describe la mecánica de la clausura autopoiética, pero ignora la complejidad de las redes transindividuales de sentido.",
+          "char_start": 0,
+          "char_end": 0,
+          "line_start": 4,
+          "line_end": 4,
+          "citations_references": ["Maturana"]
+        },
+        {
+          "core_idea_id": "5.0.5",
+          "argument_id": "5.0.5",
+          "statement": "Nuestra unificación toma de Simondon el operador Iop, de Luhmann la arquitectura de subsistemas con Fop y la definición de Persona como intersección estructural, y de Maturana el principio de clausura operativa y acoplamiento estructural, eliminando con Ockham toda sustancia metafísica.",
+          "text_span": "Nuestra unificación toma de Simondon el operador Iop, de Luhmann la arquitectura de subsistemas con Fop y la definición de Persona como intersección estructural, y de Maturana el principio de clausura operativa y acoplamiento estructural —eliminando, con Ockham, toda sustancia metafísica (el 'alma', el 'sujeto libre', la 'esencia').",
+          "char_start": 0,
+          "char_end": 0,
+          "line_start": 5,
+          "line_end": 5,
+          "citations_references": ["Simondon", "Luhmann", "Maturana", "Ockham"]
+        },
+        {
+          "core_idea_id": "5.1.1",
+          "argument_id": "5.1.1",
+          "statement": "La individuación ocurre una vez y es prerrequisito ontológico de todo lo demás.",
+          "text_span": "Ocurre una vez. Prerrequisito ontológico de todo lo demás.",
+          "char_start": 0,
+          "char_end": 0,
+          "line_start": 6,
+          "line_end": 6,
+          "citations_references": []
+        },
+        {
+          "core_idea_id": "5.2.1",
+          "argument_id": "5.2.1",
+          "statement": "La individualización es un proceso recursivo que requiere M_Omega > 1 (pluralidad de trayectorias accesibles) y M_E > 0 (energía para efectuar transiciones).",
+          "text_span": "Propiedades: recursivo. Requiere M_Omega > 1 (pluralidad de trayectorias accesibles) y M_E > 0 (energia para efectuar transiciones).",
+          "char_start": 0,
+          "char_end": 0,
+          "line_start": 7,
+          "line_end": 7,
+          "citations_references": []
+        },
+        {
+          "core_idea_id": "5.2.2",
+          "argument_id": "5.2.2",
+          "statement": "La individualización consume M_E proporcionalmente a la complejidad de la navegación.",
+          "text_span": "Consume M_E proporcionalmente a la complejidad de la navegacion.",
+          "char_start": 0,
+          "char_end": 0,
+          "line_start": 8,
+          "line_end": 8,
+          "citations_references": []
+        },
+        {
+          "core_idea_id": "5.2.3",
+          "argument_id": "5.2.3",
+          "statement": "La velocidad de la individualización está acotada por dEp/dt; su alcance por M_Omega; su frecuencia por M_E.",
+          "text_span": "Su velocidad esta acotada por dEp/dt; su alcance —la novedad de las transiciones— por M_Omega; su frecuencia —cuantas transiciones por unidad de tiempo— por M_E.",
+          "char_start": 0,
+          "char_end": 0,
+          "line_start": 9,
+          "line_end": 9,
+          "citations_references": []
+        },
+        {
+          "core_idea_id": "5.2.4",
+          "argument_id": "5.2.4",
+          "statement": "E aparece en la firma como irritación, no como determinación: el entorno provee ruido que el sistema procesa según sus propias reglas internas (σ_pred, σ_pref).",
+          "text_span": "E aparece en la firma como irritacion, no como determinacion: el entorno provee ruido que el sistema procesa segun sus propias reglas internas (σ_pred, σ_pref).",
+          "char_start": 0,
+          "char_end": 0,
+          "line_start": 10,
+          "line_end": 10,
+          "citations_references": []
+        },
+        {
+          "core_idea_id": "5.2.5",
+          "argument_id": "5.2.5",
+          "statement": "La flecha → denota transición de estado, no causalidad eficiente del entorno sobre el sistema.",
+          "text_span": "La flecha → denota transicion de estado, no causalidad eficiente del entorno sobre el sistema.",
+          "char_start": 0,
+          "char_end": 0,
+          "line_start": 11,
+          "line_end": 11,
+          "citations_references": []
+        },
+        {
+          "core_idea_id": "5.2.6",
+          "argument_id": "5.2.6",
+          "statement": "Iop se descompone en tres sub-operadores: Seleccionar, Predecir y Navegar.",
+          "text_span": "Descomposicion de Iop en tres sub-operadores: Teorema 6.1b — Descomposicion de Iop: Iop(S, Mpsy, E) = Seleccionar o Predecir o Navegar (S, Mpsy, E).",
+          "char_start": 0,
+          "char_end": 0,
+          "line_start": 12,
+          "line_end": 12,
+          "citations_references": []
+        },
+        {
+          "core_idea_id": "5.2.7",
+          "argument_id": "5.2.7",
+          "statement": "Iop congelado puede deberse a Navegar congelado (Mpsy -> 1, rigidez cognitiva), a Seleccionar congelado (regla de decisión colapsa a un solo output, pánico o impulsividad), o a ambas.",
+          "text_span": "Iop congelado puede deberse a: (a) Navegar congelado: Mpsy -> 1, el sistema solo ve una trayectoria posible (rigidez cognitiva, Lmeta); (b) Seleccionar congelado: la regla de decision colapsa a un solo output independientemente de las trayectorias disponibles (panico, impulsividad); (c) ambas.",
+          "char_start": 0,
+          "char_end": 0,
+          "line_start": 13,
+          "line_end": 13,
+          "citations_references": []
+        },
+        {
+          "core_idea_id": "5.2.8",
+          "argument_id": "5.2.8",
+          "statement": "La distinción entre Navegar congelado y Seleccionar congelado es clínicamente crucial: Navegar congelado requiere restaurar Mpsy (neuromodulación); Seleccionar congelado requiere resolver el doble vínculo que bloquea la decisión (intervención semántica).",
+          "text_span": "Esta distincion es clinicamente crucial: Navegar congelado requiere restaurar Mpsy (neuromodulacion); Seleccionar congelado requiere resolver el doble vinculo que bloquea la decision (intervencion semantica).",
+          "char_start": 0,
+          "char_end": 0,
+          "line_start": 14,
+          "line_end": 14,
+          "citations_references": []
+        },
+        {
+          "core_idea_id": "5.2.9",
+          "argument_id": "5.2.9",
+          "statement": "La descomposición de Iop en Navegar, Predecir y Seleccionar identifica una distinción funcional real, pero no refleja dos tipos de información categóricamente distintos; refleja dos roles funcionales que emergen de un único proceso predictivo.",
+          "text_span": "La descomposicion de Iop en Navegar, Predecir y Seleccionar identifica una distincion funcional real. Pero esta distincion NO refleja dos tipos de informacion categoricamente distintos ('descriptiva' vs. 'practica') que el sistema reciba de fuentes separadas. Refleja dos ROLES FUNCIONALES que emergen de un UNICO proceso predictivo.",
+          "char_start": 0,
+          "char_end": 0,
+          "line_start": 15,
+          "line_end": 15,
+          "citations_references": []
+        },
+        {
+          "core_idea_id": "5.2.10",
+          "argument_id": "5.2.10",
+          "statement": "La meritocracia es una creencia previa con precisión inflada artificialmente.",
+          "text_span": "La meritocracia como creencia previa con precision inflada artificialmente:",
+          "char_start": 0,
+          "char_end": 0,
+          "line_start": 16,
+          "line_end": 16,
+          "citations_references": []
+        },
+        {
+          "core_idea_id": "5.2.11",
+          "argument_id": "5.2.11",
+          "statement": "La alostasis predictiva es acción anticipatoria que modifica el entorno o el estado interno antes de que la perturbación llegue.",
+          "text_span": "Alostasis Predictiva (Pred): Mas alla de Predecir como proyeccion, la alostasis predictiva es accion anticipatoria que modifica el entorno o el estado interno antes de que la perturbacion llegue:",
+          "char_start": 0,
+          "char_end": 0,
+          "line_start": 17,
+          "line_end": 17,
+          "citations_references": []
+        },
+        {
+          "core_idea_id": "5.2.12",
+          "argument_id": "5.2.12",
+          "statement": "Existe una distinción crucial entre aislamiento reactivo y aislamiento predictivo: el aislamiento episódico como defensa gatillada cuando la atenuación de sigma ya no basta (reactivo) versus la ruta predictiva donde Pred detecta tendencia, Spsych ordena reducción de kappa, y el aislamiento es voluntario antes de que A_load se acumule.",
+          "text_span": "Distincion crucial — Aislamiento Reactivo vs. Aislamiento Predictivo: El marco describe el aislamiento episodico como defensa gatillada cuando la atenuacion de sigma ya no basta (reactivo). Pero existe otra ruta: Pred detecta tendencia → Spsych ordena reduccion de kappa → aislamiento voluntario antes de que A_load se acumule (predictivo).",
+          "char_start": 0,
+          "char_end": 0,
+          "line_start": 18,
+          "line_end": 18,
+          "citations_references": []
+        },
+        {
+          "core_idea_id": "5.2.13",
+          "argument_id": "5.2.13",
+          "statement": "El burnout ocurre precisamente cuando el sistema no puede ejecutar Aislamiento Predictivo y es arrastrado al Aislamiento Reactivo cuando ya es tarde.",
+          "text_span": "El 'burnout' ocurre precisamente cuando el sistema no puede ejecutar Aislamiento Predictivo y es arrastrado al Aislamiento Reactivo cuando ya es tarde.",
+          "char_start": 0,
+          "char_end": 0,
+          "line_start": 19,
+          "line_end": 19,
+          "citations_references": []
+        },
+        {
+          "core_idea_id": "5.2.14",
+          "argument_id": "5.2.14",
+          "statement": "Esta diferencia explica por qué algunas personas manejan la sobrecarga sin colapsar (logran la transición predictiva) y otras colapsan (quedan atrapadas en modo automático sin capacidad de anticipación).",
+          "text_span": "Esta diferencia explica por que algunas personas manejan la sobrecarga sin colapsar (logran la transicion predictiva) y otras colapsan (quedan atrapadas en modo automatico sin capacidad de anticipacion).",
+          "char_start": 0,
+          "char_end": 0,
+          "line_start": 20,
+          "line_end": 20,
+          "citations_references": []
+        },
+        {
+          "core_idea_id": "5.3.1",
+          "argument_id": "5.3.1",
+          "statement": "La Persona NO es una intersección de elementos entre SS y Spsych; es el punto de acoplamiento estructural donde SS atribuye expectativas a una dirección comunicativa que Spsych reconoce como 'yo'.",
+          "text_span": "La Persona NO es una interseccion de elementos entre SS y Spsych (una comunicacion no puede ser un pensamiento). Es el PUNTO DE ACOPLAMIENTO ESTRUCTURAL donde SS atribuye expectativas a una direccion comunicativa que Spsych reconoce como 'yo'.",
+          "char_start": 0,
+          "char_end": 0,
+          "line_start": 21,
+          "line_end": 21,
+          "citations_references": []
+        },
+        {
+          "core_idea_id": "5.3.2",
+          "argument_id": "5.3.2",
+          "statement": "Los filtros Fop determinan qué Personas son legibles para cada subsistema.",
+          "text_span": "Los filtros Fop determinan qué Personas son legibles para cada subsistema.",
+          "char_start": 0,
+          "char_end": 0,
+          "line_start": 22,
+          "line_end": 22,
+          "citations_references": []
+        },
+        {
+          "core_idea_id": "5.3.3",
+          "argument_id": "5.3.3",
+          "statement": "A mayor Cmacro, Spsych debe habitar múltiples Personas en subsistemas con códigos incompatibles, lo cual no es una carga sino el motor de la individualización (White): la identidad emerge de la fricción al saltar entre netdoms.",
+          "text_span": "A mayor Cmacro, Spsych debe habitar múltiples Personas en subsistemas con códigos incompatibles —lo cual no es una carga sino el motor de la individualización (White): la identidad emerge precisamente de la fricción al saltar entre netdoms.",
+          "char_start": 0,
+          "char_end": 0,
+          "line_start": 23,
+          "line_end": 23,
+          "citations_references": ["White"]
+        },
+        {

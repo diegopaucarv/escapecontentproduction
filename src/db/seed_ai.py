@@ -91,7 +91,17 @@ MODELS = [
         ],
         "weaknesses": ["mas lento", "mas caro por token"],
         "prompt_style": "few-shot con ejemplos, descomponer tareas en pasos",
-        "syntax_profile": TOGETHER_CHAT_PROFILE,
+        "syntax_profile": {
+            **TOGETHER_CHAT_PROFILE,
+            "reasoning_mode": {
+                "supports_reasoning": True,
+                "thinking_parameter": "thinking",
+                "thinking_config": {"type": "enabled", "budget_tokens": 2048},
+                "min_tokens_for_reasoning": 1024,
+                "min_content_reserve": 512,
+                "strip_think_tags_in_output": False,
+            },
+        },
     },
     {
         "model_name": "jinaai/jina-embeddings-v5-text-nano",

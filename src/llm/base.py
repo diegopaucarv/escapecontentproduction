@@ -26,12 +26,15 @@ Contrato de resultado de decisión (dict) — TODOS los consumidores lo siguen:
 
 from __future__ import annotations
 
-import json
+import logging
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from src.db.models import SessionSettings
+from src.llm.sanitize import LLMJSONError, LLMTruncatedError, sanitize_llm_json
+
+logger = logging.getLogger(__name__)
 
 # Origen de la decisión.
 DECISION_SOURCE_LLM = "llm"
@@ -59,6 +62,7 @@ def call_with_retries(
     response_format: dict,
     retries: int,
     fallback_model: str | None = None,
+    thinking: dict | bool | None = None,
 ) -> tuple[str, str, bool]:
     """Llama a complete() con fallback. Devuelve
     (texto, modelo_usado, usó_fallback). Lanza la última excepción si todo
@@ -68,6 +72,10 @@ def call_with_retries(
     complete() (src/llm/together.py::_post_with_retry) según
     session_settings.llm_retries — este wrapper NO repite el bucle
     (antes: retries × retries = 9 llamadas con el default 3).
+
+    `thinking` se pasa a complete(). Default: thinking=None → default del
+    modelo (razonamiento ACTIVO). Las tareas que NO quieran razonar deben
+    pasar `thinking=False` explícitamente (p. ej. summarize_document).
     """
     from src.llm.together import complete
 
@@ -80,6 +88,7 @@ def call_with_retries(
                 model_size=model_size,
                 system=system,
                 response_format=response_format,
+                thinking=thinking,
             ),
             model_size,
             False,
@@ -96,6 +105,7 @@ def call_with_retries(
                     model_size=fallback_model,
                     system=system,
                     response_format=response_format,
+                    thinking=thinking,
                 ),
                 fallback_model,
                 True,
@@ -107,11 +117,20 @@ def call_with_retries(
 
 
 def parse_llm_output(text: str) -> dict:
-    """Parsea el JSON del LLM. Devuelve dict vacío si no es JSON válido."""
+    """Parsea el JSON del LLM. Devuelve dict vacío si no es JSON válido.
+
+    Delega en src.llm.sanitize (fences, texto alrededor, trailing commas y
+    detección de truncamiento). Compatibilidad: devuelve {} en vez de lanzar;
+    el truncamiento se LOGUEA (el reintento ya ocurrió en _extract_content).
+    """
+    if not isinstance(text, str):
+        return {}
     try:
-        data = json.loads(text)
-        return data if isinstance(data, dict) else {}
-    except (json.JSONDecodeError, TypeError):
+        return sanitize_llm_json(text)
+    except LLMTruncatedError as exc:
+        logger.warning("parse_llm_output: output LLM truncado: %s", exc)
+        return {}
+    except LLMJSONError:
         return {}
 
 

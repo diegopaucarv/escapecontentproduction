@@ -12,6 +12,7 @@ import os
 from src.kag.config import (
     KAG_DEFAULTS,
     apply_cli_overrides,
+    estimate_parallelism,
     get_config_value,
     parse_env_config,
     resolve_config,
@@ -34,9 +35,10 @@ def test_defaults_exactos():
         "KAG_PPR_ALPHA": 0.15,
         "KAG_AUTO_THRESHOLDS": True,
         "KAG_EXTRACT_PROPOSITIONS": True,
-        "KAG_PROPOSITION_BATCH_SIZE": 400000,
+        "KAG_PROPOSITION_BATCH_SIZE": 1500,
         "KAG_PROPOSITION_MODEL": "large",
         "KAG_PROPOSITION_PARALLEL": 3,
+        "KAG_PARAPHRASE_PARALLEL": 3,
         "KAG_LLM_ENTITIES": False,
         "KAG_USE_COREF": "auto",
         "KAG_PROCESS_FIGURES": True,
@@ -46,7 +48,9 @@ def test_defaults_exactos():
     }
 
 
-def test_resolve_config_sin_session_usa_defaults():
+def test_resolve_config_sin_session_usa_defaults(monkeypatch):
+    # Sin estimación (capa 0 neutralizada) → defaults estáticos exactos.
+    monkeypatch.setattr("src.kag.config.estimate_parallelism", lambda: {})
     config = resolve_config()
     assert config == KAG_DEFAULTS
 
@@ -210,10 +214,11 @@ def test_session_settings_objeto():
     assert config["KAG_BRANCH_B_MAX_ITERS"] == 7
 
 
-def test_session_sin_settings_no_rompe():
+def test_session_sin_settings_no_rompe(monkeypatch):
     class FakeSession:
         pass
 
+    monkeypatch.setattr("src.kag.config.estimate_parallelism", lambda: {})
     config = resolve_config(session=FakeSession())
     assert config == KAG_DEFAULTS
 
@@ -224,6 +229,7 @@ def test_session_settings_rotas_no_rompen(monkeypatch):
         def session_settings(self):
             raise RuntimeError("DB caída")
 
+    monkeypatch.setattr("src.kag.config.estimate_parallelism", lambda: {})
     config = resolve_config(session=FakeSession())
     assert config == KAG_DEFAULTS
 
@@ -239,6 +245,51 @@ def test_db_gana_sobre_env_y_pierde_ante_overrides(monkeypatch):
 
     config = resolve_config(session=FakeSession(), overrides={"KAG_QUERY_MODE": "fast"})
     assert config["KAG_QUERY_MODE"] == "fast"
+
+
+# ---------------------------------------------------------------------
+# Auto-estimación de paralelismo (capa 0)
+# ---------------------------------------------------------------------
+
+
+def test_estimate_parallelism_bounds():
+    est = estimate_parallelism()
+    for flag in (
+        "KAG_PROPOSITION_PARALLEL",
+        "KAG_PARAPHRASE_PARALLEL",
+        "KAG_FIGURE_PARALLEL",
+        "KAG_SUMMARY_PARALLEL",
+    ):
+        assert 2 <= est[flag] <= 8, f"{flag} fuera de rango: {est[flag]}"
+    assert 1 <= est["KAG_ENTITY_N_PROCESS"] <= 4
+
+
+def test_resolve_config_usa_estimaciones():
+    config = resolve_config()
+    est = estimate_parallelism()
+    for flag in (
+        "KAG_PROPOSITION_PARALLEL",
+        "KAG_PARAPHRASE_PARALLEL",
+        "KAG_FIGURE_PARALLEL",
+        "KAG_SUMMARY_PARALLEL",
+        "KAG_ENTITY_N_PROCESS",
+    ):
+        assert config[flag] == est[flag]
+
+
+def test_env_gana_sobre_estimacion(monkeypatch):
+    monkeypatch.setenv("KAG_PROPOSITION_PARALLEL", "2")
+    config = resolve_config()
+    assert config["KAG_PROPOSITION_PARALLEL"] == 2
+
+
+def test_env_invalido_paralelismo_usa_estimacion(monkeypatch):
+    monkeypatch.setenv("KAG_PROPOSITION_PARALLEL", "abc")
+    config = resolve_config()
+    assert (
+        config["KAG_PROPOSITION_PARALLEL"]
+        == estimate_parallelism()["KAG_PROPOSITION_PARALLEL"]
+    )
 
 
 # ---------------------------------------------------------------------

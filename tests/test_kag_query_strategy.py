@@ -105,7 +105,8 @@ def _llm_ok(strategy, reason="porque sí"):
     kag_query_strategy."""
 
     def fake_call(
-        session, *, prompt, system, model_size, response_format, retries, fallback_model
+        session, *, prompt, system, model_size, response_format, retries, fallback_model,
+        thinking=None,
     ):
         return json.dumps({"strategy": strategy, "reason": reason}), "small", False
 
@@ -114,7 +115,8 @@ def _llm_ok(strategy, reason="porque sí"):
 
 def _llm_raises(exc=None):
     def fake_call(
-        session, *, prompt, system, model_size, response_format, retries, fallback_model
+        session, *, prompt, system, model_size, response_format, retries, fallback_model,
+        thinking=None,
     ):
         raise exc or RuntimeError("LLM no disponible")
 
@@ -224,7 +226,8 @@ def test_flag_off_skips_slm(monkeypatch):
     calls = []
 
     def _fake_call(
-        session, *, prompt, system, model_size, response_format, retries, fallback_model
+        session, *, prompt, system, model_size, response_format, retries, fallback_model,
+        thinking=None,
     ):
         calls.append(prompt)
         return json.dumps({"strategy": "graph", "reason": "x"}), "small", False
@@ -292,7 +295,8 @@ def _install_ask_mocks(monkeypatch, session, strategy):
         )
 
     def _fake_call(
-        session, *, prompt, system, model_size, response_format, retries, fallback_model
+        session, *, prompt, system, model_size, response_format, retries, fallback_model,
+        thinking=None,
     ):
         return "respuesta", "model", False
 

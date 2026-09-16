@@ -123,6 +123,7 @@ def test_extract_propositions_llm_ok(monkeypatch):
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         return (
             json.dumps(
@@ -190,6 +191,7 @@ def test_extract_propositions_llm_fails_returns_empty(monkeypatch):
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         raise RuntimeError("LLM no disponible")
 
@@ -219,6 +221,7 @@ def test_extract_propositions_invalid_json_returns_empty(monkeypatch):
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         return ("esto no es json", "small", False)
 
@@ -248,6 +251,7 @@ def test_extract_propositions_json_without_propositions_returns_empty(monkeypatc
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         return (json.dumps({"otra_cosa": 1}), "small", False)
 
@@ -278,6 +282,7 @@ def test_extract_propositions_span_not_found_keeps_none_spans(monkeypatch):
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         return (
             json.dumps(
@@ -338,6 +343,7 @@ def test_extract_propositions_truncates_long_content(monkeypatch):
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         captured["prompt"] = prompt
         return (json.dumps({"propositions": []}), "small", False)
@@ -367,7 +373,7 @@ def _prop(doc_id=1, chunk_id=2, i=0, citations=None):
     return {
         "doc_id": doc_id,
         "chunk_id": chunk_id,
-        "chapter_id": "s1",
+        "chapter_id": "11111111-1111-1111-1111-111111111111",
         "core_idea_id": f"CI-{i}",
         "argument_id": f"ARG-{i}",
         "statement": f"Proposición {i}.",
@@ -411,12 +417,24 @@ def test_store_propositions_single_multi_values_statement():
     assert "executemany" not in sql.lower()
     assert params["d0"] == 1
     assert params["c0"] == 2
-    assert params["ch0"] == "s1"
+    assert params["ch0"] == "11111111-1111-1111-1111-111111111111"
     assert params["s0"] == "Proposición 0."
     assert params["cr0"] == json.dumps(["Bourdieu, 1984"], ensure_ascii=False)
     assert params["cr1"] == "[]"
     assert params["emb0"] == "[0.1,0.2]"
     assert params["emb1"] == "[0.3,0.4]"
+
+
+def test_coerce_uuid_valid_and_invalid():
+    """_coerce_uuid: UUID válido pasa; etiquetas legibles del LLM ("archivo
+    completo") degradan a None (la columna es UUID)."""
+    assert (
+        ki._coerce_uuid("11111111-1111-1111-1111-111111111111")
+        == "11111111-1111-1111-1111-111111111111"
+    )
+    assert ki._coerce_uuid("archivo completo") is None
+    assert ki._coerce_uuid("") is None
+    assert ki._coerce_uuid(None) is None
 
 
 def test_store_propositions_embedding_failure_degrades_to_none():
@@ -630,6 +648,7 @@ def test_extract_propositions_batch_assigns_chunks_by_span(monkeypatch):
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         return (
             json.dumps(
@@ -701,6 +720,7 @@ def test_extract_propositions_batch_span_not_found_chunk_none(monkeypatch):
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         return (
             json.dumps(
@@ -750,6 +770,7 @@ def test_extract_propositions_batch_llm_fails_returns_empty(monkeypatch):
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         raise RuntimeError("LLM no disponible")
 
@@ -780,6 +801,7 @@ def test_extract_propositions_batch_uses_large_model_by_default(monkeypatch):
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         captured["model_size"] = model_size
         return (json.dumps({"propositions": []}), model_size, False)
@@ -809,6 +831,7 @@ def test_extract_propositions_batch_model_size_small(monkeypatch):
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         captured["model_size"] = model_size
         return (json.dumps({"propositions": []}), model_size, False)
@@ -842,6 +865,7 @@ def test_extract_propositions_batch_parses_divisions(monkeypatch):
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         return (
             json.dumps(
@@ -917,6 +941,7 @@ def test_extract_propositions_batch_legacy_flat_output(monkeypatch):
         response_format,
         retries,
         fallback_model=None,
+        thinking=None,
     ):
         return (
             json.dumps(
@@ -1227,39 +1252,49 @@ def test_extract_propositions_for_doc_persists_in_chunk_index_order(monkeypatch)
 # ---------------------------------------------------------------------
 
 
+def _flags_config(**overrides) -> dict:
+    """Config determinista para _proposition_flags (sin estimación de
+    máquina: los defaults de paralelismo se fijan explícitamente)."""
+    base = {
+        "KAG_EXTRACT_PROPOSITIONS": True,
+        "KAG_PROPOSITION_BATCH_SIZE": 1500,
+        "KAG_PROPOSITION_MODEL": "large",
+        "KAG_PROPOSITION_PARALLEL": 3,
+    }
+    base.update(overrides)
+    return base
+
+
 def test_proposition_flags_param_false_disables(monkeypatch):
-    monkeypatch.delenv("KAG_EXTRACT_PROPOSITIONS", raising=False)
-    monkeypatch.delenv("KAG_PROPOSITION_BATCH_SIZE", raising=False)
-    monkeypatch.delenv("KAG_PROPOSITION_MODEL", raising=False)
-    monkeypatch.delenv("KAG_PROPOSITION_PARALLEL", raising=False)
+    monkeypatch.setattr(ki, "resolve_config", lambda session: _flags_config())
     enabled, batch_size, model_size, max_parallel = ki._proposition_flags(
         None, extract_propositions=False
     )
     assert enabled is False
-    assert batch_size == 400000
+    assert batch_size == 1500
     assert model_size == "large"
     assert max_parallel == 3
 
 
 def test_proposition_flags_defaults(monkeypatch):
-    monkeypatch.delenv("KAG_EXTRACT_PROPOSITIONS", raising=False)
-    monkeypatch.delenv("KAG_PROPOSITION_BATCH_SIZE", raising=False)
-    monkeypatch.delenv("KAG_PROPOSITION_MODEL", raising=False)
-    monkeypatch.delenv("KAG_PROPOSITION_PARALLEL", raising=False)
+    monkeypatch.setattr(ki, "resolve_config", lambda session: _flags_config())
     enabled, batch_size, model_size, max_parallel = ki._proposition_flags(
         None, extract_propositions=True
     )
     assert enabled is True
-    assert batch_size == 400000
+    assert batch_size == 1500
     assert model_size == "large"
     assert max_parallel == 3
 
 
 def test_proposition_flags_env_overrides(monkeypatch):
-    monkeypatch.setenv("KAG_EXTRACT_PROPOSITIONS", "0")
-    monkeypatch.setenv("KAG_PROPOSITION_BATCH_SIZE", "1000")
-    monkeypatch.delenv("KAG_PROPOSITION_MODEL", raising=False)
-    monkeypatch.delenv("KAG_PROPOSITION_PARALLEL", raising=False)
+    monkeypatch.setattr(
+        ki,
+        "resolve_config",
+        lambda session: _flags_config(
+            KAG_EXTRACT_PROPOSITIONS=False, KAG_PROPOSITION_BATCH_SIZE=1000
+        ),
+    )
     enabled, batch_size, model_size, max_parallel = ki._proposition_flags(
         None, extract_propositions=True
     )
@@ -1270,10 +1305,11 @@ def test_proposition_flags_env_overrides(monkeypatch):
 
 
 def test_proposition_flags_batch_size_env(monkeypatch):
-    monkeypatch.delenv("KAG_EXTRACT_PROPOSITIONS", raising=False)
-    monkeypatch.setenv("KAG_PROPOSITION_BATCH_SIZE", "50000")
-    monkeypatch.delenv("KAG_PROPOSITION_MODEL", raising=False)
-    monkeypatch.delenv("KAG_PROPOSITION_PARALLEL", raising=False)
+    monkeypatch.setattr(
+        ki,
+        "resolve_config",
+        lambda session: _flags_config(KAG_PROPOSITION_BATCH_SIZE=50000),
+    )
     enabled, batch_size, model_size, max_parallel = ki._proposition_flags(
         None, extract_propositions=True
     )
@@ -1285,10 +1321,11 @@ def test_proposition_flags_batch_size_env(monkeypatch):
 
 def test_proposition_flags_model_env(monkeypatch):
     """KAG_PROPOSITION_MODEL=small cambia el modelo de extracción."""
-    monkeypatch.delenv("KAG_EXTRACT_PROPOSITIONS", raising=False)
-    monkeypatch.delenv("KAG_PROPOSITION_BATCH_SIZE", raising=False)
-    monkeypatch.setenv("KAG_PROPOSITION_MODEL", "small")
-    monkeypatch.delenv("KAG_PROPOSITION_PARALLEL", raising=False)
+    monkeypatch.setattr(
+        ki,
+        "resolve_config",
+        lambda session: _flags_config(KAG_PROPOSITION_MODEL="small"),
+    )
     enabled, _batch_size, model_size, max_parallel = ki._proposition_flags(
         None, extract_propositions=True
     )
@@ -1299,10 +1336,11 @@ def test_proposition_flags_model_env(monkeypatch):
 
 def test_proposition_flags_model_invalid_falls_back_large(monkeypatch):
     """Valor inválido de KAG_PROPOSITION_MODEL → default "large" (nunca romper)."""
-    monkeypatch.delenv("KAG_EXTRACT_PROPOSITIONS", raising=False)
-    monkeypatch.delenv("KAG_PROPOSITION_BATCH_SIZE", raising=False)
-    monkeypatch.setenv("KAG_PROPOSITION_MODEL", "gigante")
-    monkeypatch.delenv("KAG_PROPOSITION_PARALLEL", raising=False)
+    monkeypatch.setattr(
+        ki,
+        "resolve_config",
+        lambda session: _flags_config(KAG_PROPOSITION_MODEL="gigante"),
+    )
     enabled, _batch_size, model_size, max_parallel = ki._proposition_flags(
         None, extract_propositions=True
     )
@@ -1313,15 +1351,16 @@ def test_proposition_flags_model_invalid_falls_back_large(monkeypatch):
 
 def test_proposition_flags_parallel_env(monkeypatch):
     """KAG_PROPOSITION_PARALLEL configura el semáforo de concurrencia."""
-    monkeypatch.delenv("KAG_EXTRACT_PROPOSITIONS", raising=False)
-    monkeypatch.delenv("KAG_PROPOSITION_BATCH_SIZE", raising=False)
-    monkeypatch.delenv("KAG_PROPOSITION_MODEL", raising=False)
-    monkeypatch.setenv("KAG_PROPOSITION_PARALLEL", "5")
+    monkeypatch.setattr(
+        ki,
+        "resolve_config",
+        lambda session: _flags_config(KAG_PROPOSITION_PARALLEL=5),
+    )
     enabled, batch_size, _model_size, max_parallel = ki._proposition_flags(
         None, extract_propositions=True
     )
     assert enabled is True
-    assert batch_size == 400000
+    assert batch_size == 1500
     assert max_parallel == 5
 
 

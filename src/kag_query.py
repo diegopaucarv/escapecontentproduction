@@ -270,6 +270,7 @@ def classify_query_strategy(session, query) -> tuple[str, list[str], str, str, b
             response_format={"type": "json_object"},
             retries=retries,
             fallback_model=fallback,
+            thinking=False,
         )
         data = parse_llm_output(text_out)
         strategy = str(data.get("strategy", "")).strip()
@@ -370,6 +371,7 @@ def extract_metadata_filters(session, query) -> dict:
             response_format={"type": "json_object"},
             retries=retries,
             fallback_model=fallback,
+            thinking=False,
         )
         data = parse_llm_output(text_out)
         filters = data.get("filters") or {}
@@ -415,6 +417,7 @@ def generate_subqueries(session, query) -> list:
             response_format={"type": "json_object"},
             retries=retries,
             fallback_model=fallback,
+            thinking=False,
         )
         data = parse_llm_output(text_out)
         raw = data.get("subqueries") or []
@@ -766,6 +769,7 @@ def grounded_entity_linking(session, query: str) -> list:
             response_format={"type": "json_object"},
             retries=retries,
             fallback_model=fallback,
+            thinking=False,
         )
         data = parse_llm_output(text_out)
         names = [str(e).strip() for e in (data.get("entities") or []) if str(e).strip()]
@@ -2193,6 +2197,7 @@ def critic_regex_search(session, query, top_k=10, verbose=False):
             response_format={"type": "json_object"},
             retries=retries,
             fallback_model=fallback,
+            thinking=False,
         )
         data = parse_llm_output(text_out)
         if data.get("needs_regex"):
@@ -2280,6 +2285,7 @@ def critic_and_linking(session, query, top_k=10, verbose=False):
             response_format={"type": "json_object"},
             retries=retries,
             fallback_model=fallback,
+            thinking=False,
         )
         data = parse_llm_output(text_out)
         if data.get("needs_regex"):
@@ -2737,7 +2743,7 @@ def _audit_epistemic_fused(
     encabezados que assemble_context, para que el LLM distinga la
     granularidad de cada capa.
     """
-    if not propositions:
+    if not propositions and not chunks:
         return (
             [],
             {"contradictions_detected": False, "analysis_cases": []},
@@ -2746,6 +2752,32 @@ def _audit_epistemic_fused(
                 "confidence_score": 0.5,
             },
         )
+    degraded_from_chunks = False
+    if not propositions:
+        # Degradación: sin proposiciones (capa micro) pero con chunks (capa
+        # textual) → usar los chunks como candidatos. Sin esto, el flujo
+        # audited descartaría la evidencia textual y abortaría con
+        # INSUFFICIENT aunque los chunks contengan la respuesta.
+        # Se truncan a 800 chars y se capan a 12 (los grupos de mayor
+        # score) para no inflar el prompt del LLM pequeño.
+        if verbose:
+            print(
+                f"[KAG] ⚠ Sin proposiciones en DB; usando {len(chunks)} chunks "
+                "como capa atómica."
+            )
+        degraded_from_chunks = True
+        propositions = [
+            {
+                "chunk_id": str(c.get("chunk_id", "")),
+                "document_id": str(c.get("doc_id") or ""),
+                "statement": (c.get("content") or "")[:800],
+                "text_span": (c.get("content") or "")[:800],
+                "citation_references": [],
+                "doc_title": str(c.get("doc_path") or ""),
+                "chapter_title": "",
+            }
+            for c in chunks[:12]
+        ]
     retries, fallback = _settings_retries(session)
     small_model, _large_model = _settings_models(session)
     system, user_template = _get_prompt_pair(
@@ -2759,7 +2791,7 @@ def _audit_epistemic_fused(
         .replace("{active_corpus_metadata}", _json_dumps(corpus_metadata))
         .replace("{candidate_chunks_json}", _json_dumps(propositions))
     )
-    if chunks is not None or summary_hits is not None:
+    if (chunks is not None or summary_hits is not None) and not degraded_from_chunks:
         prompt += "\n\nEvidencia por capas de granularidad:\n"
         prompt += (
             "--- MARCO TEMÁTICO (resúmenes de documento/sección) ---\n"
@@ -2868,6 +2900,23 @@ def _fused_facts_to_shape(facts_raw, propositions) -> list:
             by_statement.setdefault(stmt, p)
         if span:
             by_span.setdefault(span, p)
+
+    def _anchor(statement: str, verbatim: str) -> dict:
+        """Ancla el hecho a su proposición/chunk original.
+
+        Match exacto por statement o text_span; si no, fallback por
+        substring del verbatim dentro del text_span (cubre la degradación
+        sin proposiciones, donde los candidatos son chunks completos y el
+        LLM cita solo un fragmento).
+        """
+        prop = by_statement.get(statement) or by_span.get(verbatim) or {}
+        if not prop and verbatim:
+            for span, p in by_span.items():
+                if verbatim in span:
+                    prop = p
+                    break
+        return prop
+
     out: list = []
     for f in facts_raw:
         if not isinstance(f, dict):
@@ -2882,7 +2931,7 @@ def _fused_facts_to_shape(facts_raw, propositions) -> list:
             "irrelevant",
         ):
             relevance = "supporting_evidence"
-        prop = by_statement.get(statement) or by_span.get(verbatim) or {}
+        prop = _anchor(statement, verbatim)
         out.append(
             {
                 "chunk_id": str(prop.get("chunk_id", "")),
@@ -2961,6 +3010,29 @@ def _verify_grounding(session, facts, verbose=False) -> list:
                 ),
                 {"cid": chunk_id},
             ).fetchone()
+            if row is None:
+                # Safety net dirigido: cuando la DB no tiene proposiciones
+                # (caso degradado, _audit_epistemic_fused convierte chunks
+                # reales en candidatos con degraded_from_chunks=True), el
+                # chunk_id del fact es un id de CHUNK (kag_chunks), no de
+                # proposición, y el lookup anterior devuelve None. En vez de
+                # leer todos los chunks, verificamos SOLO el chunk concreto
+                # referido por el fact: las proposiciones/paráfrasis son un
+                # proxy compacto, y este safety net verifica únicamente los
+                # chunks referidos.
+                row = session.execute(
+                    text(
+                        "SELECT c.content AS text_span, "
+                        "'[]'::jsonb AS citation_references, c.doc_id, "
+                        "d.title AS doc_title, "
+                        "COALESCE(kc.title, '') AS chapter_title "
+                        "FROM kag_chunks c "
+                        "JOIN kag_documents d ON c.doc_id = d.id "
+                        "LEFT JOIN kag_chapters kc ON kc.id = c.chapter_id "
+                        "WHERE c.id = :cid"
+                    ),
+                    {"cid": chunk_id},
+                ).fetchone()
         except Exception as exc:  # noqa: BLE001 — degradación natural
             _safe_rollback(session)
             if verbose:
