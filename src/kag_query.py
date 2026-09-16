@@ -1054,6 +1054,13 @@ def build_adjacency(session):
     migración no está aplicada (o la sesión no soporta el SELECT de versión),
     degrada al comportamiento viejo: reconstruir en cada llamada, sin
     cachear.
+
+    Capa proposicional (0034, flag KAG_GRAPH_PROPOSITION_LAYER): además de
+    kag_relations, lee kag_proposition_links y agrega nodos de proposición
+    con namespace de STRING "p:{proposition_id}" conectados a sus entidades
+    (arista bidireccional, weight 1). El dict mezcla keys INT (entidades) y
+    STRING "p:..." (proposiciones). Si la tabla no existe, degrada al grafo
+    de entidades sin romper.
     """
     global _adjacency_cache, _adjacency_version
 
@@ -1077,6 +1084,26 @@ def build_adjacency(session):
         adj[s][t] = adj[s].get(t, 0) + 1
         adj[t][s] = adj[t].get(s, 0) + 1
 
+    if _kag_config_value(session, "KAG_GRAPH_PROPOSITION_LAYER", True):
+        try:
+            link_rows = session.execute(
+                text("SELECT proposition_id, entity_id FROM kag_proposition_links")
+            ).fetchall()
+        except Exception:  # noqa: BLE001 — tabla ausente: grafo de entidades
+            link_rows = []
+        for r in link_rows:
+            # Defensivo: sesiones falsas de tests pueden devolver filas con
+            # otra forma (p. ej. las de kag_relations) — se ignoran.
+            pid = getattr(r, "proposition_id", None)
+            eid = getattr(r, "entity_id", None)
+            if pid is None or eid is None:
+                continue
+            pnode = f"p:{pid}"
+            adj.setdefault(pnode, {})
+            adj.setdefault(eid, {})
+            adj[pnode][eid] = 1
+            adj[eid][pnode] = 1
+
     if version is not None:
         _adjacency_cache = adj
         _adjacency_version = version
@@ -1094,7 +1121,9 @@ def personalized_pagerank(adjacency, seed, alpha=0.15, max_iter=50, tol=1e-6):
         return {}
     nodes = set(adjacency.keys())
     nodes.update(seed)
-    nodes = sorted(nodes)
+    # Clave mixta INT (entidades) + STRING "p:..." (proposiciones, 0034):
+    # ordenar por tipo primero para que sorted() no compare int con str.
+    nodes = sorted(nodes, key=lambda n: (isinstance(n, str), n))
     if not nodes:
         return {}
     n = len(nodes)
@@ -1281,14 +1310,19 @@ def ppr_entity_selection(
     """
     if not scores:
         return []
-    vals = list(scores.values())
+    # Solo nodos entidad (keys INT): los nodos "p:..." (capa proposicional,
+    # 0034) propagan el PPR pero no se seleccionan como semilla de chunks.
+    entity_items = [(eid, s) for eid, s in scores.items() if isinstance(eid, int)]
+    if not entity_items:
+        return []
+    vals = [s for _, s in entity_items]
     max_s = max(vals)
     floor = min_ratio * max_s
     if len(vals) >= 100:
         mean = sum(vals) / len(vals)
         std = (sum((v - mean) ** 2 for v in vals) / len(vals)) ** 0.5
         floor = max(floor, mean + z * std)
-    sorted_items = sorted(scores.items(), key=lambda x: -x[1])
+    sorted_items = sorted(entity_items, key=lambda x: -x[1])
     if auto:
         cutoff = auto_cutoff(vals)
         if cutoff is not None:

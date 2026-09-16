@@ -845,6 +845,55 @@ def _store_entities_relations(session, doc_id, chunk_id, data, embed_fn=None):
             ),
             params,
         )
+    return entity_ids
+
+
+def _store_proposition_links(
+    session, doc_id, propositions, entities, prop_ids, entity_ids_by_norm
+):
+    """Enlaza proposiciones ↔ entidades del lote (capa proposicional, 0034).
+
+    En memoria (sin SQL pesado): para cada proposición del lote, para cada
+    entidad del lote, si el nombre (minúsculas) aparece en el statement →
+    link (prop_id, entity_id). UN solo INSERT multi-VALUES con
+    ON CONFLICT DO NOTHING (dedup por PK). `prop_ids` = ids devueltos por
+    _store_propositions (RETURNING id); `entity_ids_by_norm` = name_norm →
+    id devuelto por _store_entities_relations.
+    """
+    if not propositions or not entities:
+        return
+    links = []
+    seen = set()
+    for i, p in enumerate(propositions):
+        if i >= len(prop_ids):
+            break
+        stmt_lower = p["statement"].lower()
+        for ent in entities:
+            name = str(ent.get("name") or "").strip()
+            if not name:
+                continue
+            eid = entity_ids_by_norm.get(normalize_entity_name(name))
+            if eid is None:
+                continue
+            if name.lower() in stmt_lower:
+                key = (prop_ids[i], eid)
+                if key not in seen:
+                    seen.add(key)
+                    links.append(key)
+    if not links:
+        return
+    placeholders = ", ".join(f"(:p{i}, :e{i})" for i in range(len(links)))
+    params = {}
+    for i, (pid, eid) in enumerate(links):
+        params[f"p{i}"] = pid
+        params[f"e{i}"] = eid
+    session.execute(
+        text(
+            "INSERT INTO kag_proposition_links (proposition_id, entity_id) "
+            f"VALUES {placeholders} ON CONFLICT DO NOTHING"
+        ),
+        params,
+    )
 
 
 # ---------------------------------------------------------------------
@@ -1102,7 +1151,7 @@ def _store_propositions(session, doc_id, propositions, embed_fn=None):
     `citation_references` = json.dumps(citations).
     """
     if not propositions:
-        return
+        return []
     embs: list = []
     if embed_fn is not None:
         try:
@@ -1135,16 +1184,20 @@ def _store_propositions(session, doc_id, propositions, embed_fn=None):
                 f"emb{i}": embedding_to_sql(embs[i]),
             }
         )
-    session.execute(
+    rows = session.execute(
         text(
             "INSERT INTO kag_propositions "
             "(doc_id, chunk_id, chapter_id, core_idea_id, argument_id, statement, "
             "text_span, char_start, char_end, line_start, line_end, "
             "citation_references, embedding) "
-            f"VALUES {placeholders}"
+            f"VALUES {placeholders} "
+            "RETURNING id"
         ),
         params,
     )
+    if rows is None:  # sesiones falsas de tests sin resultado real
+        return []
+    return [r.id for r in rows.fetchall()]
 
 
 def _chunk_content_hash(content: str) -> str:
@@ -1807,17 +1860,32 @@ def _extract_document_propositions(
         # inválido y span no localizable) se descartan — kag_propositions.
         # chunk_id es NOT NULL.
         props = [p for p in props if p["chunk_id"] is not None]
-        _store_propositions(session, doc_id, props, embed_fn=embed_fn)
+        prop_ids = _store_propositions(session, doc_id, props, embed_fn=embed_fn) or []
         # Entidades + relaciones LLM: se persisten contra el primer chunk del
         # lote (dedup por name_norm por doc — no duplica con las de spaCy).
+        entity_ids_by_norm = {}
         if entities or relations:
-            _store_entities_relations(
-                session,
-                doc_id,
-                batch[0]["id"],
-                {"entities": entities, "relations": relations},
-                embed_fn=embed_fn,
+            entity_ids_by_norm = (
+                _store_entities_relations(
+                    session,
+                    doc_id,
+                    batch[0]["id"],
+                    {"entities": entities, "relations": relations},
+                    embed_fn=embed_fn,
+                )
+                or {}
             )
+        # Capa proposicional (0034): enlazar proposiciones ↔ entidades del
+        # lote. Degradación: si falla, rollback + log — la ingesta sigue (los
+        # links son una capa de mejora, no crítica).
+        try:
+            _store_proposition_links(
+                session, doc_id, props, entities, prop_ids, entity_ids_by_norm
+            )
+        except Exception as exc:  # noqa: BLE001 — capa de mejora, no crítica
+            session.rollback()
+            if verbose:
+                print(f"[KAG] ⚠ links proposicionales fallaron: {exc}")
         for ch in batch:
             session.execute(
                 text("UPDATE kag_chunks SET content_hash = :h WHERE id = :id"),

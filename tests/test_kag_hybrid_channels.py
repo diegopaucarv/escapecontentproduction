@@ -411,7 +411,7 @@ def test_ask_audited_final_rrf_merge_has_no_prop_channel(monkeypatch):
     )
 
     session = _FakeSession()
-    kq._ask_audited(session, "¿De qué trata el libro?", verbose=False)
+    result = kq._ask_audited(session, "¿De qué trata el libro?", verbose=False)
 
     assert result["answer"] == "respuesta"
     assert captured["merge_lists"] is not None
